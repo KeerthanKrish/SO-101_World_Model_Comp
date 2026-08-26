@@ -79,3 +79,35 @@ write an articulation config (joint stiffness/damping/limits, modeled on
 Isaac Lab's existing manipulator configs), then build a minimal scene
 (ground plane, table, cube, SO-101) and a scripted (non-learned) reach/grasp
 motion to sanity-check the physics before any learning goes in.
+
+### 2026-08-26 (continued) — Isaac Lab verified working; SO-101 spawns and simulates
+
+- Confirmed Isaac Lab actually runs (not just installs): tutorial scripts
+  in this project loop forever by design (meant for GUI viewing), so
+  "hangs" during verification were expected behavior plus two of my own
+  mistakes (stdout block-buffering hid log output until I set
+  `PYTHONUNBUFFERED=1`; `timeout` failed to kill nested Kit subprocesses,
+  leaving orphaned GPU-using processes that needed `pkill -9 -f <script>`
+  cleanup). Worth remembering for any future bounded test run.
+- Converted the SO-101 URDF to USD via
+  `IsaacLab/scripts/tools/convert_urdf.py` (`--fix-base`,
+  `--joint-target-type position`). Output at
+  `~/SO-101-WM/assets/usd/so101/so101.usd`. Only warnings in the log (about
+  `gripper_frame_link` having no visual mesh of its own — harmless), no
+  errors.
+- Wrote `sim/robots/so101.py`: an Isaac Lab `ArticulationCfg` for the
+  SO-101, modeled on Isaac Lab's Franka config. Joint torque/velocity limits
+  are estimated from STS3215 datasheet figures (~1.9 N*m peak torque, ~4.7
+  rad/s no-load speed) since the raw URDF's placeholder limits
+  (effort=10, velocity=10 for every joint) don't reflect the real servo —
+  flagged in the code as estimates to validate against the real arm later.
+  See docs/so101_asset_notes.md for the full reasoning.
+- Wrote `sim/scripts/test_so101_spawn.py`, a bounded (300-step, not
+  infinite) sanity-check script. Result: robot spawns correctly, joint
+  names match the expected 6 DOF, physics is stable (max joint velocity
+  0.17 rad/s while holding default pose against gravity, no NaNs).
+
+**Status**: SO-101 confirmed working end-to-end in Isaac Lab (spawn +
+stable physics). Next: build the actual pick-and-place scene (table, cube,
+camera) and a scripted (non-learned) reach/grasp motion, before any domain
+randomization or learning.
