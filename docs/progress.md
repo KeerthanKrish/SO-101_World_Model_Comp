@@ -50,3 +50,32 @@ scene (asset import + minimal scripted pick-and-place task).
 **Status**: Isaac Sim install in progress. Next: verify Isaac Sim launches,
 install Isaac Lab from source, install LeRobot in its own env, then set up
 physical arm connectivity once arms are plugged in.
+
+### 2026-08-26 (continued) — Isaac Sim, Isaac Lab, LeRobot installed
+
+- Isaac Sim 5.1.0 installed via pip in `env_isaaclab`. Bundled torch (cu126)
+  didn't support this GPU's compute capability (RTX 5060 Ti is Blackwell,
+  sm_120) — reinstalled torch 2.7.0 with the cu128 build; verified with an
+  actual GPU matmul (no more sm_120 compatibility warning).
+- Cloned Isaac Lab (`~/SO-101-WM/IsaacLab`) and ran `./isaaclab.sh --install`
+  using gcc-11/g++-11 (Ubuntu 24.04 ships gcc 13 by default, which Isaac
+  Lab's build doesn't yet support). Isaac Sim's first run needed
+  `OMNI_KIT_ACCEPT_EULA=YES` since the interactive EULA prompt fails over a
+  non-interactive SSH session — noting explicitly that this accepts the
+  Omniverse EULA.
+- LeRobot: initial `pip install -e ".[feetech]"` failed — LeRobot now
+  requires Python >=3.12 (docs/earlier research said 3.11, which was
+  outdated). Recreated the `lerobot` conda env with Python 3.12; installed
+  cleanly, `lerobot-find-port` / `lerobot-calibrate` CLIs confirmed present.
+- Found the official SO-101 URDF source: `TheRobotStudio/SO-ARM100` repo,
+  `Simulation/SO101/` folder (URDF + meshes + MuJoCo XML). Cloned into
+  `~/SO-101-WM/assets/SO-ARM100`. Confirmed joint structure in the URDF:
+  `shoulder_pan`, `shoulder_lift`, `elbow_flex`, `wrist_flex`, `wrist_roll`,
+  `gripper` (6 revolute joints, matches the real SO-101's 6 servos).
+
+**Status**: Verifying Isaac Lab runs headless (`create_empty.py` tutorial).
+Next: convert the SO-101 URDF to USD via Isaac Lab's `convert_urdf.py`,
+write an articulation config (joint stiffness/damping/limits, modeled on
+Isaac Lab's existing manipulator configs), then build a minimal scene
+(ground plane, table, cube, SO-101) and a scripted (non-learned) reach/grasp
+motion to sanity-check the physics before any learning goes in.
