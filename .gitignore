@@ -1,0 +1,28 @@
+# External dependencies (cloned separately, not part of this repo's history)
+IsaacLab/
+lerobot/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+env_isaaclab/
+lerobot_env/
+
+# Data / checkpoints / logs (large binary artifacts)
+*.pt
+*.pth
+*.ckpt
+outputs/
+logs/
+wandb/
+data/
+datasets/
+*.mp4
+*.avi
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
