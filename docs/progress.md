@@ -161,10 +161,36 @@ randomization or learning.
   instance) -- kept in the repo since it's still a valid script if
   streaming is revisited later, just unused for now.
 
-**Status**: Pick-and-place scene confirmed visually correct. Next: scripted
-(non-learned) reach/grasp/place motion -- likely via Isaac Lab's
-differential IK controller (`scripts/tutorials/05_controllers/run_diff_ik.py`)
-to command Cartesian targets rather than guessing joint angles -- as the
-sanity check before any domain randomization or learning goes in. Also
-worth validating the cube's placement distance against the real arm's
-actual reach once the physical arm is connected.
+### 2026-08-27 (continued) — First scripted grasp attempt (didn't grasp yet)
+
+- Wrote `sim/scripts/run_pickplace_demo.py`: scripted (non-learned)
+  reach/grasp/lift/place/release motion using Isaac Lab's
+  `DifferentialIKController` (position-only command mode) to command
+  Cartesian end-effector targets for the 5 arm joints, with the gripper
+  joint commanded directly and separately. Waypoint positions and
+  gripper open/closed joint values are initial guesses, explicitly flagged
+  in the code as unverified.
+- Wrote `sim/scripts/stitch_video.sh` (ffmpeg wrapper) to turn saved frame
+  sequences into mp4s.
+- Ran the demo: completed all 8 waypoints, 128 frames saved, stitched to
+  video and pulled to the local laptop mirror at
+  `sim/output/pickplace_demo.mp4`. Result: robot moved through the full
+  sequence quickly (expected -- no motion smoothing/speed limiting
+  implemented yet), but the cube's final position was unchanged from its
+  start -- the grasp did not succeed. Likely candidates: wrong
+  grasp-height waypoint, wrong gripper open/closed joint direction, or
+  both -- needs iterating against the video.
+- Realized (prompted by a good question from the user) that the current
+  scene/camera/motor setup was built for a first physics sanity check, not
+  for sim-to-real consistency. Created docs/sim_to_real_checklist.md to
+  track what still needs deliberate matching (camera extrinsics/intrinsics,
+  control interface/frequency, torque/PD gains) versus what's left to
+  domain randomization (the plan's actual strategy for the sim-to-real
+  gap, not full parameter matching).
+
+**Status**: Pick-and-place scene confirmed visually correct. Scripted grasp
+motion runs end-to-end but doesn't yet successfully grasp the cube -- next
+step is tuning waypoints/gripper direction against the video. Also tracking
+sim-to-real consistency gaps for later (see checklist doc), not blocking
+current sim-only iteration. Worth validating the cube's placement distance
+against the real arm's actual reach once the physical arm is connected.
