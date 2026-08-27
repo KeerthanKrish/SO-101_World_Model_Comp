@@ -59,6 +59,25 @@ downgrading and rebooting.
 
 ---
 
+**Decision**: Do not use Isaac Sim's WebRTC streaming for live remote viewing;
+stick with offscreen image/video capture instead.
+
+**Why**: Tried three ways to get the Isaac Sim WebRTC Streaming Client
+working over Tailscale to `100.71.12.16:8011` -- (1) plain connection to a
+generic empty streaming instance (connected then immediately disconnected,
+per `NVST_CCE_DISCONNECTED` in the server log), (2) explicit
+`--/app/livestream/publicEndpointAddress` set to the Tailscale IP (same
+result), (3) streaming our actual SO-101 scene directly via Isaac Lab's
+`--livestream 2 --kit_args` (this time no connection reached the server log
+at all). This matches widely-documented unreliability of Isaac Sim's WebRTC
+streaming outside NVIDIA's own cloud infrastructure (see docs/progress.md
+for sources). NoMachine remote desktop was identified as the reliable
+alternative but declined for now -- offscreen rendering (screenshot/video
+capture, already working) is the standing approach for visual checks. Revisit
+NoMachine if live interactive viewing becomes important later.
+
+---
+
 **Decision**: Local (Windows laptop) and remote (Ubuntu, `keerthan@100.71.12.16`)
 copies of the project are kept in sync via `scp`, on-demand only (when the
 user explicitly asks), not automatically.

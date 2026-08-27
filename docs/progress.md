@@ -144,6 +144,23 @@ randomization or learning.
   SO-101 spawns correctly on the table next to the cube, correct
   gripper/link geometry, no clipping or unstable physics.
 
+### 2026-08-27 (continued) — WebRTC live streaming attempted and abandoned
+
+- Tried to set up live remote viewing of Isaac Sim via its WebRTC
+  Streaming Client (user connected from the Windows laptop, server on the
+  Ubuntu machine at `100.71.12.16:8011` over Tailscale). Three attempts,
+  three different failure modes -- see docs/decisions.md for details.
+  Matches known, widely-reported unreliability of Isaac Sim's WebRTC
+  streaming outside NVIDIA's own cloud infrastructure.
+- Decision: stick with offscreen image capture (already working, see the
+  2026-08-27 entry above) for visual checks. NoMachine remote desktop was
+  identified as the reliable alternative if live interactive viewing
+  becomes important later, but declined for now.
+- Wrote `sim/scripts/stream_scene.py` during this attempt (loads the actual
+  pick-and-place scene with streaming flags, rather than an empty
+  instance) -- kept in the repo since it's still a valid script if
+  streaming is revisited later, just unused for now.
+
 **Status**: Pick-and-place scene confirmed visually correct. Next: scripted
 (non-learned) reach/grasp/place motion -- likely via Isaac Lab's
 differential IK controller (`scripts/tutorials/05_controllers/run_diff_ik.py`)
