@@ -46,6 +46,19 @@ with the code), not as a separate top-level location.
 
 ---
 
+**Decision**: Use NVIDIA driver 580 branch (580.173.02, `nvidia-driver-580-open`)
+instead of the 595 branch initially installed.
+
+**Why**: Isaac Sim 5.1.0's RTX renderer segfaults on Blackwell GPUs (this
+machine's RTX 5060 Ti included) with the 595.x driver branch -- a known,
+widely-reported issue (NVIDIA developer forums, isaac-sim/IsaacLab GitHub
+issues all show the same `librtx.scenedb.plugin.so` crash signature). The
+580 branch is NVIDIA's officially validated driver for Isaac Sim 5.1.0.
+Confirmed fix empirically: camera-enabled rendering worked immediately after
+downgrading and rebooting.
+
+---
+
 **Decision**: Local (Windows laptop) and remote (Ubuntu, `keerthan@100.71.12.16`)
 copies of the project are kept in sync via `scp`, on-demand only (when the
 user explicitly asks), not automatically.

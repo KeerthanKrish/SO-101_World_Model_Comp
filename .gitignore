@@ -1,6 +1,7 @@
 # External dependencies (cloned separately, not part of this repo's history)
 IsaacLab/
 lerobot/
+assets/
 
 # Python
 __pycache__/
@@ -9,6 +10,9 @@ __pycache__/
 .venv/
 env_isaaclab/
 lerobot_env/
+
+# Scratch simulation output (regeneratable) -- dated reference images live in docs/images/ instead
+sim/output/
 
 # Data / checkpoints / logs (large binary artifacts)
 *.pt

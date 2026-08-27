@@ -111,3 +111,43 @@ motion to sanity-check the physics before any learning goes in.
 stable physics). Next: build the actual pick-and-place scene (table, cube,
 camera) and a scripted (non-learned) reach/grasp motion, before any domain
 randomization or learning.
+
+### 2026-08-27 — Pick-and-place scene built and rendered; driver downgrade required
+
+- Wrote `sim/scenes/pickplace_scene.py` (`InteractiveSceneCfg`): ground
+  plane, dome light, static table (top surface at z=0), SO-101 robot, a
+  0.05kg cube 0.2m in front of the robot base (approximate reach guess, not
+  yet validated), and a fixed-viewpoint camera for offscreen rendering.
+- Wrote `sim/scripts/capture_scene_image.py`: builds the scene, settles
+  physics for 60 steps, aims the camera via `set_world_poses_from_view`,
+  and saves an RGB frame -- since there's no practical GPU-accelerated way
+  to view Isaac Sim's live 3D GUI over X11 forwarding to MobaXterm (see
+  docs/preferences.md), offscreen rendering is the way we'll visually
+  check scenes going forward.
+- Hit a real blocker: Isaac Sim 5.1.0 segfaulted on first camera-enabled
+  run (`librtx.scenedb.plugin.so` crash in the RTX/Hydra render path).
+  Root cause: a known incompatibility between Isaac Sim 5.1.0's RTX
+  renderer and the NVIDIA 595.x driver branch on Blackwell GPUs (confirmed
+  via multiple NVIDIA forum posts and isaac-sim/IsaacLab GitHub issues
+  with the same crash signature). Isaac Sim's officially validated driver
+  is the 580 branch. Downgraded: purged `nvidia-driver-595-open`,
+  installed `nvidia-driver-580-open` (580.173.02), rebooted. Camera
+  rendering worked immediately afterward -- confirms this was the actual
+  root cause, not a scene/config bug.
+- Also hit (again) the Kit shutdown-hang issue: `capture_scene_image.py`
+  finished and saved its output but the process didn't exit on its own;
+  had to kill it by exact PID (using `pkill -f <script>` risks matching
+  its own invocation's command-line text over SSH and killing the SSH
+  session itself -- happened twice this session; exact-PID `kill` is
+  safer).
+- Result: successfully rendered and pulled back an image confirming the
+  SO-101 spawns correctly on the table next to the cube, correct
+  gripper/link geometry, no clipping or unstable physics.
+
+**Status**: Pick-and-place scene confirmed visually correct. Next: scripted
+(non-learned) reach/grasp/place motion -- likely via Isaac Lab's
+differential IK controller (`scripts/tutorials/05_controllers/run_diff_ik.py`)
+to command Cartesian targets rather than guessing joint angles -- as the
+sanity check before any domain randomization or learning goes in. Also
+worth validating the cube's placement distance against the real arm's
+actual reach once the physical arm is connected.
