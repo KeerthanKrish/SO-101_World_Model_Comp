@@ -36,6 +36,15 @@ SO101_CFG = ArticulationCfg(
             solver_position_iteration_count=8,
             solver_velocity_iteration_count=0,
         ),
+        # No visual_material override here -- tried a uniform blue override
+        # for debug visibility, but that replaces ALL materials including
+        # the motor housings (originally black, distinct from the yellow-ish
+        # link plastic), losing that contrast. Getting "blue links, black
+        # motors" specifically needs per-mesh material assignment (targeting
+        # only the link meshes, leaving motor sub-mesh materials alone),
+        # which needs more USD-scripting effort than justified right now --
+        # keeping the original per-mesh materials instead. Revisit if
+        # per-mesh recoloring becomes worth the effort later.
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         joint_pos={

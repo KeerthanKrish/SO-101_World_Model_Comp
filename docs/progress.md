@@ -194,3 +194,82 @@ step is tuning waypoints/gripper direction against the video. Also tracking
 sim-to-real consistency gaps for later (see checklist doc), not blocking
 current sim-only iteration. Worth validating the cube's placement distance
 against the real arm's actual reach once the physical arm is connected.
+
+### 2026-08-27/28 -- Extended grasp-tuning session: real progress, still not grasping
+
+Long iterative session narrowing down why the scripted grasp wasn't working.
+Summary of what was tried, in order:
+
+1. **Jaw-offset bug found and fixed**: the tracked IK frame
+   (`gripper_frame_link`) is not at the fingertips -- it's ~8cm away from
+   where the jaws actually meet (confirmed both analytically, from the
+   URDF's fixed joint transforms, and empirically via `calibrate_grasp.py`
+   -- the two measurements agreed to within a few mm). Fixed by computing
+   a local-frame offset correction (`_JAW_OFFSET_LOCAL` in
+   `run_pickplace_demo.py`) and aiming for the corrected target instead of
+   the raw frame position. Real, working fix.
+2. **First version of the fix was unstable**: recomputing the offset
+   correction *every step* using the still-changing current orientation
+   created a feedback loop -- during a big motion (large orientation
+   swings), the estimated correction swung wildly, observed as the arm
+   lurching toward/through the floor. Fixed with a two-phase approach per
+   waypoint: move roughly into place first (orientation settles), *then*
+   compute the correction once from the settled pose and aim at that fixed
+   target for the rest of the waypoint's steps. This resolved the
+   floor-smashing entirely.
+3. **Wrist camera**: abandoned per user request after ~8 failed mount
+   configurations (see the "WebRTC...abandoned" entry above for the
+   general pattern -- same story, different feature). Scene now has two
+   additional *fixed* cameras instead (`side_camera`, `top_camera` in
+   `pickplace_scene.py`) for multi-angle diagnosis without relying on an
+   eye-in-hand view.
+4. **Robot color**: tried a uniform blue `visual_material` override for
+   debug visibility -- this replaced ALL materials including the
+   originally-black motor housings, losing that contrast (user preferred
+   the original look). Reverted entirely; getting "blue links, black
+   motors" specifically would need per-mesh material assignment (targeting
+   only link meshes, preserving motor sub-mesh materials), which needs
+   real USD-scripting effort not yet justified. Robot is back to its
+   original converted colors (yellow-ish links, black motors).
+5. **Tried rotating the gripper 90 deg** (locking `wrist_roll` to a fixed
+   absolute value -- learned along the way that this must be an absolute
+   override, not an incremental add-on-top-of-IK's-output-every-step,
+   since the latter compounds indefinitely). Visually confirmed the
+   rotation took effect (gripper's opening plane visibly changed), but
+   didn't fix the grasp -- the cube got shoved to a completely different
+   location (near the elbow/wrist), revealing a *different* problem: during
+   the uncorrected "phase 1" of each waypoint, the arm's body/wrist can
+   sweep low across the table at an uncontrolled angle and clip the cube
+   before the gripper even gets there, since position-only IK never
+   constrains orientation.
+6. **Tried full pose control** (position + a fixed "gripper points
+   straight down" target orientation, derived analytically as the
+   shortest-arc rotation sending the local jaw direction onto world -Z) to
+   fix the uncontrolled-approach-angle problem properly instead of
+   patching wrist_roll. This made things *worse*: the target orientation
+   turned out to be unreachable for this 5-DOF arm at this position, and
+   the damped-least-squares solver converged to a completely collapsed
+   configuration near the robot's base instead of reaching at all.
+   **Reverted** to the position-only two-phase approach (item 2 above) per
+   user decision -- it's the best-working version so far, even though the
+   grasp still isn't succeeding.
+7. Found and killed an orphaned process from `probe_gripper_geometry.py`
+   that had been silently running (and holding ~866MB of GPU memory) for
+   over 11 hours, undetected until an explicit `nvidia-smi` check --
+   process-name-specific checks (`ps aux | grep <script>`) can miss
+   orphans from earlier, differently-named scripts. Worth periodically
+   checking `nvidia-smi` broadly, not just for the specific process just
+   launched.
+
+**Current state**: position-only IK with the two-phase jaw-offset
+correction is the working baseline. The arm reliably reaches the correct
+neighborhood of the cube (no more floor-smashing, no more wild misses) and
+nudges the cube by a few cm on contact, but does not yet close around it
+and lift it. The remaining gap is almost certainly the uncontrolled
+approach angle during the coarse (phase 1) part of each waypoint --
+solving this without breaking anything else (as full pose control did) is
+the open problem.
+
+**Status**: Grasp still not succeeding. Position-only + two-phase offset
+correction is the stable baseline to keep iterating from. Wrist camera and
+per-mesh robot recoloring are explicitly parked, not abandoned.

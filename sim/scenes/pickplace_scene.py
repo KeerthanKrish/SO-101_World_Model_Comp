@@ -79,3 +79,47 @@ class PickPlaceSceneCfg(InteractiveSceneCfg):
         height=720,
         data_types=["rgb"],
     )
+
+    # extra fixed viewpoints for diagnosing grasp attempts without relying
+    # on the (currently unresolved, parked) wrist camera. Aimed via
+    # set_world_poses_from_view in the calling script, same as scene_camera.
+    side_camera = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/SideCamera",
+        offset=CameraCfg.OffsetCfg(pos=(0.2, -0.5, 0.1), convention="world"),
+        spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, clipping_range=(0.05, 5.0)),
+        width=960,
+        height=720,
+        data_types=["rgb"],
+    )
+    top_camera = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/TopCamera",
+        offset=CameraCfg.OffsetCfg(pos=(0.15, 0.0, 0.55), convention="world"),
+        spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, clipping_range=(0.05, 5.0)),
+        width=960,
+        height=720,
+        data_types=["rgb"],
+    )
+
+    # wrist/eye-in-hand camera, rigidly attached to gripper_frame_link.
+    # Two earlier approaches failed: (1) attached with a tiny 2cm offset,
+    # which put the camera almost inside our debug marker geometry; (2) a
+    # free-floating world camera repositioned every step via
+    # set_world_poses_from_view(eye, target) -- that helper assumes a fixed
+    # world "up" axis with no override, and our view direction (toward the
+    # jaw, which is mostly along the frame's local -Z) ends up nearly
+    # parallel to world-up at some arm poses, making its look-at math
+    # degenerate. A fixed rigid attachment sidesteps this: no runtime
+    # look-at computation, it just rotates with the arm. Position backs off
+    # ~1.8x the jaw offset so the jaw is in frame, not clipped through;
+    # rotation (180 deg about local X, "ros" convention) points the
+    # camera's forward (+Z in ROS convention) toward local -Z, the jaw's
+    # dominant direction (see _JAW_OFFSET_LOCAL in run_pickplace_demo.py --
+    # not exact since that offset isn't perfectly axis-aligned, but close).
+    wrist_camera = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/gripper_frame_link/WristCamera",
+        offset=CameraCfg.OffsetCfg(pos=(0.05, -0.034, 0.135), rot=(0.0, 1.0, 0.0, 0.0), convention="ros"),
+        spawn=sim_utils.PinholeCameraCfg(focal_length=12.0, clipping_range=(0.01, 2.0)),
+        width=480,
+        height=480,
+        data_types=["rgb"],
+    )
