@@ -30,8 +30,17 @@ _CUBE_POS = (0.2, 0.0, _CUBE_SIZE / 2)
 
 
 @configclass
-class PickPlaceSceneCfg(InteractiveSceneCfg):
-    """Configuration for the SO-101 pick-and-place scene."""
+class PickPlaceSceneBaseCfg(InteractiveSceneCfg):
+    """Physical scene only (table, robot, cube) -- no cameras.
+
+    Use this directly for interactive/teleop sessions where a human is
+    watching the native Kit viewport (mouse-navigable) rather than any of
+    our offscreen CameraCfg sensors -- those render every single frame
+    regardless of whether anything reads their output, and having 3-4 of
+    them active was a real, measurable source of lag during teleop.
+    PickPlaceSceneCfg (below) adds the offscreen cameras back for headless
+    scripted runs that need to save images/video.
+    """
 
     # ground plane
     ground = AssetBaseCfg(prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg())
@@ -60,13 +69,18 @@ class PickPlaceSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Cube",
         spawn=sim_utils.CuboidCfg(
             size=(_CUBE_SIZE, _CUBE_SIZE, _CUBE_SIZE),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(solver_position_iteration_count=8, solver_velocity_iteration_count=2),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
             collision_props=sim_utils.CollisionPropertiesCfg(),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.1, 0.1)),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=_CUBE_POS),
     )
+
+
+@configclass
+class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
+    """Pick-and-place scene with offscreen cameras, for headless scripted runs."""
 
     # fixed viewpoint camera for offscreen rendering (no live GUI available remotely).
     # Placeholder offset/rot below -- actual view direction is set at runtime via

@@ -34,7 +34,12 @@ SO101_CFG = ArticulationCfg(
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
             solver_position_iteration_count=8,
-            solver_velocity_iteration_count=0,
+            # Was 0 -- every single run's log carried a PhysX warning saying
+            # exactly this causes poor contact accuracy and recommending 1-2.
+            # Ignored it until teleop made the resulting clip-through
+            # (gripper visually passing into the cube instead of colliding)
+            # obvious and unmistakable.
+            solver_velocity_iteration_count=2,
         ),
         # No visual_material override here -- tried a uniform blue override
         # for debug visibility, but that replaces ALL materials including

@@ -273,3 +273,51 @@ the open problem.
 **Status**: Grasp still not succeeding. Position-only + two-phase offset
 correction is the stable baseline to keep iterating from. Wrist camera and
 per-mesh robot recoloring are explicitly parked, not abandoned.
+
+### 2026-08-29 -- Real arm connected, teleop working
+
+Machine now has a monitor, keyboard, and the leader arm physically
+attached (follower arm not yet connected). Full details in
+docs/real_arm_setup.md; summary here.
+
+- Reconnected on a new LAN IP (`10.0.0.240`, DHCP-assigned, changes on
+  reboot -- machine previously briefly power-cycled by accident, see
+  below).
+- Confirmed a real GUI window (not just headless offscreen rendering) can
+  be opened on the physical monitor from an SSH session, via
+  `DISPLAY=:1 XAUTHORITY=/run/user/1001/gdm/Xauthority`. Verified with a
+  screenshot (`ffmpeg -f x11grab`) before asking the user to confirm on
+  their own screen.
+- Leader arm calibrated (`lerobot-calibrate`, id `leader1`) -- needed
+  external power (not just USB) to be detected at all; calibration itself
+  is interactive and needs a real TTY, doesn't work through a
+  non-interactive SSH command.
+- **Discovered LeRobot and Isaac Sim can't share a Python process**:
+  LeRobot's source uses Python 3.12+ syntax, Isaac Sim requires 3.11.
+  Solved with a two-process file-based bridge: `leader_reader.py` (in the
+  `lerobot` env) writes live leader-arm state to a shared JSON file;
+  `teleop_bridge.py` (in `env_isaaclab`) polls it and drives the simulated
+  robot's joints. **Confirmed working** by the user -- moving the real
+  leader arm visibly drives the simulated arm in real time.
+- User-reported issues from the first teleop session, both fixed:
+  - Gripper visually clipping into the cube instead of colliding -- root
+    cause was `solver_velocity_iteration_count=0`, which every prior run's
+    log had actually warned about (PhysX explicitly recommending 1-2), just
+    never addressed. Bumped to 2 for both the robot and the cube.
+  - Noticeable lag, including in native mouse-driven viewport navigation
+    (not just leader-arm responsiveness) -- root cause was 3-4 `CameraCfg`
+    sensors rendering every frame regardless of whether their output was
+    read. Split the scene into `PickPlaceSceneBaseCfg` (physical scene
+    only, no cameras -- now used for teleop) and `PickPlaceSceneCfg`
+    (adds cameras back, for headless scripted/recording runs).
+- Accidentally shut down the user's own Windows laptop instead of just the
+  Ubuntu machine earlier in this session (misread "shutdown my computer"
+  as referring to the laptop) -- caught and aborted (`shutdown /a`) before
+  it triggered, per the user's immediate correction.
+
+**Status**: Teleoperation confirmed working end-to-end (real arm -> live
+sim). Fixes for clipping/lag just applied, not yet re-confirmed by the
+user. Next: have the user teleoperate an actual successful pick-and-place,
+recorded via teleop_bridge.py's JSON output, then use that recording to
+(a) extract real grasp parameters for the scripted demo and (b) serve as
+demonstration data for the model-training side of the project.
