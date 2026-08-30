@@ -132,16 +132,24 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
     # -Y (image "up") points along world -X (back toward the robot base,
     # so the arm appears near the top of frame) -- a 180-degree rotation
     # about the world (1,1,0) axis, quaternion (0, 1/sqrt2, 1/sqrt2, 0).
-    # Position offset toward +X (into the reachable workspace, past the
-    # cube) so the robot base sits near the top of frame instead of dead
-    # center -- found empirically (test_wrist_fov_and_topdown.py) since
-    # our 0.6m table is much smaller than the user's real cardboard
-    # workspace and can't fully fill the frame the way the reference photo
-    # does without cropping the table's edges.
+    # Position: x=0.15 centers the visible footprint over the table's
+    # actual usable depth. Correction from an earlier attempt at x=0.35 --
+    # that assumed the robot sits at the NEAR edge of the visible table
+    # (like the user's real cardboard sheet, which only extends forward
+    # from the arm), but our sim table is centered ON the robot (spans
+    # -0.3 to +0.3m), so only 0-0.3m ahead of the base is usable table.
+    # x=0.35 aimed the camera mostly past that edge, showing empty ground
+    # instead of tabletop for most of the frame. x=0.15 (the midpoint of
+    # the usable 0-0.3m range) plus a higher standoff (z=0.85, focal
+    # length 16.0) reproduces the reference photo's proportions much more
+    # closely: tabletop fills the full width and most of the height, arm
+    # near the top -- found empirically, see test_wrist_fov_and_topdown.py
+    # and docs/real_camera_setup.md for the comparison against a live
+    # capture from the real camera.
     top_camera = CameraCfg(
         prim_path="{ENV_REGEX_NS}/TopCamera",
         offset=CameraCfg.OffsetCfg(
-            pos=(0.35, 0.0, 0.85), rot=(0.0, 0.70710678, 0.70710678, 0.0), convention="ros"
+            pos=(0.15, 0.0, 0.85), rot=(0.0, 0.70710678, 0.70710678, 0.0), convention="ros"
         ),
         # width/height set to 16:9 to match the real top-down camera
         # (a Logitech C922 Pro Stream Webcam, confirmed via v4l2-ctl on

@@ -58,7 +58,7 @@ _WRIST_POS = (-0.00080248, -0.07002216, -0.00996772)
 _WRIST_ROT = (0.03478796, 0.02019336, -0.98402225, -0.17344234)
 _WRIST_FOCAL_LENGTHS = {"fov_fl10": 10.0, "fov_fl8": 8.0, "fov_fl6": 6.0}
 
-_TOPDOWN_POS = (0.15, 0.0, 0.55)
+_TOPDOWN_POS = (0.15, 0.0, 0.85)
 _TOPDOWN_ROT = (0.0, 0.70710678, 0.70710678, 0.0)
 
 
@@ -82,14 +82,19 @@ def main():
                 data_types=["rgb"],
             ),
         )
-    scene_cfg.cam_topdown = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Cam_topdown",
-        offset=CameraCfg.OffsetCfg(pos=_TOPDOWN_POS, rot=_TOPDOWN_ROT, convention="ros"),
-        spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, clipping_range=(0.05, 5.0)),
-        width=640,
-        height=640,
-        data_types=["rgb"],
-    )
+    for fl_name, fl in {"td_fl8": 8.0, "td_fl10": 10.0, "td_fl12": 12.0, "td_fl16": 16.0}.items():
+        setattr(
+            scene_cfg,
+            f"cam_{fl_name}",
+            CameraCfg(
+                prim_path=f"{{ENV_REGEX_NS}}/Cam_{fl_name}",
+                offset=CameraCfg.OffsetCfg(pos=_TOPDOWN_POS, rot=_TOPDOWN_ROT, convention="ros"),
+                spawn=sim_utils.PinholeCameraCfg(focal_length=fl, clipping_range=(0.05, 5.0)),
+                width=960,
+                height=540,
+                data_types=["rgb"],
+            ),
+        )
 
     scene = InteractiveScene(scene_cfg)
     sim.reset()
@@ -133,7 +138,7 @@ def main():
         scene.update(sim_dt)
 
     sim.render()
-    for name in list(_WRIST_FOCAL_LENGTHS.keys()) + ["topdown"]:
+    for name in list(_WRIST_FOCAL_LENGTHS.keys()) + ["td_fl8", "td_fl10", "td_fl12", "td_fl16"]:
         cam = scene[f"cam_{name}"]
         rgb = cam.data.output["rgb"][0, ..., :3].cpu().numpy()
         out_path = os.path.join(args_cli.output_dir, f"{name}.png")

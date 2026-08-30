@@ -164,17 +164,33 @@ Two things needed fixing in `top_camera` to match this:
    (straight down), local -Y (image "up") onto world -X (back toward the
    robot base, so the arm appears near the top of frame like the
    reference) -- a 180-degree rotation about the world `(1,1,0)` axis,
-   quaternion `(0, 1/sqrt2, 1/sqrt2, 0)`. Position and height then tuned
-   empirically (`test_wrist_fov_and_topdown.py`) across a few iterations:
-   too low/centered showed only the arm filling the frame; too high/far
-   showed mostly empty ground beyond our (much smaller than the user's
-   real cardboard sheet) 0.6m table. Settled on `pos=(0.35, 0.0, 0.85)`,
-   `focal_length=16.0` -- arm near the top of frame, most of the visible
-   area is the tabletop, closest achievable match given the sim table's
-   size (matching the reference's near-total table fill would need a
-   larger sim table, a separate scene change, not just a camera tweak).
+   quaternion `(0, 1/sqrt2, 1/sqrt2, 0)`. Position tuned empirically
+   (`test_wrist_fov_and_topdown.py`), initially settled on
+   `pos=(0.35, 0.0, 0.85)`, `focal_length=16.0` -- see correction below,
+   this position was wrong.
 
-**Open question still standing**: is a second real camera actually
-planned to match this view, or is it a sim-only visualization aid? The
-photo suggests a real overhead camera may be planned, but this hasn't been
-explicitly confirmed.
+**Resolved**: a second real camera (Logitech C922 Pro Stream Webcam) was
+in fact connected to the Ubuntu box. A live capture from it
+(`ffmpeg -f v4l2 ... /dev/video2`) revealed the `pos=(0.35, ...)` config
+above didn't actually match: the real photo shows the cardboard workspace
+filling nearly the *entire* frame height, arm hugging just the top edge.
+
+**Root cause**: `x=0.35` assumed the robot sits at the *near edge* of the
+visible table, matching the real setup where the cardboard only extends
+forward from the arm. But our sim table is centered ON the robot (spans
+-0.3 to +0.3m in x), so only the 0 to +0.3m range ahead of the base is
+actually usable/reachable table -- `x=0.35` aimed the camera's footprint
+mostly past that edge, showing empty ground for most of the frame instead
+of tabletop.
+
+**Fix**: recentered to `x=0.15` (the midpoint of the 0-0.3m usable range)
+and re-swept `focal_length` at that position (8/10/12/16) -- higher
+focal_length = *more* zoomed in for this camera model, opposite of what
+lower values did on the wrist camera (that one only ever tested a narrow
+range where the relationship happened to look monotonic in one
+direction -- worth remembering that "which way is wider" isn't always
+intuitive and should be checked empirically per-camera, not assumed from
+a previous camera's tuning). `focal_length=16.0` at `pos=(0.15, 0.0, 0.85)`
+reproduced the reference proportions closely: tabletop filling the full
+width and most of the height, arm near the top. This is now the final
+config -- see `pickplace_scene.py`'s `top_camera`.
