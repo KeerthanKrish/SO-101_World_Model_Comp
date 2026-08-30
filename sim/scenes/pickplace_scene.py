@@ -143,9 +143,14 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
         offset=CameraCfg.OffsetCfg(
             pos=(0.35, 0.0, 0.85), rot=(0.0, 0.70710678, 0.70710678, 0.0), convention="ros"
         ),
+        # width/height set to 16:9 to match the real top-down camera
+        # (a Logitech C922 Pro Stream Webcam, confirmed via v4l2-ctl on
+        # the Ubuntu box -- native capture up to 1920x1080). Previously
+        # 960x720 (4:3), which doesn't match the real sensor's aspect
+        # ratio at all.
         spawn=sim_utils.PinholeCameraCfg(focal_length=16.0, clipping_range=(0.05, 5.0)),
         width=960,
-        height=720,
+        height=540,
         data_types=["rgb"],
     )
 
@@ -174,6 +179,10 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
     # just wanted to see more of the scene. Tested 6.0 and 10.0 side by
     # side (test_wrist_fov_and_topdown.py); user picked 10.0 as the closer
     # match -- 6.0 was wider than the real camera's actual FOV.
+    # width/height set to 16:9 to match the real wrist camera (a generic
+    # "Web Camera" USB module, confirmed via v4l2-ctl and a live test
+    # capture on the Ubuntu box -- native capture at 1280x720). Previously
+    # 480x480 (square), which doesn't match the real sensor's aspect ratio.
     wrist_camera = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/gripper_link/WristCamera",
         offset=CameraCfg.OffsetCfg(
@@ -183,6 +192,6 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
         ),
         spawn=sim_utils.PinholeCameraCfg(focal_length=10.0, clipping_range=(0.005, 2.0)),
         width=480,
-        height=480,
+        height=270,
         data_types=["rgb"],
     )
