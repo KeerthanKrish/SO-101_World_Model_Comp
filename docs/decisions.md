@@ -85,3 +85,47 @@ user explicitly asks), not automatically.
 **Why**: Avoids unnecessary token usage from rewriting files on both sides,
 and avoids syncing on a timer for no reason. Implementation work (code,
 running experiments, robots, GPU) all happens on the Ubuntu machine.
+
+---
+
+**Decision**: The pick-and-place reward function (`sim/envs/pickplace_reward.py`)
+uses two-phase potential-based shaping (approach -> transport, switching at
+the grasp event) with tanh-bounded distance terms, rather than a single
+continuous reward (e.g. cube height) or raw negative distance.
+
+**Why**: A pure height-based reward has no incentive to ever place the cube
+back down, since placing requires lowering it again at the target -- it would
+fight against the actual goal. Framing the post-grasp phase as "distance to a
+3D target point at table height" makes lift -> move -> lower one continuous,
+non-conflicting signal. tanh-bounding (rather than raw distance) keeps the
+reward smooth and bounded, which matters because TD-MPC2 trains a neural
+network to predict this value -- a bounded target is an easier regression
+problem than an unbounded one. See docs/reward_function.md for the full
+design writeup.
+
+---
+
+**Decision**: Grasp detection requires cube height + gripper joint angle +
+gripper-to-cube proximity, all three together -- not just height and joint
+angle.
+
+**Why**: Caught empirically, not by code review -- validating the reward
+against a real captured teleop episode showed a false positive where a cube
+barely above rest height (still settling from a previous rep) plus a
+coincidentally-closed gripper joint elsewhere on the table registered as
+"grasped." No contact sensor exists on the gripper yet, so this is a
+heuristic; a proper `ContactSensorCfg` would be a more principled fix if
+misdetection becomes a real problem once training starts.
+
+---
+
+**Decision**: The reward function's place target reuses `run_pickplace_demo.py`'s
+existing place-zone location, `(-0.15, 0.15, ...)`, rather than defining a
+new one.
+
+**Why**: One arbitrary place location per project, not two independently-
+drifting ones. Fixed (not yet randomized) for this first version, since a
+fixed position is what allowed empirical validation against real recorded
+(fixed-position) demonstrations -- will need to become randomized once
+domain randomization for object/target pose is wired in, per the project
+plan.

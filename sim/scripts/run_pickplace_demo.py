@@ -68,17 +68,8 @@ from isaaclab.scene import InteractiveScene
 from isaaclab.sim import SimulationContext
 from isaaclab.utils.math import combine_frame_transforms, subtract_frame_transforms
 
-# Fixed local-frame offset from gripper_frame_link's origin to the gripper
-# joint's pivot (where the jaws actually meet), derived from the URDF's
-# fixed joint transforms (gripper_frame_joint and the gripper joint's
-# origin, both relative to gripper_link) -- see docs/so101_asset_notes.md.
-# This is constant regardless of arm pose (both frames are rigidly attached
-# to gripper_link), unlike a world-frame offset which rotates with the
-# wrist. Verified: its magnitude (~8.2cm) matches an empirical world-frame
-# measurement taken at one specific arm pose via calibrate_grasp.py.
-_JAW_OFFSET_LOCAL = (-0.0281, 0.019018, -0.0747274)
-
 sys.path.insert(0, "/home/keerthan/SO-101-WM/sim")
+from robots.grasp_geometry import JAW_OFFSET_LOCAL as _JAW_OFFSET_LOCAL  # isort:skip
 from scenes.pickplace_scene import PickPlaceSceneCfg  # isort:skip
 
 # Confirmed empirically via calibrate_grasp.py + visual inspection of the

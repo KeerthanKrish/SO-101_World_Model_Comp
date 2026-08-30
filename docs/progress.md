@@ -489,3 +489,94 @@ exists).
 Rendered confirmation at
 `sim/output/wrist_cam_test6/negy_7cm.png` (same pos/rot now baked into
 `pickplace_scene.py`).
+
+### 2026-08-30 (continued) -- Camera FOV, real hardware queried directly, top-down camera fixed
+
+User connected both real cameras (wrist "Web Camera" + a Logitech C922
+for top-down) to the Ubuntu box, live. Queried both directly via
+`v4l2-ctl`/`ffmpeg` instead of guessing specs:
+
+- Wrist camera: native 1280x720. Top-down (C922): native up to 1920x1080.
+  Both 16:9 -- sim cameras were mismatched (wrist 480x480 square,
+  `top_camera` 960x720 4:3). Corrected both to 16:9.
+- Wrist `focal_length` widened per user feedback after reviewing the
+  first working render; user compared 6/8/10mm side by side and picked
+  10.0 as the closer match to the real camera's actual FOV.
+- `top_camera`'s position was wrong in a way only a live real-camera
+  capture exposed: it assumed the robot sits at the *near edge* of the
+  visible table (matching the user's real cardboard sheet, which only
+  extends forward from the arm), but the sim table is centered ON the
+  robot -- only 0-0.3m ahead of the base is usable. The camera was aimed
+  mostly past that edge, showing empty ground for most of the frame.
+  Recentered and re-tuned; now closely matches the real camera's
+  proportions (tabletop fills most of the frame, arm near the top).
+- Real wrist camera's raw output has a visible vignette + warm color
+  cast, absent from sim. Decision: leave uncorrected -- domain
+  randomization already varies sim color/lighting broadly, and the
+  planned real-data fine-tuning phase trains directly on this camera's
+  actual output anyway, which is a more direct fix than synthetically
+  reproducing a lens artifact. See docs/sim_to_real_checklist.md.
+
+Also noticed (unrelated, caught while investigating): Ubuntu's crash
+reporter (`apport`) had generated a crash report for
+`xdg-desktop-portal-gnome`, timestamped right when a script was
+accidentally launched in GUI mode with no display attached (forgot
+`--headless`) -- explains why the user was seeing intermittent "Ubuntu
+has experienced an internal error" popups on the physical monitor mid-
+session. Not a hardware/OS health issue, just fallout from that one
+mistake; fixed by always passing `--headless` going forward.
+
+**Status**: Both cameras now aspect-matched and position/FOV-tuned
+against live real hardware, not just static reference photos. See
+docs/real_camera_setup.md and docs/sim_to_real_checklist.md for full
+details.
+
+### 2026-08-30 (continued) -- Reward function implemented and validated
+
+Implemented the reward function for the TD-MPC2 world-model side of the
+comparison (the diffusion policy never needs one -- see
+docs/reward_function.md for the full writeup, condensed here).
+
+- Extracted `JAW_OFFSET_LOCAL` (the calibrated gripper-frame-to-fingertip
+  offset) out of `run_pickplace_demo.py` into a new dependency-free
+  module, `sim/robots/grasp_geometry.py` -- the demo script boots Isaac
+  Sim as an import side effect, so the constant couldn't be safely
+  imported from anywhere else before this.
+- Wrote `sim/envs/pickplace_reward.py`: two-phase potential-based shaping
+  (approach -> transport, switching on the grasp event, to avoid a naive
+  height-reward fighting against ever placing the cube), tanh-bounded
+  distance terms, a proximity+height+joint-angle grasp heuristic, a
+  sparse success bonus, and a small action-energy penalty. Fully
+  self-contained (stdlib only) so it's importable/testable without
+  booting Isaac Sim. Reuses the scripted demo's existing place-zone
+  location `(-0.15, 0.15, ...)` rather than inventing a second one.
+- Validated two ways: (1) a synthetic self-test with hand-constructed
+  states, all passing; (2) replaying real captured teleop demonstrations
+  (`sim/scripts/validate_reward_function.py`) through the actual reward
+  function using live simulated state + real forward-kinematics-derived
+  gripper position. This caught two real bugs neither the self-test nor
+  code review found: the validation script was resetting the cube/robot
+  to scene defaults instead of the episode's own recorded starting state
+  (these episodes are segments of one continuous session, so they don't
+  start from a clean reset), and once fixed, a false-positive grasp
+  detection (cube barely above rest height + coincidentally-closed
+  gripper joint far away registering as "grasped") -- fixed by adding a
+  `grasp_proximity_threshold` requirement, with a regression test added.
+- Confirmed after fixes: approach-phase reward rises/falls sensibly
+  across ~930 combined real simulated steps (two episodes), no false
+  positives, no NaNs/crashes. Confirmed limitation, not swept under the
+  rug: neither replayed episode ever reproduced an actual lift in
+  open-loop replay, even the one with the strongest original recorded
+  peak (0.149m) -- matches `replay_episode.py`'s own documented caveat
+  that open-loop replay is sensitive to small differences and doesn't
+  reliably reproduce a contact-dependent outcome even from matched
+  starting conditions. So the grasp/transport/success-bonus half of the
+  reward is validated only synthetically, not against real data --
+  documented explicitly as an open item.
+
+**Status**: Reward function implemented, self-tested, and empirically
+validated against real data as far as open-loop replay allows. Not yet
+wired into an actual Gym-style training environment (`reset()`/`step()`)
+-- that's the next piece of infrastructure needed before RL training can
+start. See docs/reward_function.md for the complete design rationale and
+validation details.
