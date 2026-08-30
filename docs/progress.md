@@ -580,3 +580,44 @@ wired into an actual Gym-style training environment (`reset()`/`step()`)
 -- that's the next piece of infrastructure needed before RL training can
 start. See docs/reward_function.md for the complete design rationale and
 validation details.
+
+### 2026-08-30 (continued) -- Top-down camera still not matching; evaluation plan written
+
+User re-checked all four camera views after the FOV/aspect-ratio fixes
+and felt the top-down camera still doesn't match the real C922's view
+well. Diagnosis: the remaining gap isn't a camera-angle problem anymore,
+it's a **table size mismatch** -- the sim table is a fixed 0.6m square
+centered on the robot, while the user's real cardboard workspace is much
+larger and only extends forward from the arm. No camera position can
+fully compensate for that scale difference.
+
+Recommended two options rather than physically repositioning the real
+camera to chase the current (fairly arbitrary) sim table size: (1)
+enlarge the sim table to better match the real workspace's proportions
+-- the more durable, root-cause fix -- or (2) lean on camera-pose domain
+randomization during training so the trained policy tolerates imperfect
+real-camera alignment rather than needing pixel-perfect matching,
+consistent with the project's existing "not aiming for a perfect
+match" philosophy (sim_to_real_checklist.md). **Not yet implemented --
+awaiting user decision on whether to resize the table.**
+
+User then asked for a detailed look ahead at how the world model and
+diffusion policy will actually be compared once both are trained -- this
+being "the important part of the project." Wrote
+docs/evaluation_plan.md: eight concrete comparison tests (sample
+efficiency, novel start-position generalization, mid-episode perturbation
+recovery, visual domain shift, distractor objects, zero-shot sim-to-real
+transfer, inference latency, multi-modal demonstration handling), each
+with why it differentiates model-based planning from reactive imitation,
+plus a "data collection pre-planning checklist" section -- several of
+these tests only work if specific decisions (train/held-out position
+splits, reserved real-world eval positions, deliberately varied teleop
+demonstration style) are made *before* bulk data collection, not after,
+since some of these can only be fixed by recollecting data from scratch
+if gotten wrong.
+
+**Status**: Evaluation plan documented in detail, ahead of any actual
+training work (none has started yet). Top-down camera fix pending user
+decision (resize table vs. rely on randomization). Next: resolve the
+table-size question, then proceed toward wiring the reward function into
+an actual training env once ready.
