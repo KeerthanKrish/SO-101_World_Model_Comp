@@ -133,24 +133,26 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
         data_types=["rgb"],
     )
 
-    # wrist/eye-in-hand camera, rigidly attached to gripper_frame_link.
-    # Two earlier approaches failed: (1) attached with a tiny 2cm offset,
-    # which put the camera almost inside our debug marker geometry; (2) a
-    # free-floating world camera repositioned every step via
-    # set_world_poses_from_view(eye, target) -- that helper assumes a fixed
-    # world "up" axis with no override, and our view direction (toward the
-    # jaw, which is mostly along the frame's local -Z) ends up nearly
-    # parallel to world-up at some arm poses, making its look-at math
-    # degenerate. A fixed rigid attachment sidesteps this: no runtime
-    # look-at computation, it just rotates with the arm. Position backs off
-    # ~1.8x the jaw offset so the jaw is in frame, not clipped through;
-    # rotation (180 deg about local X, "ros" convention) points the
-    # camera's forward (+Z in ROS convention) toward local -Z, the jaw's
-    # dominant direction (see _JAW_OFFSET_LOCAL in run_pickplace_demo.py --
-    # not exact since that offset isn't perfectly axis-aligned, but close).
+    # wrist/eye-in-hand camera, rigidly attached to gripper_link (matches
+    # where the user's real webcam is actually mounted -- see
+    # docs/real_camera_setup.md). Two earlier attempts (attached to
+    # gripper_frame_link, various guessed rotations) failed -- one put the
+    # camera inside our own debug marker geometry, the rest just guessed
+    # wrong rotations and saw either the robot's own body or empty space.
+    # This one instead computes the rotation analytically: the "gripper"
+    # joint's URDF <origin> (0.0202, 0.0188, -0.0234) IS the jaw pivot's
+    # position directly in gripper_link's own local frame (URDF joint
+    # origins are relative to the parent link), so no guessing was needed
+    # -- rotation sends local +Z ("forward" in ROS convention) onto that
+    # normalized direction, and position backs off 9cm along the opposite
+    # direction (matching the standoff visible in the real bracket photo).
+    # Confirmed working: renders show both the gripper and the cube in
+    # frame, unlike every earlier attempt.
     wrist_camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/gripper_frame_link/WristCamera",
-        offset=CameraCfg.OffsetCfg(pos=(0.05, -0.034, 0.135), rot=(0.0, 1.0, 0.0, 0.0), convention="ros"),
+        prim_path="{ENV_REGEX_NS}/Robot/gripper_link/WristCamera",
+        offset=CameraCfg.OffsetCfg(
+            pos=(-0.05025, -0.04677, 0.05821), rot=(0.42027, -0.61815, 0.66412, 0.0), convention="ros"
+        ),
         spawn=sim_utils.PinholeCameraCfg(focal_length=12.0, clipping_range=(0.01, 2.0)),
         width=480,
         height=480,
