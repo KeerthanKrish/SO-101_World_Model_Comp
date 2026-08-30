@@ -77,9 +77,9 @@ What changed:
    real bracket's visible height suggested. 5cm was still too close;
    7cm and 9cm both worked, 9cm chosen for a slightly wider view.
 
-Confirmed working: renders now show both the gripper mechanism and the
-cube on the table in frame -- see `sim/scenes/pickplace_scene.py`'s
-`wrist_camera` for the final config.
+Renders at the time showed both the gripper mechanism and the cube on
+the table in frame -- looked plausible, but see the correction below:
+this render did NOT actually match the user's reference photo framing.
 
 **Lesson for next time a camera/frame orientation needs figuring out**:
 before guessing candidate rotations, check whether the needed direction is
@@ -87,6 +87,60 @@ already sitting in a URDF `<origin>` tag relative to the body being
 attached to -- URDF joint origins are relative to the *parent* link, so if
 attaching to that same parent, the direction is already known exactly,
 no trial and error required.
+
+## Status: round-3 correction -- wrong target point (2026-08-30)
+
+User sent 5 additional reference photos plus the actual camera-view still
+frame (not saved as separate files -- described here). Two clarifications
+that corrected assumptions above:
+
+1. The camera is mounted on the **gripper assembly**, not the wrist --
+   this was initially misread as "moves with the jaw," prompting a
+   (wrong) attempt to attach the camera to `moving_jaw_so101_v1_link`.
+   The user then clarified: it does **not** move with the gripper
+   opening/closing -- it's solidly mounted on the static housing. So the
+   attachment point (`gripper_link`) from the first "working" attempt was
+   actually correct all along.
+2. The real bug was the **aim point**. The first attempt's rotation aimed
+   the camera at the "gripper" joint's URDF origin -- but that's only the
+   position of the moving jaw's *pivot/hinge*, near the base of the
+   mechanism. Aiming at a hinge point produces a foreshortened view of
+   the whole gripper body (confirmed by re-inspecting the "working"
+   render: it showed a blobby yellow mechanism, not two distinct fingers)
+   -- not the tight, fingertip-converging framing in the reference
+   photos.
+
+   The fix: `gripper_link` has a second fixed child frame,
+   `gripper_frame_link` (Isaac Lab's actual IK end-effector frame),
+   attached via `gripper_frame_joint` with URDF `<origin>`
+   `(-0.0079, -0.000218121, -0.0981274)` -- overwhelmingly along local
+   -Z. That's the direction from the housing straight down the fingers
+   toward the actual grasp point, not the pivot. Re-aiming the camera at
+   that direction instead was the key correction.
+3. The perpendicular "which way is up on the housing" axis still had no
+   analytical shortcut (unlike the aim direction), so it was found by
+   rendering candidates across all 4 lateral directions (`+X`, `-X`,
+   `+Y`, `-Y`) at a few standoffs each (`test_wrist_camera_angles5.py`,
+   `test_wrist_camera_angles6.py`). Short standoffs (1-5cm along the
+   lateral axis alone) still landed inside the housing's own solid mesh
+   (near-clip artifacts, flat color, no scene visible) -- same lesson as
+   the very first attempt: the servo-box part of `gripper_link` is bigger
+   than a few cm across. `-Y` at 7cm finally reproduced the reference
+   framing: two fingertips entering the bottom corners, tabletop filling
+   the rest.
+
+Final config (`sim/scenes/pickplace_scene.py`'s `wrist_camera`):
+attached to `gripper_link`, `pos=(-0.00080248, -0.07002216, -0.00996772)`,
+`rot=(0.03478796, 0.02019336, -0.98402225, -0.17344234)` (ROS
+convention), 20-degree tilt applied on top of the analytically-aimed
+base rotation. Render matches the reference photo's framing.
+
+**Updated lesson**: when a URDF has more than one child frame off the
+attachment body, check which one actually represents the direction
+needed (a fingertip/end-effector frame vs. a joint pivot are very
+different directions even though both originate from the same parent
+link) -- don't assume the first candidate origin found is the right one
+without sanity-checking what it geometrically represents.
 
 ## Status: top-down (context) camera
 

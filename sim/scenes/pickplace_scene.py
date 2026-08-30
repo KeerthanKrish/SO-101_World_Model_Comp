@@ -133,27 +133,34 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
         data_types=["rgb"],
     )
 
-    # wrist/eye-in-hand camera, rigidly attached to gripper_link (matches
-    # where the user's real webcam is actually mounted -- see
-    # docs/real_camera_setup.md). Two earlier attempts (attached to
-    # gripper_frame_link, various guessed rotations) failed -- one put the
-    # camera inside our own debug marker geometry, the rest just guessed
-    # wrong rotations and saw either the robot's own body or empty space.
-    # This one instead computes the rotation analytically: the "gripper"
-    # joint's URDF <origin> (0.0202, 0.0188, -0.0234) IS the jaw pivot's
-    # position directly in gripper_link's own local frame (URDF joint
-    # origins are relative to the parent link), so no guessing was needed
-    # -- rotation sends local +Z ("forward" in ROS convention) onto that
-    # normalized direction, and position backs off 9cm along the opposite
-    # direction (matching the standoff visible in the real bracket photo).
-    # Confirmed working: renders show both the gripper and the cube in
-    # frame, unlike every earlier attempt.
+    # wrist/eye-in-hand camera, rigidly attached to gripper_link (the
+    # static wrist/servo housing -- matches where the user's real webcam
+    # is actually mounted; it does NOT move with the moving jaw's
+    # open/close motion). See docs/real_camera_setup.md for the full
+    # history: an earlier "round 2" attempt aimed the camera at the
+    # "gripper" joint's URDF origin, which is only the moving jaw's pivot
+    # point near the base -- that produced a foreshortened view of the
+    # whole mechanism, not the tight fingertip-converging framing in the
+    # user's reference photos. This config instead aims at
+    # gripper_frame_link (gripper_frame_joint's URDF <origin>,
+    # (-0.0079, -0.000218121, -0.0981274) in gripper_link's own local
+    # frame) -- that's Isaac Lab's actual IK end-effector/fingertip frame,
+    # so "down the fingers" is almost exactly local -Z. Rotation sends
+    # local +Z (ROS "forward") onto that direction, tilted 20 degrees
+    # toward -Y, with position backed off 7cm along -Y plus a small
+    # forward push -- found by testing standoffs/tilts empirically (no
+    # analytical shortcut for the perpendicular "which way is up on the
+    # housing" axis). Confirmed working: renders show two fingertips
+    # converging into the bottom of frame with the tabletop filling the
+    # rest, matching the user's real camera's reference photo.
     wrist_camera = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/gripper_link/WristCamera",
         offset=CameraCfg.OffsetCfg(
-            pos=(-0.05025, -0.04677, 0.05821), rot=(0.42027, -0.61815, 0.66412, 0.0), convention="ros"
+            pos=(-0.00080248, -0.07002216, -0.00996772),
+            rot=(0.03478796, 0.02019336, -0.98402225, -0.17344234),
+            convention="ros",
         ),
-        spawn=sim_utils.PinholeCameraCfg(focal_length=12.0, clipping_range=(0.01, 2.0)),
+        spawn=sim_utils.PinholeCameraCfg(focal_length=12.0, clipping_range=(0.005, 2.0)),
         width=480,
         height=480,
         data_types=["rgb"],

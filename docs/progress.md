@@ -462,3 +462,30 @@ and (eventually) model training data, per the plan from earlier.
 start a new Isaac Sim session per user's explicit request this time. Next:
 either collect more episodes in a future session to grow the batch, or
 start using these 8 for parameter extraction / training data prep.
+
+### 2026-08-30 (continued) -- Wrist camera round-3 correction
+
+User sent additional reference photos and pointed out the round-2 "working"
+wrist camera didn't actually match: it aimed at the moving jaw's pivot
+point (a hinge near the base) instead of down the fingers toward the grasp
+point. Also clarified the camera does NOT move with the gripper's
+open/close motion -- it's solidly mounted on the static housing
+("gripper_link"), confirming that attachment point was right, just the aim
+direction was wrong.
+
+Fix: re-aimed at "gripper_frame_link" (Isaac Lab's own IK end-effector
+frame, via "gripper_frame_joint"'s URDF origin) instead of the "gripper"
+joint's origin -- that's almost exactly local -Z from "gripper_link",
+i.e. actually down the fingers. Found the remaining "which lateral axis is
+up" offset empirically (test_wrist_camera_angles5.py,
+test_wrist_camera_angles6.py) -- "-Y" at a 7cm standoff reproduced the
+reference photo's framing (fingertips converging at the bottom of frame,
+tabletop filling the rest). Updated "pickplace_scene.py"'s "wrist_camera"
+and docs/real_camera_setup.md with full details and the corrected lesson
+(check what a URDF child frame actually represents, not just that one
+exists).
+
+**Status**: Wrist camera now matches the reference photo's framing.
+Rendered confirmation at
+`sim/output/wrist_cam_test6/negy_7cm.png` (same pos/rot now baked into
+`pickplace_scene.py`).
