@@ -169,9 +169,11 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
     # housing" axis). Confirmed working: renders show two fingertips
     # converging into the bottom of frame with the tabletop filling the
     # rest, matching the user's real camera's reference photo.
-    # focal_length lowered from 12.0 to 6.0 (wider FOV) per user feedback
-    # after reviewing the first working render -- framing/direction was
-    # right, just wanted to see more of the scene.
+    # focal_length lowered from 12.0 (wider FOV) per user feedback after
+    # reviewing the first working render -- framing/direction was right,
+    # just wanted to see more of the scene. Tested 6.0 and 10.0 side by
+    # side (test_wrist_fov_and_topdown.py); user picked 10.0 as the closer
+    # match -- 6.0 was wider than the real camera's actual FOV.
     wrist_camera = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/gripper_link/WristCamera",
         offset=CameraCfg.OffsetCfg(
@@ -179,7 +181,7 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
             rot=(0.03478796, 0.02019336, -0.98402225, -0.17344234),
             convention="ros",
         ),
-        spawn=sim_utils.PinholeCameraCfg(focal_length=6.0, clipping_range=(0.005, 2.0)),
+        spawn=sim_utils.PinholeCameraCfg(focal_length=10.0, clipping_range=(0.005, 2.0)),
         width=480,
         height=480,
         data_types=["rgb"],
