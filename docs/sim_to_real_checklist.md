@@ -22,13 +22,32 @@ arbitrary/placeholder values, because randomization doesn't fix them:
   `wrist_camera` (`sim/scenes/pickplace_scene.py`) now attaches to the
   same body (`gripper_link`) with a position/rotation computed to match
   the real mount, informed by reference photos -- see
-  docs/real_camera_setup.md. `scene_camera`/`side_camera`/`top_camera`
-  remain arbitrary sim-only debugging viewpoints (fine, no real
-  counterpart planned for those as far as we know).
-- [ ] **Camera intrinsics** (FOV/focal length, resolution) -- Still not
-  matched to the real webcam's actual specs (model unknown beyond "HD FULL
-  WEBCAM" branding on the housing) -- our wrist_camera uses a guessed
-  focal_length=12.0, not measured from the real hardware.
+  docs/real_camera_setup.md. A real top-down camera (Logitech C922) was
+  also connected and matched the same way -- `top_camera` is no longer
+  an arbitrary debugging viewpoint, it has a real counterpart now.
+  `scene_camera`/`side_camera` remain sim-only debugging viewpoints.
+- [x] **Camera resolution/aspect ratio** -- Done 2026-08-30. Both real
+  cameras are now physically connected to the Ubuntu box, so this was
+  queried directly instead of guessed: wrist camera (generic "Web Camera"
+  USB module) native 1280x720, top-down (Logitech C922 Pro Stream Webcam)
+  native up to 1920x1080 -- both 16:9. Sim cameras corrected from
+  mismatched aspect ratios (wrist was 480x480 square, top_camera was
+  960x720 4:3) to 480x270 and 960x540.
+- [ ] **Camera FOV/focal length** -- Not measured precisely (no physical
+  calibration rig), but tuned by eye: rendered several `focal_length`
+  candidates side by side against live real-camera captures and picked
+  the closest match (wrist_camera: 10.0). Good enough for now; would need
+  a proper checkerboard calibration only if precise pixel-level sim/real
+  alignment becomes necessary later.
+- [ ] **Real camera color/vignette** -- The real wrist camera's raw output
+  has a visible vignette (dark rounded corners) and a warm color cast,
+  neither present in sim renders. Decision: leave uncorrected rather than
+  post-process it away or try to replicate it in sim. Domain randomization
+  already varies sim lighting/color broadly, and the plan's real-data
+  fine-tuning phase (see project_plan.md) trains directly on this
+  camera's actual output anyway -- that's a more direct fix for this gap
+  than synthetically reproducing a lens artifact. Revisit only if a
+  future need calls for zero-shot sim-to-real without fine-tuning.
 - [ ] **Control interface / frequency** -- Sim currently commands joints
   via Isaac Lab's `ImplicitActuatorCfg` position targets in the physics
   loop (~100Hz, `dt=0.01`). Needs to match LeRobot's actual real-servo
