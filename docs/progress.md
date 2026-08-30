@@ -389,3 +389,53 @@ residual clipping/escaping remain, improved not eliminated. Cube starting
 position corrected based on real teleop feedback. Next: keep iterating on
 remaining contact issues if the user wants to continue, or move on to
 using recorded teleop trajectories for parameter extraction / demo data.
+
+### 2026-08-29 (continued) -- Further perf tuning, first successful pick, and a real data-loss bug
+
+- Added `sim.step(render=(step % 2 == 0))` to teleop_bridge.py -- renders
+  every other physics step instead of every step (physics still runs at
+  full 100Hz), roughly halving GPU render cost for a further
+  responsiveness improvement the user asked for.
+- User's cube got trapped in a small gap near the fixed jaw housing (not
+  between the pincer tips at all) after switching to convex decomposition
+  -- a known tradeoff: decomposing a mesh into multiple convex pieces to
+  fix the "can't represent concave shapes" problem can introduce tiny
+  gaps *between* those pieces that a small object gets caught in. No
+  targeted fix yet; a session restart (which respawns the cube) clears it
+  immediately when it happens.
+- **First successful teleop pick-and-place**, confirmed by checking the
+  recording mid-session (cube height reached ~0.19m, well above the
+  ~0.015m resting height). Did several more reps afterward (some
+  successful, some "jiggling" without a real lift, per the user).
+- **Real bug: recording data loss.** Stopped the session with SIGINT to
+  trigger a clean final save via the script's `finally` block. The
+  recording file (a single JSON array, rewritten in full every 2 seconds)
+  ended up truncated/corrupted -- the interrupt landed mid-`json.dump()`
+  write, likely during a periodic autosave, and left a half-written file.
+  Recovered what could be salvaged by finding the last complete JSON
+  object and closing the array there -- recovered 16,162 of what had been
+  a longer recording, but the recovered portion turned out to be only the
+  early, mostly-idle part of the session (max cube height ~0.025m
+  throughout) -- **the actual successful pick-and-place reps were in the
+  lost tail and are gone.** Saved the partial recovery as
+  `teleop_recording_partial_2026-08-29.json` for reference, not because
+  it's useful demonstration data.
+- **Root cause fixed**: added `atomic_save_json()` to teleop_bridge.py --
+  writes to a `.tmp` file and `os.replace()`s it into place, so a
+  mid-write interrupt can now only ever leave the *previous* complete
+  save intact, never a truncated one. Used for both the periodic autosave
+  and the final `finally`-block save.
+- Wrote `sim/scripts/segment_teleop_episodes.py`: segments a continuous
+  teleop recording into individual pick-and-place episodes by detecting
+  spans where the cube's height rises above a threshold and back down,
+  discarding spans that never rose high enough to count as a genuine
+  lift (vs. jiggling the cube on the table without lifting it). Plain
+  Python, no Isaac Lab/torch dependency. Ran on the recovered (jiggle-only)
+  data as a smoke test -- correctly found 0 genuine episodes, matching
+  the data's actual content.
+
+**Status**: Teleop pick-and-place demonstrated as achievable (once), but
+no usable recorded demonstration data survived from today's session due to
+the now-fixed save-corruption bug. Next: redo a batch of demonstrations
+with the fixed (atomic-write) teleop_bridge.py, then actually run
+segment_teleop_episodes.py on real successful data.

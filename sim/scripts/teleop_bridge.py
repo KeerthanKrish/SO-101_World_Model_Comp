@@ -86,6 +86,21 @@ def leader_action_to_sim_joint_pos(action: dict[str, float]) -> dict[str, float]
     return sim_pos
 
 
+def atomic_save_json(data, path):
+    """Write JSON atomically (temp file + rename) so a mid-write interrupt
+    (e.g. Ctrl+C / SIGINT arriving during json.dump) can never leave a
+    truncated, corrupted file -- the rename only happens once the full
+    write has succeeded. Hit this exact corruption once without it: a
+    session got interrupted mid-save and the recording was truncated,
+    losing the tail of the data (recoverable by hand that time, but not
+    guaranteed).
+    """
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp_path, path)
+
+
 def read_leader_state(path, last_t):
     """Read the shared state file if it has a newer timestamp than last seen. Returns (action, t) or (None, last_t)."""
     try:
@@ -135,7 +150,11 @@ def main():
                 robot.set_joint_position_target(target, joint_ids=joint_indices)
 
             scene.write_data_to_sim()
-            sim.step()
+            # Render every other step, not every step -- physics still runs
+            # at full rate (100Hz) so control/contact accuracy is unaffected,
+            # but this roughly halves GPU rendering cost. The eye can't tell
+            # the difference between 50fps and 100fps anyway.
+            sim.step(render=(step % 2 == 0))
             scene.update(sim_dt)
 
             if current_sim_joint_pos is not None:
@@ -150,12 +169,10 @@ def main():
             step += 1
 
             if time.time() - last_save > 2.0:
-                with open(args_cli.output, "w") as f:
-                    json.dump(recording, f)
+                atomic_save_json(recording, args_cli.output)
                 last_save = time.time()
     finally:
-        with open(args_cli.output, "w") as f:
-            json.dump(recording, f)
+        atomic_save_json(recording, args_cli.output)
         print(f"[RESULT] Saved {len(recording)} steps to {args_cli.output}")
 
 
