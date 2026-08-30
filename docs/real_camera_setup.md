@@ -142,8 +142,39 @@ different directions even though both originate from the same parent
 link) -- don't assume the first candidate origin found is the right one
 without sanity-checking what it geometrically represents.
 
-## Status: top-down (context) camera
+## Status: top-down (context) camera -- matched to a real reference photo (2026-08-30)
 
-`top_camera` in `pickplace_scene.py` -- already existed, confirmed as a
-sensible choice, no changes needed. See "Open question" above re: whether
-a second physical camera is planned to match it.
+User confirmed the top-down concept and sent an actual reference photo of
+their real overhead setup: camera mounted well above the workspace,
+looking straight down over a large cardboard sheet, with the arm entering
+the frame from the top edge (mounted at the near edge of the surface) and
+the rest of the frame filled by the reachable workspace.
+
+Two things needed fixing in `top_camera` to match this:
+
+1. **Feedback requested a wider wrist camera FOV too** -- lowered
+   `focal_length` from 12.0 to 6.0 on `wrist_camera` (smaller focal length
+   = wider field of view for a fixed sensor size). Confirmed direction/
+   framing was already right, just needed to see more of the scene.
+2. **Top-down rotation/position, computed + tuned**: `top_camera`
+   previously had no fixed rotation of its own (aimed only at runtime via
+   `set_world_poses_from_view` in test/capture scripts, never baked into
+   the scene config for headless use). Computed a fixed straight-down
+   rotation analytically -- local +Z (camera forward) onto world -Z
+   (straight down), local -Y (image "up") onto world -X (back toward the
+   robot base, so the arm appears near the top of frame like the
+   reference) -- a 180-degree rotation about the world `(1,1,0)` axis,
+   quaternion `(0, 1/sqrt2, 1/sqrt2, 0)`. Position and height then tuned
+   empirically (`test_wrist_fov_and_topdown.py`) across a few iterations:
+   too low/centered showed only the arm filling the frame; too high/far
+   showed mostly empty ground beyond our (much smaller than the user's
+   real cardboard sheet) 0.6m table. Settled on `pos=(0.35, 0.0, 0.85)`,
+   `focal_length=16.0` -- arm near the top of frame, most of the visible
+   area is the tabletop, closest achievable match given the sim table's
+   size (matching the reference's near-total table fill would need a
+   larger sim table, a separate scene change, not just a camera tweak).
+
+**Open question still standing**: is a second real camera actually
+planned to match this view, or is it a sim-only visualization aid? The
+photo suggests a real overhead camera may be planned, but this hasn't been
+explicitly confirmed.

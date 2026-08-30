@@ -124,10 +124,26 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
         height=720,
         data_types=["rgb"],
     )
+    # Fixed straight-down rotation matching the user's real top-down
+    # reference photo (arm mounted at one edge, looking straight down over
+    # the workspace, arm entering from the top of frame). Computed
+    # analytically as the rotation whose local +Z (camera forward, ROS
+    # convention) points along world -Z (straight down) and whose local
+    # -Y (image "up") points along world -X (back toward the robot base,
+    # so the arm appears near the top of frame) -- a 180-degree rotation
+    # about the world (1,1,0) axis, quaternion (0, 1/sqrt2, 1/sqrt2, 0).
+    # Position offset toward +X (into the reachable workspace, past the
+    # cube) so the robot base sits near the top of frame instead of dead
+    # center -- found empirically (test_wrist_fov_and_topdown.py) since
+    # our 0.6m table is much smaller than the user's real cardboard
+    # workspace and can't fully fill the frame the way the reference photo
+    # does without cropping the table's edges.
     top_camera = CameraCfg(
         prim_path="{ENV_REGEX_NS}/TopCamera",
-        offset=CameraCfg.OffsetCfg(pos=(0.15, 0.0, 0.55), convention="world"),
-        spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, clipping_range=(0.05, 5.0)),
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.35, 0.0, 0.85), rot=(0.0, 0.70710678, 0.70710678, 0.0), convention="ros"
+        ),
+        spawn=sim_utils.PinholeCameraCfg(focal_length=16.0, clipping_range=(0.05, 5.0)),
         width=960,
         height=720,
         data_types=["rgb"],
@@ -153,6 +169,9 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
     # housing" axis). Confirmed working: renders show two fingertips
     # converging into the bottom of frame with the tabletop filling the
     # rest, matching the user's real camera's reference photo.
+    # focal_length lowered from 12.0 to 6.0 (wider FOV) per user feedback
+    # after reviewing the first working render -- framing/direction was
+    # right, just wanted to see more of the scene.
     wrist_camera = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/gripper_link/WristCamera",
         offset=CameraCfg.OffsetCfg(
@@ -160,7 +179,7 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
             rot=(0.03478796, 0.02019336, -0.98402225, -0.17344234),
             convention="ros",
         ),
-        spawn=sim_utils.PinholeCameraCfg(focal_length=12.0, clipping_range=(0.005, 2.0)),
+        spawn=sim_utils.PinholeCameraCfg(focal_length=6.0, clipping_range=(0.005, 2.0)),
         width=480,
         height=480,
         data_types=["rgb"],
