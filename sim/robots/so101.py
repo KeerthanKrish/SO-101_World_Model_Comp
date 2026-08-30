@@ -29,11 +29,21 @@ SO101_CFG = ArticulationCfg(
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
-            max_depenetration_velocity=5.0,
+            # Was 5.0 -- when the gripper commands "fully closed" against an
+            # object too big to actually close on, position control keeps
+            # pushing and drives deep interpenetration; PhysX then resolves
+            # it by "ejecting" the object at up to this speed, seen as the
+            # cube violently bouncing out of the gripper. Lower cap = gentler
+            # separation instead of a launch.
+            max_depenetration_velocity=1.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
-            solver_position_iteration_count=8,
+            # Was 8 -- community reports (Isaac Lab discussions/forums) note
+            # grasping/contact-rich tasks specifically benefit from higher
+            # position iteration counts (e.g. 10 vs. a default of 4) to
+            # prevent penetration.
+            solver_position_iteration_count=12,
             # Was 0 -- every single run's log carried a PhysX warning saying
             # exactly this causes poor contact accuracy and recommending 1-2.
             # Ignored it until teleop made the resulting clip-through
@@ -41,6 +51,16 @@ SO101_CFG = ArticulationCfg(
             # obvious and unmistakable.
             solver_velocity_iteration_count=2,
         ),
+        # Tried adding a robot-side physics_material override here too, but
+        # `physics_material` isn't a plain field on UsdFileCfg -- it only
+        # exists on UsdFileWithCompliantContactCfg, which needs an explicit
+        # per-prim path (not a simple whole-asset override) and uses a
+        # different spawn function. Not worth the extra complexity: the
+        # cube's own physics_material (see pickplace_scene.py) uses
+        # friction_combine_mode="max", which should make the *effective*
+        # contact friction high regardless of the gripper's own (default)
+        # material, since PhysX uses the higher-priority combine mode's
+        # value for the pair. Revisit only if that turns out insufficient.
         # No visual_material override here -- tried a uniform blue override
         # for debug visibility, but that replaces ALL materials including
         # the motor housings (originally black, distinct from the yellow-ish
@@ -73,8 +93,15 @@ SO101_CFG = ArticulationCfg(
             joint_names_expr=["gripper"],
             effort_limit_sim=_STS3215_EFFORT_LIMIT,
             velocity_limit_sim=_STS3215_VELOCITY_LIMIT,
-            stiffness=50.0,
-            damping=2.0,
+            # Softer than the arm joints (was 50/2, same as arm) -- when
+            # commanded fully closed against an object it physically can't
+            # close past, a stiff PD gain keeps applying strong corrective
+            # force instead of complying, building up the interpenetration
+            # that causes the object to pop out (see max_depenetration_velocity
+            # comment above). Lower gains let it behave more like a
+            # torque-limited real servo yielding against the object.
+            stiffness=15.0,
+            damping=1.0,
         ),
     },
     soft_joint_pos_limit_factor=1.0,

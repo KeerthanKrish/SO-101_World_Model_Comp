@@ -321,3 +321,71 @@ user. Next: have the user teleoperate an actual successful pick-and-place,
 recorded via teleop_bridge.py's JSON output, then use that recording to
 (a) extract real grasp parameters for the scripted demo and (b) serve as
 demonstration data for the model-training side of the project.
+
+### 2026-08-29 (continued) -- Researched grasping physics issues, applied real fixes
+
+After the lag fix, user reported the gripper still clipping into the cube,
+the cube "escaping" (bouncing out) when the gripper closed fully on it,
+and general slipperiness -- and asked me to specifically research how
+others handle this for the SO-101 / robot arms in general before just
+guessing more fixes.
+
+**Research findings** (Isaac Lab GitHub discussions/forums, community
+SO-ARM100/101 Isaac Lab projects):
+- An IsaacLab GitHub discussion with the literal title "Why my gripper can
+  not close when I want to grasp the cube?" diagnosed and fixed the exact
+  same symptom: the gripper's USD collision used the default `convex_hull`
+  approximation, which **cannot represent concave geometry at all** -- a
+  convex hull "fills in" any concave notch, so the gripper's pincer mouth
+  had no actual gap in its collision shape. Confirmed fix: switch to
+  `convex_decomposition` for the gripper meshes.
+- Community tips for grasping-task stability: higher solver position
+  iteration counts (10 vs. a default of 4) reduce penetration; explicit
+  higher friction on both contacting surfaces addresses slipperiness;
+  contacts are sensitive to timestep size.
+- Found (but didn't need) additional options for later: SDF collision
+  approximation (even more accurate than convex decomposition, higher
+  cost), and PhysX "compliant contact" materials (a spring-based soft
+  contact model) for finer control if convex decomposition alone isn't
+  enough.
+
+**Fixes applied**, in order of impact:
+1. **Re-converted the URDF to USD with `collider_type="convex_decomposition"`**
+   instead of the default `convex_hull` (`sim/scripts/reconvert_urdf_convex_decomp.py`
+   -- convert_urdf.py's CLI doesn't expose this option, had to call
+   `UrdfConverter`/`UrdfConverterCfg` directly). This is the fix that
+   actually addresses the root cause per the research above.
+2. Bumped `solver_position_iteration_count` from 8 to 12 (robot and cube).
+3. Cube `physics_material`: friction 0.5->1.2 (static and dynamic) with
+   `friction_combine_mode="max"` -- ensures effective contact friction is
+   reliably high regardless of the gripper's own (default) material,
+   since PhysX uses the higher-priority combine mode's value. (Tried
+   adding a matching physics_material to the robot too, but hit a real
+   API gap: `physics_material` isn't a field on the base `UsdFileCfg`,
+   only on `UsdFileWithCompliantContactCfg`, which needs an explicit
+   per-prim path rather than a whole-asset override -- reverted that part,
+   not worth the extra complexity given the cube-side fix alone should be
+   sufficient.)
+4. Softer gripper actuator gains (stiffness 50->15, damping 2->1, gripper
+   joint only) -- a stiff PD gain fighting to reach "fully closed" against
+   an object it physically can't close past was building up the
+   interpenetration that caused the pop-out; softer gains let it yield
+   more like a torque-limited real servo.
+5. Lowered `max_depenetration_velocity` 5.0->1.0 (robot and cube) -- caps
+   how violently PhysX's depenetration correction can eject an object,
+   converting a "launch" into a gentler separation.
+
+**Result** (user-confirmed): successfully picked up the cube for the first
+time. Still some residual clipping and occasional escaping, but
+noticeably less slippery. Real, measurable progress, not fully solved.
+
+**Also**: moved the cube from 0.2m to 0.28m in front of the robot base --
+user found 0.2m uncomfortably close (awkward reach angle) once actually
+teleoperating the real arm. This is the first cube-placement number
+informed by actual real-arm feedback rather than a guess.
+
+**Status**: Grasping via teleop now works but isn't fully solid --
+residual clipping/escaping remain, improved not eliminated. Cube starting
+position corrected based on real teleop feedback. Next: keep iterating on
+remaining contact issues if the user wants to continue, or move on to
+using recorded teleop trajectories for parameter extraction / demo data.

@@ -7,9 +7,10 @@ offscreen rendering (since we're running headless on the remote GPU box --
 see docs/preferences.md on why: no practical GPU-accelerated GUI over X11
 forwarding to view Isaac Sim's 3D viewport remotely).
 
-Cube placement (0.2m in front of the robot base) is an approximate guess at
-what's within the SO-101's reach -- not yet validated against the real
-arm's actual workspace. Revisit once we can compare against real-arm reach.
+Cube placement: moved from 0.2m to 0.28m in front of the robot base after
+teleop feedback that 0.2m was uncomfortably close to the base (awkward
+joint angles to reach down at that distance) -- informed by actually
+teleoperating the real arm, not just guessing.
 """
 
 import isaaclab.sim as sim_utils
@@ -26,7 +27,7 @@ from robots.so101 import SO101_CFG  # isort:skip
 # Table top surface sits at z=0; robot base is fixed there (URDF converted with --fix-base).
 _TABLE_HEIGHT = 0.02
 _CUBE_SIZE = 0.03
-_CUBE_POS = (0.2, 0.0, _CUBE_SIZE / 2)
+_CUBE_POS = (0.28, 0.0, _CUBE_SIZE / 2)
 
 
 @configclass
@@ -69,9 +70,27 @@ class PickPlaceSceneBaseCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Cube",
         spawn=sim_utils.CuboidCfg(
             size=(_CUBE_SIZE, _CUBE_SIZE, _CUBE_SIZE),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(solver_position_iteration_count=8, solver_velocity_iteration_count=2),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=12,
+                solver_velocity_iteration_count=2,
+                # Matches the robot's cap -- see so101.py's comment. Without
+                # this the cube could still get ejected at a high default
+                # speed when the gripper drives deep interpenetration.
+                max_depenetration_velocity=1.0,
+            ),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
             collision_props=sim_utils.CollisionPropertiesCfg(),
+            # Explicit higher friction (default is 0.5/0.5, "average" combine
+            # mode) -- felt "slippery" in teleop; this is a first guess at a
+            # grippier surface, not a measured value. Root cause of the worse
+            # symptoms (clipping, popping out under full grip) was actually
+            # the gripper's convex-hull collision approximation (see
+            # reconvert_urdf_convex_decomp.py) -- a convex hull can't
+            # represent the pincer's concave notch at all. Friction alone
+            # wouldn't have fixed that.
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=1.2, dynamic_friction=1.2, friction_combine_mode="max", restitution=0.0
+            ),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.1, 0.1)),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=_CUBE_POS),
