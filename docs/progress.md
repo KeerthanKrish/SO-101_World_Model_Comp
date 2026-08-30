@@ -439,3 +439,26 @@ no usable recorded demonstration data survived from today's session due to
 the now-fixed save-corruption bug. Next: redo a batch of demonstrations
 with the fixed (atomic-write) teleop_bridge.py, then actually run
 segment_teleop_episodes.py on real successful data.
+
+### 2026-08-29 (continued) -- First real demonstration batch collected
+
+Redid the teleop session with the atomic-write fix in place. Stopped
+cleanly via SIGINT -- recording saved correctly this time (29,748 steps,
+valid JSON, no corruption). Ran `segment_teleop_episodes.py` on it:
+
+- 10 candidate lifted spans detected
+- 2 correctly discarded as jiggling (peak height 0.068m / 0.076m, below
+  the 0.08m real-pick threshold) -- matches the user's own description of
+  some messy reps that didn't actually lift the cube
+- **8 genuine pick episodes** kept (peak heights 0.082m-0.149m), saved to
+  `sim/output/teleop_episodes/episode_000.json` through `episode_007.json`
+
+First real, usable batch of demonstration data for this project -- not
+huge, but a genuine starting point for both scripted-parameter extraction
+and (eventually) model training data, per the plan from earlier.
+
+**Status**: 8 genuine demonstration episodes on disk (gitignored,
+`sim/output/`, not committed to git -- data artifacts, not code). Did not
+start a new Isaac Sim session per user's explicit request this time. Next:
+either collect more episodes in a future session to grow the batch, or
+start using these 8 for parameter extraction / training data prep.
