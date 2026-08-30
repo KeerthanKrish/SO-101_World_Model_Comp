@@ -26,6 +26,7 @@ from robots.so101 import SO101_CFG  # isort:skip
 
 # Table top surface sits at z=0; robot base is fixed there (URDF converted with --fix-base).
 _TABLE_HEIGHT = 0.02
+_TABLE_SIZE = 1.2  # doubled from 0.6m (2026-08-30) -- see below
 _CUBE_SIZE = 0.03
 _CUBE_POS = (0.28, 0.0, _CUBE_SIZE / 2)
 
@@ -51,11 +52,21 @@ class PickPlaceSceneBaseCfg(InteractiveSceneCfg):
         prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.9, 0.9, 0.9))
     )
 
-    # table (static, robot and cube sit on its top surface at z=0)
+    # table (static, robot and cube sit on its top surface at z=0). Doubled
+    # from 0.6m to 1.2m (2026-08-30) -- the real cardboard workspace is
+    # much larger than the arm's actual reach, and the small sim table was
+    # the real reason the top-down camera couldn't be made to match the
+    # real overhead camera's framing no matter how it was aimed (not
+    # enough usable forward depth before hitting the table's edge). Robot
+    # stays centered on the table rather than being moved to one edge --
+    # keeps everything else (cube/target positions, IK targets) valid
+    # without other changes, and the extra table behind the robot is
+    # simply out of frame for every camera, which already only look
+    # forward -- harmless, not wasted collision cost worth avoiding.
     table = AssetBaseCfg(
         prim_path="/World/Table",
         spawn=sim_utils.CuboidCfg(
-            size=(0.6, 0.6, _TABLE_HEIGHT),
+            size=(_TABLE_SIZE, _TABLE_SIZE, _TABLE_HEIGHT),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.35, 0.2)),
             collision_props=sim_utils.CollisionPropertiesCfg(),
         ),
@@ -132,24 +143,27 @@ class PickPlaceSceneCfg(PickPlaceSceneBaseCfg):
     # -Y (image "up") points along world -X (back toward the robot base,
     # so the arm appears near the top of frame) -- a 180-degree rotation
     # about the world (1,1,0) axis, quaternion (0, 1/sqrt2, 1/sqrt2, 0).
-    # Position: x=0.15 centers the visible footprint over the table's
-    # actual usable depth. Correction from an earlier attempt at x=0.35 --
-    # that assumed the robot sits at the NEAR edge of the visible table
-    # (like the user's real cardboard sheet, which only extends forward
-    # from the arm), but our sim table is centered ON the robot (spans
-    # -0.3 to +0.3m), so only 0-0.3m ahead of the base is usable table.
-    # x=0.35 aimed the camera mostly past that edge, showing empty ground
-    # instead of tabletop for most of the frame. x=0.15 (the midpoint of
-    # the usable 0-0.3m range) plus a higher standoff (z=0.85, focal
-    # length 16.0) reproduces the reference photo's proportions much more
-    # closely: tabletop fills the full width and most of the height, arm
-    # near the top -- found empirically, see test_wrist_fov_and_topdown.py
-    # and docs/real_camera_setup.md for the comparison against a live
-    # capture from the real camera.
+    # Position: x=0.3 centers the visible footprint over the table's
+    # actual usable depth. History: an earlier attempt at x=0.35 assumed
+    # the robot sits at the NEAR edge of the visible table (like the
+    # user's real cardboard sheet, which only extends forward from the
+    # arm), but the sim table was centered ON the robot, so only 0-0.3m
+    # ahead of the base was usable. That got fixed with x=0.15 (that
+    # range's midpoint) -- but the table itself was still much smaller
+    # than the real workspace, capping how well this could ever match.
+    # The table was then doubled to 1.2m (2026-08-30, see the table
+    # AssetBaseCfg above), making 0-0.6m usable ahead of the base --
+    # x=0.3 is that new midpoint. Standoff height doubled to match
+    # (0.85 -> 1.7): a pinhole camera's visible extent scales linearly
+    # with height for a fixed focal length, so doubling both the table
+    # depth and the camera height preserves the same framing proportions
+    # confirmed to work before -- verified by re-rendering rather than
+    # assumed, see test_wrist_fov_and_topdown.py and
+    # docs/real_camera_setup.md.
     top_camera = CameraCfg(
         prim_path="{ENV_REGEX_NS}/TopCamera",
         offset=CameraCfg.OffsetCfg(
-            pos=(0.15, 0.0, 0.85), rot=(0.0, 0.70710678, 0.70710678, 0.0), convention="ros"
+            pos=(0.3, 0.0, 1.7), rot=(0.0, 0.70710678, 0.70710678, 0.0), convention="ros"
         ),
         # width/height set to 16:9 to match the real top-down camera
         # (a Logitech C922 Pro Stream Webcam, confirmed via v4l2-ctl on

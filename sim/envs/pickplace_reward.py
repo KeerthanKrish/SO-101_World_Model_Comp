@@ -63,10 +63,11 @@ class PickPlaceRewardConfig:
     place_max_speed: float = 0.05  # m/s -- must be ~at rest at the target, not just passing through it
 
     # -- Table / failure bounds --
-    # Matches pickplace_scene.py: table top at z=0, size=(0.6, 0.6, ...)
-    # centered at the origin, so it spans -0.3..+0.3 in both x and y.
+    # Matches pickplace_scene.py: table top at z=0, size=(1.2, 1.2, ...)
+    # centered at the origin, so it spans -0.6..+0.6 in both x and y.
+    # (Enlarged from 0.6m/0.3 half-extent on 2026-08-30.)
     table_z: float = 0.0
-    table_half_extent: float = 0.3
+    table_half_extent: float = 0.6
     fall_z_threshold: float = -0.05  # cube center below this -> fell off/through the table
 
     # -- Grasp / lift detection --
@@ -343,7 +344,7 @@ def _self_test():
 
     # 7. Failure detection.
     assert is_failed((0.0, 0.0, -0.1), cfg)
-    assert is_failed((0.5, 0.0, 0.02), cfg)
+    assert is_failed((0.8, 0.0, 0.02), cfg)  # beyond the 1.2m table's edge + margin
     assert not is_failed(cube_at_start, cfg)
 
     print("[OK] pickplace_reward self-test passed")

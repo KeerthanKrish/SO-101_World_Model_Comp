@@ -192,5 +192,14 @@ direction -- worth remembering that "which way is wider" isn't always
 intuitive and should be checked empirically per-camera, not assumed from
 a previous camera's tuning). `focal_length=16.0` at `pos=(0.15, 0.0, 0.85)`
 reproduced the reference proportions closely: tabletop filling the full
-width and most of the height, arm near the top. This is now the final
-config -- see `pickplace_scene.py`'s `top_camera`.
+width and most of the height, arm near the top.
+
+**Superseded (2026-08-30)**: even after this fix, the match was capped by
+the sim table simply being much smaller than the real cardboard
+workspace. User chose to enlarge the table (0.6m -> 1.2m, see
+`pickplace_scene.py`) rather than reposition the real camera. The
+top-down camera was re-tuned to match: x moved to 0.3 (the new usable
+range's midpoint) and standoff height doubled to 1.7 (visible extent
+scales linearly with height for fixed focal length, confirmed by
+re-rendering rather than assumed). `pos=(0.3, 0.0, 1.7)`,
+`focal_length=16.0` is now the final config.

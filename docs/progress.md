@@ -621,3 +621,30 @@ training work (none has started yet). Top-down camera fix pending user
 decision (resize table vs. rely on randomization). Next: resolve the
 table-size question, then proceed toward wiring the reward function into
 an actual training env once ready.
+
+### 2026-08-30 (continued) -- Table enlarged, top-down camera re-tuned
+
+User chose to enlarge the sim surface rather than reposition the real
+camera. Doubled the table from 0.6m to 1.2m in `pickplace_scene.py`
+(`_TABLE_SIZE`), keeping it centered on the robot (simpler than moving
+the robot to one edge -- everything else, cube/target positions, stays
+valid without further changes, and the extra table behind the robot is
+harmless since every camera only looks forward anyway).
+
+Updated `pickplace_reward.py`'s `table_half_extent` (0.3 -> 0.6) to match,
+and fixed one self-test assertion that would have silently become wrong
+under the new bounds (a fallen-cube test position that was beyond the
+old table's edge but not the new, larger one).
+
+Re-tuned `top_camera`: midpoint of the new usable forward depth moved
+from x=0.15 to x=0.3, and the standoff height doubled (0.85 -> 1.7) to
+match -- a pinhole camera's visible extent scales linearly with height
+for fixed focal length, so doubling both the table depth and camera
+height should preserve the same framing that worked before. Verified by
+re-rendering (not just assumed): the doubled config reproduced the same
+good composition confirmed working previously (tabletop filling the full
+width and most of the height, arm near the top).
+
+**Status**: Table enlarged and top-down camera re-matched; all four
+camera views re-rendered and confirmed working together on the new
+table size.
