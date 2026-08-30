@@ -17,14 +17,18 @@ arbitrary/placeholder values, because randomization doesn't fix them:
 
 ## Checklist
 
-- [ ] **Camera extrinsics (pose relative to robot base)** -- Not yet done.
-  Current sim camera (`sim/scenes/pickplace_scene.py`, pos `(0.6, -0.6,
-  0.5)` looking at `(0.15, 0, 0.05)`) was placed arbitrarily for visual
-  debugging, not matched to any real mounting position. Once a real camera
-  mounting position is chosen, either match it exactly or make it the
-  center of the randomized camera-pose range (not fully arbitrary).
-- [ ] **Camera intrinsics** (FOV/focal length, resolution) -- Not yet
-  matched to whatever real camera hardware gets used.
+- [x] **Camera extrinsics (wrist/eye-in-hand camera)** -- Done 2026-08-30.
+  User mounted a real webcam on the wrist/gripper housing; sim's
+  `wrist_camera` (`sim/scenes/pickplace_scene.py`) now attaches to the
+  same body (`gripper_link`) with a position/rotation computed to match
+  the real mount, informed by reference photos -- see
+  docs/real_camera_setup.md. `scene_camera`/`side_camera`/`top_camera`
+  remain arbitrary sim-only debugging viewpoints (fine, no real
+  counterpart planned for those as far as we know).
+- [ ] **Camera intrinsics** (FOV/focal length, resolution) -- Still not
+  matched to the real webcam's actual specs (model unknown beyond "HD FULL
+  WEBCAM" branding on the housing) -- our wrist_camera uses a guessed
+  focal_length=12.0, not measured from the real hardware.
 - [ ] **Control interface / frequency** -- Sim currently commands joints
   via Isaac Lab's `ImplicitActuatorCfg` position targets in the physics
   loop (~100Hz, `dt=0.01`). Needs to match LeRobot's actual real-servo
