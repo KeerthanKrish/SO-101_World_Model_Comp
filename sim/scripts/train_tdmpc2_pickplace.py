@@ -58,6 +58,19 @@ wandb is enabled (`self._video = VideoRecorder(...) if self._wandb and
 cfg.save_video else None`), and we're deliberately not standing up real
 wandb logging for this.
 
+Checkpointing is also handled directly here, not through
+common/logger.py's Logger.save_agent() -- that method is only ever called
+from trainer/offline_trainer.py (the multi-task path we don't use);
+trainer/online_trainer.py's OnlineTrainer.train() (whose logic this
+script's loop is based on) never calls it at all, checkpointed or not.
+Calls TDMPC2.save() directly instead -- a small, simple method
+(`torch.save({"model": self.model.state_dict()}, fp)`) with no
+wandb/Logger coupling. Added after the first real training run
+(2026-08-31) produced a policy that could never be reloaded for further
+inspection, once eval video review raised real concerns about it (see
+docs/tdmpc2_integration.md's results section and docs/decisions.md) --
+every future run saves a checkpoint at each eval point plus a final one.
+
 Usage:
     ./isaaclab.sh -p /path/to/train_tdmpc2_pickplace.py --headless --enable_cameras --smoke-test
     ./isaaclab.sh -p /path/to/train_tdmpc2_pickplace.py --headless --enable_cameras --steps 30000 --eval-every 5000
@@ -76,6 +89,10 @@ parser.add_argument("--steps", type=int, default=None, help="Override total env 
 parser.add_argument("--eval-every", type=int, default=5000, help="Real training steps between eval+video episodes.")
 parser.add_argument(
     "--video-dir", type=str, default="/home/keerthan/SO-101-WM/sim/output/tdmpc2_eval_videos", help="Eval video output dir."
+)
+parser.add_argument(
+    "--checkpoint-dir", type=str, default="/home/keerthan/SO-101-WM/sim/output/tdmpc2_checkpoints",
+    help="Where to save agent checkpoints (one per eval checkpoint, plus a final one).",
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -270,6 +287,7 @@ def main():
         torch.tensor([[0.6, -0.6, 0.5]], device=base_env.device), torch.tensor([[0.15, 0.0, 0.05]], device=base_env.device)
     )
     os.makedirs(args_cli.video_dir, exist_ok=True)
+    os.makedirs(args_cli.checkpoint_dir, exist_ok=True)
 
     agent = TDMPC2(cfg)
     buffer = Buffer(cfg)
@@ -294,6 +312,9 @@ def main():
                 eval_reward, eval_success = run_eval_episode(env, base_env, agent, cfg, video_path)
                 print(f"[INFO] step {step}: EVAL episode -- reward={eval_reward:+.3f} "
                       f"success={eval_success} video={video_path}")
+                ckpt_path = os.path.join(args_cli.checkpoint_dir, f"agent_step_{step:06d}.pt")
+                agent.save(ckpt_path)
+                print(f"[INFO] step {step}: checkpoint saved to {ckpt_path}")
                 next_eval_at += args_cli.eval_every
 
             obs = env.reset()
@@ -326,6 +347,10 @@ def main():
 
     elapsed = time() - start
     label = "smoke test" if args_cli.smoke_test else "training run"
+    if not args_cli.smoke_test:
+        final_ckpt = os.path.join(args_cli.checkpoint_dir, f"agent_step_{step:06d}_final.pt")
+        agent.save(final_ckpt)
+        print(f"[RESULT] Final checkpoint saved to {final_ckpt}")
     print(f"\n[RESULT] === TD-MPC2 {label} summary ===")
     print(f"[RESULT] Ran {step} env steps, {ep_idx} episodes added to buffer, "
           f"{num_updates_done} agent.update() calls, in {elapsed:.1f}s.")

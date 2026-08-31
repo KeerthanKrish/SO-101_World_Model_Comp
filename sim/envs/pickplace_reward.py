@@ -109,7 +109,20 @@ class PickPlaceRewardConfig:
     # unbounded one, and this shape (~1 near the goal, ~0 far away,
     # smooth in between) is a standard, well-behaved choice for that.
     reach_weight: float = 1.0
-    reach_scale: float = 0.15  # meters -- distance at which reach shaping is ~half-saturated
+    # Was 0.15. Tightened after a real reward-hacking finding from the
+    # first actual TD-MPC2 training run (2026-08-31): at 0.15, merely
+    # hovering somewhere in the general vicinity of typical cube positions
+    # -- without ever tracking or reaching the SPECIFIC cube's actual
+    # position that episode -- was enough to accumulate substantial reward
+    # over a 500-step episode (an eval episode that never touched the cube
+    # at all scored +97.9, matching almost exactly what ~0.2 average dense
+    # reward/step over 500 steps works out to). A smaller scale makes the
+    # reward fall off much more sharply with distance, so only genuinely
+    # closing in on the actual cube pays off -- vague proximity should no
+    # longer be a viable substitute for real engagement. Not claimed to be
+    # the final right value -- the plan is to verify this empirically with
+    # a shorter training run before trusting a longer one.
+    reach_scale: float = 0.08  # meters -- distance at which reach shaping is ~half-saturated
     grasp_bonus: float = 0.5  # flat per-step bonus while grasped -- rewards closing AND holding, not just touching
     place_weight: float = 1.0
     place_scale: float = 0.15

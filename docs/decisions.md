@@ -170,3 +170,37 @@ represent multi-modal action distributions well, but there's nothing to
 test if every demonstration used one identical rigid style. Low cost to
 start now; expensive (impossible without recollecting data) to add
 retroactively.
+
+---
+
+**Decision**: Enabled self-collision checking on the SO-101 articulation
+(`enabled_self_collisions=True`, was `False`); tightened the reward's
+`reach_scale` from 0.15 to 0.08; added direct agent checkpoint saving to
+`train_tdmpc2_pickplace.py`.
+
+**Why**: Reviewing the first real TD-MPC2 training run's eval video
+directly (not just the printed reward numbers) surfaced two real problems
+the summary stats alone hid. First, the arm was contorting into
+self-intersecting poses -- physically impossible on the real hardware --
+because self-collision had been left at its inherited default (`False`)
+with no one having deliberately decided it should be off. Second, an eval
+episode that scored the highest reward of the run (+97.9) had never
+touched the cube at all: the dense approach-phase reward (`reach_scale`
+governing how quickly it falls off with distance) was broad enough that
+merely hovering in the general vicinity of typical cube positions, without
+tracking any specific episode's actual cube, could accumulate substantial
+reward over a 500-step episode -- genuine reward hacking, not learning
+progress. Checkpoint saving was added because the trained policy from that
+run couldn't be reloaded for further inspection once the video raised
+these concerns -- every future run now saves one.
+
+**How to apply**: A shorter (15,000-step) run was launched immediately
+after these fixes, specifically so the fixes themselves can be verified
+quickly (no reward hacking, no self-clipping, physics still stable)
+before committing to a longer run. See docs/tdmpc2_integration.md for
+results once available. `reach_scale=0.08` is not claimed to be the
+final right value -- if the shorter run still shows hacking, it needs
+tightening further; if it can no longer learn *any* useful gradient
+(reward is now too sparse to provide signal from far away), it needs
+loosening. Judge from the next run's actual behavior, not from re-deriving
+the value analytically.

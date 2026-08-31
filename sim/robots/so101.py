@@ -38,7 +38,16 @@ SO101_CFG = ArticulationCfg(
             max_depenetration_velocity=1.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=False,
+            # Was False. Left disabled since the URDF conversion with no
+            # specific reason to enable it -- meant PhysX never checked for
+            # or prevented the arm's own links passing through each other.
+            # Real, confirmed problem, not just cosmetic: a policy trained
+            # with this off can learn self-intersecting poses that are
+            # physically impossible on the real SO-101 -- attempting them
+            # on real hardware would grind/stall the servos against each
+            # other, not just "look odd." Caught by watching an actual
+            # TD-MPC2 eval video (2026-08-31) that showed exactly this.
+            enabled_self_collisions=True,
             # Was 8 -- community reports (Isaac Lab discussions/forums) note
             # grasping/contact-rich tasks specifically benefit from higher
             # position iteration counts (e.g. 10 vs. a default of 4) to
