@@ -250,6 +250,8 @@ class PickPlaceEnv(DirectRLEnv):
 
         rewards = torch.zeros(self.num_envs, device=self.device)
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        placed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         for i in range(self.num_envs):
             reward, info = compute_reward(
@@ -264,8 +266,18 @@ class PickPlaceEnv(DirectRLEnv):
             rewards[i] = reward
             terminated[i] = info["placed"] or info["failed"]
             self._was_holding[i] = info["holding"]
+            placed[i] = info["placed"]
+            failed[i] = info["failed"]
 
         self._cached_reward = rewards
+        # Exposed via self.extras so external callers (e.g. the TD-MPC2
+        # adapter, sim/scripts/tdmpc2_pickplace_env.py) can distinguish a
+        # SUCCESSFUL termination from a FAILED one -- terminated alone
+        # doesn't say which, and this was a real gap caught while writing
+        # that adapter (self.extras is never otherwise populated by
+        # DirectRLEnv's base step(), it stays an empty dict by default).
+        self.extras["placed"] = placed
+        self.extras["failed"] = failed
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, time_out
