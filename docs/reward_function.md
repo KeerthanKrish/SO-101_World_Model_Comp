@@ -194,6 +194,70 @@ training starts) or improving open-loop replay fidelity specifically
 (neither was pursued further here, to avoid scope creep into a separate,
 harder problem).
 
+## Correctness audit (2026-08-31): a real bug found by manual tracing, not by replay
+
+Before starting to wire in TD-MPC2/diffusion policy, went back through
+`pickplace_reward.py`, `grasp_geometry.py`, and `pickplace_env.py` line
+by line rather than assuming the earlier validation above was sufficient
+-- and it wasn't. The empirical replay validation (Level 2 above) never
+actually exercised the "genuinely holding and lowering the cube toward
+the target" code path at all, since neither tested episode ever achieved
+a real lift-and-carry. A bug living specifically in that unexercised path
+was invisible to it by construction.
+
+**The bug**: `is_grasped()`'s height check (`cube_height >
+lift_threshold`, 0.02m) was also driving `compute_reward()`'s
+approach/transport phase switch. But the place target's resting height
+(0.015m) is *below* `lift_threshold` by construction -- a successful
+place always ends with the cube back down near table height. This means
+the instant a genuinely-held cube is lowered onto the target,
+`cube_height` drops below 0.02m and the old code silently fell back to
+approach-phase shaping (gripper-to-cube distance) instead of the intended
+transport-phase shaping (cube-to-target distance) -- exactly during the
+most precision-critical part of the whole task. Caught by manually
+tracing the self-test's own `reward_at_target_still` case by hand
+(`cube_pos = target_pos`, height 0.015m) and noticing `is_grasped()`
+evaluated to `False` there. The existing self-test didn't catch it
+because its pass/fail tolerance was loose enough that the (wrong)
+approach-phase number and the (intended) transport-phase number happened
+to land close enough together to slip through.
+
+**A second, related flaw** surfaced while fixing the first: one of the
+self-test's own assertions ("dense reward shouldn't depend on height once
+grasped") compared two points at *different* distances from the target
+(0m and 0.085m) and asserted the results were "close enough" -- which
+only ever passed by coincidence, because it was unknowingly comparing one
+correct transport-phase number against one bugged approach-phase number
+that happened to be numerically similar. Replaced with a mathematically
+sound comparison: two points at the *same* distance from the target via
+different decompositions (pure vertical vs. pure horizontal offset),
+asserted equal to within `1e-9`.
+
+**The fix**: added `is_holding()`, a second, deliberately stateful
+function (`is_grasped()` is kept unchanged, for strict stateless liftoff
+diagnostics). `is_holding()` requires height evidence only to *establish*
+holding for the first time -- avoiding a different failure mode, where
+dropping the height requirement entirely would let a policy get MORE
+reward by leaving the gripper open near the cube than by closing it
+before actually being able to move toward the target, discouraging the
+gripper from ever closing promptly. Once holding is established, it
+persists across subsequent steps on proximity + closed-gripper evidence
+alone, correctly covering the final lowering sequence, and still ends
+immediately if the gripper opens or moves away. `compute_reward()` now
+takes a `was_holding` argument and returns the current state in
+`info["holding"]`, which the caller must persist and feed back in next
+step -- `PickPlaceEnv` does this via a `_was_holding` per-env tensor,
+reset to `False` on every episode reset. This is the one deliberate
+exception to this module's otherwise fully stateless design, documented
+inline in `is_holding()`'s own docstring.
+
+Re-ran both the self-test (now including explicit regression tests for
+both flaws, `_self_test()`'s 3c/3d cases) and the real-data replay
+validation against `episode_003.json` afterward: identical numbers to
+before the fix, exactly as expected, since that episode never reaches a
+genuine hold and so never touches the fixed code path at all -- confirms
+the fix didn't disturb the previously-validated approach-phase behavior.
+
 ## Known limitations / open items
 
 - **Grasp detection is a heuristic**, not a first-class sensor signal --
@@ -212,11 +276,15 @@ harder problem).
   from `segment_teleop_episodes.py`), not tuned against actual training
   runs -- there are none yet. Expect to revisit once training exposes
   problems.
-- **Not yet wired into an actual Gym-style training environment.** This
-  module is a pure, standalone reward function -- it doesn't yet have a
-  `reset()`/`step()` env wrapping it, which TD-MPC2 (like most RL
-  codebases) expects. That's the next piece of infrastructure needed
-  before training can start.
+- **The transport-phase hold-and-lower path is still not empirically
+  validated against real data** -- only against the synthetic self-test
+  (see the correctness audit above). Real validation of that half would
+  need either a closed-loop rollout or a real recorded episode that
+  actually achieves a sustained lift-and-carry, neither available yet.
+- Now wired into an actual Gym-style training environment
+  (`sim/envs/pickplace_env.py`, see docs/training_env.md) -- this item
+  is resolved, kept here only as a pointer for anyone who reads this file
+  before that one.
 
 ## Files
 

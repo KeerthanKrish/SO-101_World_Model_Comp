@@ -27,7 +27,16 @@ custom addition.
 
 Reward/termination reuse the already-validated pickplace_reward.py
 functions verbatim, called in a per-environment Python loop rather than
-reimplemented in batched torch. This is a deliberate simplicity/
+reimplemented in batched torch. One piece of per-env state is persisted
+across steps beyond what Isaac Lab already tracks: `_was_holding`, fed
+into compute_reward()'s was_holding parameter and reset to False on
+every env reset -- required by pickplace_reward.py's is_holding()
+hysteresis (a real bug, found during a full correctness audit: the naive
+stateless height check it replaces incorrectly drops out of the
+transport phase the instant an already-held cube is lowered onto the
+target, since the target's resting height is below the lift-detection
+threshold by construction -- see docs/reward_function.md). This is a
+deliberate simplicity/
 performance tradeoff: pickplace_reward.py was specifically built and
 empirically validated as a small, dependency-free, scalar function (see
 docs/reward_function.md) -- reimplementing that same logic a second time
@@ -168,6 +177,17 @@ class PickPlaceEnv(DirectRLEnv):
         # been reset -- see module docstring.
         self._cached_reward = torch.zeros(self.num_envs, device=self.device)
 
+        # Per-env "was the gripper holding the cube on the PREVIOUS step"
+        # state, required by pickplace_reward.compute_reward()'s
+        # was_holding parameter (see that module's is_holding() docstring
+        # for why this hysteresis is needed -- a naive per-step height
+        # check incorrectly drops out of the transport phase the instant
+        # a held cube is lowered onto the target, since the target's
+        # resting height is below the lift-detection threshold by
+        # construction). This is this env's one piece of persisted
+        # per-environment state beyond what Isaac Lab already tracks.
+        self._was_holding = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
     def _setup_scene(self):
         # Everything (robot, cube, table, ground, light, optional cameras)
         # is already declared in the scene cfg (PickPlaceSceneBaseCfg /
@@ -238,10 +258,12 @@ class PickPlaceEnv(DirectRLEnv):
                 cube_lin_vel[i].tolist(),
                 joint_pos[i, -1].item(),  # "gripper" joint is last in _JOINT_ORDER
                 joint_vel[i].tolist(),
+                bool(self._was_holding[i].item()),
                 self._reward_cfg,
             )
             rewards[i] = reward
             terminated[i] = info["placed"] or info["failed"]
+            self._was_holding[i] = info["holding"]
 
         self._cached_reward = rewards
 
@@ -261,6 +283,7 @@ class PickPlaceEnv(DirectRLEnv):
         default_joint_vel = self.robot.data.default_joint_vel[env_ids]
         self.robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel, None, env_ids)
         self._joint_pos_target[env_ids] = default_joint_pos[:, self._joint_indices]
+        self._was_holding[env_ids] = False
 
         cube_x = sample_uniform(self.cfg.cube_x_range[0], self.cfg.cube_x_range[1], (n,), self.device)
         cube_y = sample_uniform(self.cfg.cube_y_range[0], self.cfg.cube_y_range[1], (n,), self.device)

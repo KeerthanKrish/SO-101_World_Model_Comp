@@ -142,7 +142,18 @@ def is_grasped(gripper_pos, cube_pos, gripper_joint_pos, cfg: PickPlaceRewardCon
     and joint-angle alone aren't enough: a cube settling slightly above
     rest height with a coincidentally-closed gripper elsewhere on the
     table would otherwise falsely register as grasped. The proximity
-    check is what rules that out."""
+    check is what rules that out.
+
+    This is the STRICT, stateless "was a genuine liftoff just detected"
+    check -- it requires height evidence every single call, which makes
+    it correct for detecting the initial pickup but WRONG for deciding
+    whether the gripper is still holding the cube during a later
+    controlled lowering (e.g. onto the place target, whose resting height
+    is BELOW lift_threshold by construction -- see is_holding() below,
+    which is what compute_reward() actually uses for the phase switch).
+    Kept as-is for diagnostics/logging (e.g. "first genuine grasp
+    detected at step N"), where the strict liftoff semantics are exactly
+    what's wanted."""
     cube_height = cube_pos[2] - cfg.table_z
     close_enough = _dist3(gripper_pos, cube_pos) < cfg.grasp_proximity_threshold
     return (
@@ -150,6 +161,47 @@ def is_grasped(gripper_pos, cube_pos, gripper_joint_pos, cfg: PickPlaceRewardCon
         and gripper_joint_pos <= cfg.gripper_closed_threshold
         and close_enough
     )
+
+
+def is_holding(gripper_pos, cube_pos, gripper_joint_pos, was_holding: bool, cfg: PickPlaceRewardConfig) -> bool:
+    """True if the gripper is currently, physically holding the cube --
+    the condition compute_reward() actually uses to pick approach vs.
+    transport shaping. This is deliberately NOT the same as is_grasped():
+    the place target's resting height (0.015m) is below lift_threshold
+    (0.02m) by construction (a successful place always ends with the
+    cube back down near table height), so a naive height check on every
+    step would flip "grasped" back to False the instant the cube is
+    lowered onto the target -- exactly the moment precise "get closer to
+    the target" shaping matters most. Caught via a careful manual trace of
+    the reward self-test's own numbers, not by the empirical replay
+    validation (neither validated episode ever reached a genuine
+    lift-and-carry state -- see docs/reward_function.md).
+
+    Fix: require height evidence only to ESTABLISH holding (same as
+    is_grasped -- a gripper that's merely closed near the cube without
+    ever having lifted it must not count, which also avoids a different
+    problem: incentivizing the policy to delay closing the gripper at
+    all, since closing prematurely would otherwise cause an immediate,
+    unearned switch to the lower-reward transport shaping). Once holding
+    has been established, it's allowed to PERSIST across subsequent steps
+    purely on proximity + closed-gripper evidence, with no further height
+    requirement -- correctly covering the final lowering-to-target
+    sequence. Holding still ends immediately if the gripper opens or
+    moves away from the cube (proximity or joint-angle check fails),
+    which is exactly what should happen on release.
+
+    This is the one deliberate, explicitly-justified exception to this
+    module's otherwise fully stateless design -- `was_holding` is an
+    ordinary function argument (same inputs always give the same output),
+    so this is still a pure function, just one whose result legitimately
+    depends on very recent history, which a single-timestep snapshot
+    cannot resolve on its own. The caller (the training env) is
+    responsible for persisting `was_holding` across steps and passing back
+    whatever this function returns."""
+    cube_height = cube_pos[2] - cfg.table_z
+    close_enough = _dist3(gripper_pos, cube_pos) < cfg.grasp_proximity_threshold
+    closed = gripper_joint_pos <= cfg.gripper_closed_threshold
+    return closed and close_enough and (cube_height > cfg.lift_threshold or was_holding)
 
 
 def is_placed(cube_pos, cube_lin_vel, cfg: PickPlaceRewardConfig) -> bool:
@@ -180,14 +232,15 @@ def compute_reward(
     cube_lin_vel,
     gripper_joint_pos,
     joint_vel,
+    was_holding: bool,
     cfg: PickPlaceRewardConfig = PickPlaceRewardConfig(),
 ):
     """Computes one step's scalar reward plus a diagnostics dict.
 
     Two-phase dense shaping, switching on the grasp event:
-      - Ungrasped: reward for closing the gripper-to-cube distance
+      - Not holding: reward for closing the gripper-to-cube distance
         ("approach"/"reach").
-      - Grasped: a flat bonus for holding on, plus reward for closing the
+      - Holding: a flat bonus for holding on, plus reward for closing the
         cube-to-target distance ("transport"/"place").
 
     This phase switch (rather than one continuous "reward height" term)
@@ -199,6 +252,13 @@ def compute_reward(
     sideways, and lowering all part of one continuous, non-conflicting
     signal that naturally decreases to zero exactly when the task is done.
 
+    The phase switch uses is_holding(), not is_grasped() -- see
+    is_holding()'s own docstring for why a naive height-gated check on
+    every step gets this wrong specifically during the final
+    lowering-to-target sequence (a real bug caught by manually tracing
+    this function's own self-test, not by the empirical replay
+    validation).
+
     Args:
         gripper_pos: (x, y, z) world position of the actual grasp point
             (use grasp_point_world() on gripper_frame_link's pose -- NOT
@@ -209,18 +269,26 @@ def compute_reward(
         gripper_joint_pos: current "gripper" joint position, radians.
         joint_vel: iterable of all actuated joint velocities (rad/s),
             used for the action/energy penalty.
+        was_holding: whether is_holding() returned True on the PREVIOUS
+            step for this same environment (False on the first step after
+            a reset). The caller is responsible for persisting this
+            across steps -- see is_holding()'s docstring for why.
         cfg: reward configuration/weights.
 
     Returns:
         (reward: float, info: dict) -- info carries the boolean
-        grasped/placed/failed flags and the individual reward components,
-        useful for logging and for the validation script's sanity checks.
+        holding/grasped/placed/failed flags and the individual reward
+        components. info["holding"] is what the caller must feed back in
+        as next step's `was_holding`. info["grasped"] is the separate,
+        strict, stateless liftoff-detection flag (see is_grasped()) --
+        useful for logging, not for driving the phase switch.
     """
+    holding = is_holding(gripper_pos, cube_pos, gripper_joint_pos, was_holding, cfg)
     grasped = is_grasped(gripper_pos, cube_pos, gripper_joint_pos, cfg)
     placed = is_placed(cube_pos, cube_lin_vel, cfg)
     failed = is_failed(cube_pos, cfg)
 
-    if not grasped:
+    if not holding:
         d_reach = _dist3(gripper_pos, cube_pos)
         dense = cfg.reach_weight * (1.0 - _tanh(d_reach / cfg.reach_scale))
         phase = "approach"
@@ -237,6 +305,7 @@ def compute_reward(
 
     info = {
         "phase": phase,
+        "holding": holding,
         "grasped": grasped,
         "placed": placed,
         "failed": failed,
@@ -253,93 +322,144 @@ def _self_test():
     zero_joint_vel = (0.0,) * 6
     gripper_open_joint = 1.0  # above gripper_closed_threshold -> not "closed"
     gripper_closed_joint = -0.1  # below gripper_closed_threshold -> "closed"
+    F = False  # was_holding=False -- every single-snapshot test below is a "fresh" call
 
     # 1. Reach shaping must strictly improve as the gripper approaches the cube.
-    far = compute_reward((0.0, 0.0, 0.3), cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, cfg)[0]
-    near = compute_reward((0.27, 0.0, 0.02), cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, cfg)[0]
-    at_cube = compute_reward(cube_at_start, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, cfg)[0]
+    far = compute_reward((0.0, 0.0, 0.3), cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, cfg)[0]
+    near = compute_reward((0.27, 0.0, 0.02), cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, cfg)[0]
+    at_cube = compute_reward(cube_at_start, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, cfg)[0]
     assert far < near < at_cube, (far, near, at_cube)
 
-    # 2. Touching the cube with an OPEN gripper must NOT count as grasped
+    # 2. Touching the cube with an OPEN gripper must NOT count as holding
     #    (the cube hasn't actually left the table -- height gate handles this
     #    regardless of joint angle, but this also checks the joint gate
-    #    directly: closed-but-not-lifted should also not count as grasped).
-    _, info = compute_reward(cube_at_start, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, cfg)
-    assert not info["grasped"], info
+    #    directly: closed-but-not-lifted should also not count as holding).
+    _, info = compute_reward(cube_at_start, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, cfg)
+    assert not info["holding"], info
     lifted_but_open = (0.28, 0.0, 0.10)
-    _, info = compute_reward(lifted_but_open, lifted_but_open, zero_vel, gripper_open_joint, zero_joint_vel, cfg)
-    assert not info["grasped"], "lifted with an open gripper should not count as grasped"
+    _, info = compute_reward(lifted_but_open, lifted_but_open, zero_vel, gripper_open_joint, zero_joint_vel, F, cfg)
+    assert not info["holding"], "lifted with an open gripper should not count as holding"
 
-    # 3. Lifted AND closed must count as grasped, and switch to "transport" phase.
+    # 3. Lifted AND closed must count as holding, and switch to "transport" phase.
     lifted = (0.28, 0.0, 0.10)
-    _, info = compute_reward(lifted, lifted, zero_vel, gripper_closed_joint, zero_joint_vel, cfg)
-    assert info["grasped"] and info["phase"] == "transport", info
+    _, info = compute_reward(lifted, lifted, zero_vel, gripper_closed_joint, zero_joint_vel, F, cfg)
+    assert info["holding"] and info["phase"] == "transport", info
 
     # 3b. Regression test for a real bug caught during validation against
     # recorded teleop data: a cube barely above rest height (e.g. still
     # settling) combined with a coincidentally-closed gripper FAR AWAY on
-    # the table must NOT count as grasped -- height and joint angle alone
+    # the table must NOT count as holding -- height and joint angle alone
     # aren't enough, the gripper must actually be near the cube.
     cube_barely_elevated = (0.28, 0.0, cfg.lift_threshold + 0.005)
     gripper_far_away = (-0.1, 0.3, 0.15)
     _, info = compute_reward(
-        gripper_far_away, cube_barely_elevated, zero_vel, gripper_closed_joint, zero_joint_vel, cfg
+        gripper_far_away, cube_barely_elevated, zero_vel, gripper_closed_joint, zero_joint_vel, F, cfg
     )
-    assert not info["grasped"], "closed gripper far from a barely-elevated cube must not count as grasped"
+    assert not info["holding"], "closed gripper far from a barely-elevated cube must not count as holding"
 
-    # 4. Grasped reward must strictly improve as the cube approaches the target,
-    #    and must NOT depend on cube height once grasped (moving sideways at
+    # 3c. Regression test for a SECOND, separate real bug -- caught not by
+    # replay validation but by manually tracing this self-test's own
+    # numbers during a full correctness audit. lift_threshold (0.02m) sits
+    # ABOVE the place target's resting height (0.015m) -- necessarily true,
+    # since a successful place ends with the cube back down near table
+    # height. The ORIGINAL design (is_grasped-drives-everything, a naive
+    # per-step height check) would flip back to "not holding" the instant
+    # the cube is lowered onto the target -- exactly the moment the
+    # transport-phase's target-distance shaping matters most -- silently
+    # replacing it with approach-phase gripper-to-cube shaping instead.
+    # Simulate the sequence: establish a genuine hold up high (step 1),
+    # then lower the still-held cube onto the target (step 2,
+    # was_holding=True from step 1's result) and confirm holding +
+    # transport phase PERSIST despite the height drop.
+    _, info_step1 = compute_reward(
+        (0.28, 0.0, 0.10), (0.28, 0.0, 0.10), zero_vel, gripper_closed_joint, zero_joint_vel, F, cfg
+    )
+    assert info_step1["holding"], "step 1 should establish a genuine hold while elevated"
+    _, info_step2 = compute_reward(
+        cfg.target_pos, cfg.target_pos, zero_vel, gripper_closed_joint, zero_joint_vel, info_step1["holding"], cfg
+    )
+    assert info_step2["holding"] and info_step2["phase"] == "transport", (
+        "still-closed gripper lowering an already-held cube onto the target must stay in the "
+        "transport phase, not silently fall back to approach shaping"
+    )
+    # Confirm the OLD (fixed) behavior really was broken -- the strict,
+    # stateless is_grasped() check (by design, see its own docstring) still
+    # returns False at the exact target height, since 0.015m is not above
+    # lift_threshold (0.02m). Expected and correct for is_grasped()
+    # specifically -- it's exactly why compute_reward() must not use it
+    # for the phase switch.
+    assert not is_grasped(cfg.target_pos, cfg.target_pos, gripper_closed_joint, cfg)
+
+    # 3d. Holding must end immediately on release (gripper opens), even
+    # with was_holding=True carried in from the previous step.
+    _, info_released = compute_reward(
+        cfg.target_pos, cfg.target_pos, zero_vel, gripper_open_joint, zero_joint_vel, True, cfg
+    )
+    assert not info_released["holding"], "an opened gripper must not count as holding regardless of was_holding"
+
+    # 4. Holding reward must strictly improve as the cube approaches the target,
+    #    and must NOT depend on cube height once holding (moving sideways at
     #    the same height should not be penalized relative to being higher up --
     #    this is the check that the phase-2 shaping doesn't secretly still
     #    reward pure altitude, which would fight against ever placing the cube).
     far_from_target = compute_reward(
-        (0.28, 0.0, 0.10), (0.28, 0.0, 0.10), zero_vel, gripper_closed_joint, zero_joint_vel, cfg
+        (0.28, 0.0, 0.10), (0.28, 0.0, 0.10), zero_vel, gripper_closed_joint, zero_joint_vel, F, cfg
     )[0]
     closer_to_target = compute_reward(
-        (-0.05, 0.10, 0.10), (-0.05, 0.10, 0.10), zero_vel, gripper_closed_joint, zero_joint_vel, cfg
+        (-0.05, 0.10, 0.10), (-0.05, 0.10, 0.10), zero_vel, gripper_closed_joint, zero_joint_vel, F, cfg
     )[0]
     at_target_same_height = compute_reward(
-        (-0.15, 0.15, 0.10), (-0.15, 0.15, 0.10), zero_vel, gripper_closed_joint, zero_joint_vel, cfg
+        (-0.15, 0.15, 0.10), (-0.15, 0.15, 0.10), zero_vel, gripper_closed_joint, zero_joint_vel, F, cfg
     )[0]
-    # Use the DENSE component (not the full reward) for the exact-target
-    # case -- landing exactly on cfg.target_pos at rest also fires the
-    # success bonus (tested separately below), which would otherwise
-    # swamp this comparison.
-    _, info_at_target_table_height = compute_reward(
-        cfg.target_pos, cfg.target_pos, zero_vel, gripper_closed_joint, zero_joint_vel, cfg
-    )
     assert far_from_target < closer_to_target < at_target_same_height, (
         far_from_target,
         closer_to_target,
         at_target_same_height,
     )
-    # same (x, y) as the target regardless of height should give ~identical
-    # DENSE reward -- height doesn't matter once grasped, only xy+z distance
-    # to the exact target point, and both of these are already very close to
-    # it (within place_scale) so they should be nearly saturated and similar.
-    _, info_at_target_same_height = compute_reward(
-        (-0.15, 0.15, 0.10), (-0.15, 0.15, 0.10), zero_vel, gripper_closed_joint, zero_joint_vel, cfg
+    # Dense reward must depend ONLY on 3D distance to the target, never on
+    # height specifically -- otherwise phase-2 shaping could secretly still
+    # reward pure altitude, fighting against ever placing the cube. Tested
+    # correctly (not just "these two points happen to be close") by
+    # comparing two points at the SAME distance from the target via
+    # different decompositions -- one purely vertical offset, one purely
+    # horizontal -- and asserting near-exact equality. (An earlier version
+    # of this test instead compared two points at genuinely DIFFERENT
+    # distances -0.085m via height vs. 0m exactly at target- and asserted
+    # they were "close enough," which only passed by coincidence while the
+    # 3c bug was still present, silently routing one of the two calls
+    # through the wrong formula entirely. Caught during the same
+    # correctness audit that found 3c.)
+    offset = 0.085
+    tx, ty, tz = cfg.target_pos
+    vertical_offset_pos = (tx, ty, tz + offset)
+    horizontal_offset_pos = (tx + offset, ty, tz)
+    _, info_vertical = compute_reward(
+        vertical_offset_pos, vertical_offset_pos, zero_vel, gripper_closed_joint, zero_joint_vel, True, cfg
     )
-    assert abs(info_at_target_same_height["dense"] - info_at_target_table_height["dense"]) < 0.05, (
-        info_at_target_same_height["dense"],
-        info_at_target_table_height["dense"],
+    _, info_horizontal = compute_reward(
+        horizontal_offset_pos, horizontal_offset_pos, zero_vel, gripper_closed_joint, zero_joint_vel, True, cfg
+    )
+    assert info_vertical["holding"] and info_horizontal["holding"], (info_vertical, info_horizontal)
+    assert abs(info_vertical["dense"] - info_horizontal["dense"]) < 1e-9, (
+        info_vertical["dense"],
+        info_horizontal["dense"],
     )
 
     # 5. Success bonus only fires when actually placed (at rest, at the target).
     reward_at_target_still, info = compute_reward(
-        cfg.target_pos, cfg.target_pos, zero_vel, gripper_closed_joint, zero_joint_vel, cfg
+        cfg.target_pos, cfg.target_pos, zero_vel, gripper_closed_joint, zero_joint_vel, True, cfg
     )
     assert info["placed"], info
     fast_vel = (1.0, 0.0, 0.0)  # swinging through, not resting
     reward_at_target_moving, info = compute_reward(
-        cfg.target_pos, cfg.target_pos, fast_vel, gripper_closed_joint, zero_joint_vel, cfg
+        cfg.target_pos, cfg.target_pos, fast_vel, gripper_closed_joint, zero_joint_vel, True, cfg
     )
     assert not info["placed"], "fast-moving cube passing through the target should not count as placed"
     assert reward_at_target_still > reward_at_target_moving + cfg.success_bonus - 0.1
 
     # 6. Action penalty must reduce reward, all else equal.
-    still = compute_reward(cube_at_start, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, cfg)[0]
-    moving = compute_reward(cube_at_start, cube_at_start, zero_vel, gripper_open_joint, (5.0,) * 6, cfg)[0]
+    still = compute_reward(cube_at_start, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, cfg)[0]
+    moving = compute_reward(cube_at_start, cube_at_start, zero_vel, gripper_open_joint, (5.0,) * 6, F, cfg)[0]
     assert moving < still, (moving, still)
 
     # 7. Failure detection.

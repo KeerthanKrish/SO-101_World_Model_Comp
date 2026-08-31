@@ -119,6 +119,9 @@ def main():
     max_dense_approach = 0.0
     max_cube_height = 0.0
     first_grasp_gripper_cube_dist = None
+    # was_holding hysteresis state -- see pickplace_reward.is_holding()'s
+    # docstring. False at episode start, updated from each step's info.
+    was_holding = False
 
     for step_idx, step in enumerate(episode):
         target = torch.tensor([[step["joint_pos"][j] for j in _JOINT_ORDER]], device=sim.device)
@@ -136,7 +139,10 @@ def main():
         gripper_joint_pos = step["joint_pos"]["gripper"]
         joint_vel = robot.data.joint_vel[0, joint_indices].cpu().tolist()
 
-        reward, info = compute_reward(gripper_pos, cube_pos, cube_lin_vel, gripper_joint_pos, joint_vel, cfg)
+        reward, info = compute_reward(
+            gripper_pos, cube_pos, cube_lin_vel, gripper_joint_pos, joint_vel, was_holding, cfg
+        )
+        was_holding = info["holding"]
         rewards.append(reward)
 
         max_cube_height = max(max_cube_height, cube_pos[2])
@@ -151,7 +157,7 @@ def main():
         if step_idx % args_cli.log_every == 0 or step_idx == len(episode) - 1:
             print(
                 f"[step {step_idx:4d}] reward={reward:+.3f} phase={info['phase']:9s} "
-                f"grasped={info['grasped']} cube_h={cube_pos[2]:.3f} "
+                f"holding={info['holding']} grasped={info['grasped']} cube_h={cube_pos[2]:.3f} "
                 f"gripper_pos=({gripper_pos[0]:.3f},{gripper_pos[1]:.3f},{gripper_pos[2]:.3f})"
             )
 
