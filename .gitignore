@@ -1,6 +1,7 @@
 # External dependencies (cloned separately, not part of this repo's history)
 IsaacLab/
 lerobot/
+tdmpc2/
 assets/
 
 # Python
