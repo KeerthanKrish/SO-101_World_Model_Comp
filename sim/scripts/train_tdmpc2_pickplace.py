@@ -35,17 +35,37 @@ already claimed and cached) and folding TensorWrapper's small amount of
 logic directly into tdmpc2_pickplace_env.py's adapter instead of
 importing it -- see that module's own docstring.
 
-This is a SMOKE TEST launcher (--smoke-test), not a real training run:
-shrinks episode length and buffer/batch sizes so a full pipeline pass
-(collect an episode, sample from the buffer, compute a real update) can
-be verified quickly. Real training would use the full 500-step episode
-length and default hyperparameters.
+--smoke-test shrinks episode length and buffer/batch sizes so a full
+pipeline pass (collect an episode, sample from the buffer, compute a real
+update) can be verified quickly -- confirmed working, see
+docs/tdmpc2_integration.md. Without it, this runs REAL training: full
+500-step episodes, default batch size, seed_steps computed the same way
+envs.make_env() would (max(1000, 5*episode_length)).
+
+Periodic evaluation is interleaved with training in the SAME env
+instance, not a separate one -- Isaac Sim only allows one
+SimulationContext per process (DirectRLEnv's own __init__ raises if one
+already exists), so a second env instance for eval isn't possible here.
+Every --eval-every real steps (checked at episode boundaries, never
+mid-episode), one eval episode runs with agent.act(eval_mode=True) --
+deterministic, no exploration noise -- instead of random/exploratory
+actions, is NOT added to the replay buffer, and has scene_camera frames
+captured and stitched into an mp4 for visual sanity-checking of what the
+CURRENT policy actually does (not just "does the pipeline run"). This is
+deliberately NOT tdmpc2's own built-in save_video mechanism
+(common/logger.py's VideoRecorder) -- that path only activates when
+wandb is enabled (`self._video = VideoRecorder(...) if self._wandb and
+cfg.save_video else None`), and we're deliberately not standing up real
+wandb logging for this.
 
 Usage:
     ./isaaclab.sh -p /path/to/train_tdmpc2_pickplace.py --headless --enable_cameras --smoke-test
+    ./isaaclab.sh -p /path/to/train_tdmpc2_pickplace.py --headless --enable_cameras --steps 30000 --eval-every 5000
 """
 
 import argparse
+import os
+import subprocess
 import sys
 
 from isaaclab.app import AppLauncher
@@ -53,6 +73,10 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser()
 parser.add_argument("--smoke-test", action="store_true", help="Short episode/buffer for a fast pipeline check.")
 parser.add_argument("--steps", type=int, default=None, help="Override total env steps.")
+parser.add_argument("--eval-every", type=int, default=5000, help="Real training steps between eval+video episodes.")
+parser.add_argument(
+    "--video-dir", type=str, default="/home/keerthan/SO-101-WM/sim/output/tdmpc2_eval_videos", help="Eval video output dir."
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -61,10 +85,12 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import shutil
 from time import time
 
 import torch
 from omegaconf import OmegaConf
+from PIL import Image
 from tensordict.tensordict import TensorDict
 
 # IMPORT ORDER MATTERS: sim/envs/ and tdmpc2/tdmpc2/envs/ are both
@@ -122,23 +148,30 @@ def episode_length_s() -> float:
 def build_cfg():
     base = OmegaConf.load("/home/keerthan/SO-101-WM/tdmpc2/tdmpc2/config.yaml")
     episode_length = int(episode_length_s() / 0.02)
+    # Same formula envs.make_env() itself uses (see tdmpc2/tdmpc2/envs/__init__.py)
+    # -- not applicable to smoke-test's tiny episode_length, kept low there on purpose.
+    seed_steps = 5 if args_cli.smoke_test else max(1000, 5 * episode_length)
 
     overrides = {
         "task": "so101-pickplace",
         "obs": "rgb",  # informational only post-patch (encode() no longer branches on this), kept for parse_cfg/logging
         "episodic": True,  # REQUIRED: our task has real terminations (success/failure) -- see online_trainer.py
         "model_size": 5,  # REQUIRED for any task using 'rgb' -- see tdmpc2_fusion_patch.py's docstring
-        "steps": args_cli.steps or (300 if args_cli.smoke_test else 1_000_000),
+        # 30k steps (~60 real episodes) is a bounded FIRST real run, not
+        # training to convergence -- enough to see genuine learning signal
+        # and produce a few eval videos, not an open-ended commitment.
+        # Override with --steps for a longer/shorter run.
+        "steps": args_cli.steps or (300 if args_cli.smoke_test else 30_000),
         "batch_size": 8 if args_cli.smoke_test else 256,
-        "buffer_size": 5_000 if args_cli.smoke_test else 1_000_000,
-        "seed_steps": 5,  # low on purpose for the smoke test -- real training should use max(1000, 5*episode_length)
-        "eval_freq": 10_000_000,  # effectively disabled -- eval() needs its own separate env instance, not built here yet
+        "buffer_size": 5_000 if args_cli.smoke_test else 1_000_000,  # auto-capped at min(buffer_size, steps) anyway
+        "seed_steps": seed_steps,
+        "eval_freq": 10_000_000,  # tdmpc2's own eval() path unused -- see module docstring, we run our own eval loop
         "eval_episodes": 1,
-        "compile": False,  # skip torch.compile for a fast, debuggable smoke test
+        "compile": False,  # see module/file docstrings -- kept off for a debuggable first real run, not just the smoke test
         "enable_wandb": False,
-        "save_video": False,
+        "save_video": False,  # tdmpc2's own video path is wandb-gated -- we capture eval video ourselves instead
         "save_agent": False,
-        "exp_name": "smoke_test" if args_cli.smoke_test else "default",
+        "exp_name": "smoke_test" if args_cli.smoke_test else "run1",
         "data_dir": "/home/keerthan/SO-101-WM/sim/output/tdmpc2_data",
     }
     cfg = OmegaConf.merge(base, overrides)
@@ -185,6 +218,44 @@ def to_td(obs, action=None, reward=None, terminated=None, action_dim=6):
     )
 
 
+def run_eval_episode(env, base_env, agent, cfg, video_path):
+    """Runs ONE episode with the CURRENT policy (eval_mode=True -- no
+    exploration noise), using the SAME env instance training already
+    uses (a second Isaac Sim SimulationContext isn't possible in this
+    process -- see module docstring). NOT added to the replay buffer.
+    Captures scene_camera frames and stitches them into an mp4 at
+    video_path -- a visual check on what the policy actually does, not
+    just whether the pipeline runs. Returns (episode_reward, success).
+    """
+    frames_dir = video_path + "_frames"
+    os.makedirs(frames_dir, exist_ok=True)
+
+    obs = env.reset()
+    scene_cam = base_env.scene["scene_camera"]
+    ep_reward, t, done, info = 0.0, 0, False, {"success": False}
+
+    while not done:
+        obs_for_act = TensorDict(obs, batch_size=(), device="cpu") if isinstance(obs, dict) else obs
+        action = agent.act(obs_for_act, t0=(t == 0), eval_mode=True)
+        obs, reward, done, info = env.step(action)
+        ep_reward += reward.item()
+
+        base_env.sim.render()
+        rgb = scene_cam.data.output["rgb"][0, ..., :3].cpu().numpy()
+        Image.fromarray(rgb).save(os.path.join(frames_dir, f"frame_{t:05d}.png"))
+        t += 1
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-framerate", "20", "-i", os.path.join(frames_dir, "frame_%05d.png"),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", video_path,
+        ],
+        check=True, capture_output=True,
+    )
+    shutil.rmtree(frames_dir)
+    return ep_reward, bool(info["success"])
+
+
 def main():
     cfg = build_cfg()
     print(f"[INFO] task={cfg.task} model_size={cfg.model_size} latent_dim={cfg.latent_dim} "
@@ -192,6 +263,13 @@ def main():
 
     base_env = PickPlaceEnv(PickPlaceEnvCfg(use_cameras=True, num_envs=1, episode_length_s=episode_length_s()))
     env = PickPlaceTDMPC2Wrapper(base_env)
+
+    # Aimed once -- same third-person view as record_pickplace_env_video.py.
+    # Only used during eval episodes (see run_eval_episode), not training steps.
+    base_env.scene["scene_camera"].set_world_poses_from_view(
+        torch.tensor([[0.6, -0.6, 0.5]], device=base_env.device), torch.tensor([[0.15, 0.0, 0.05]], device=base_env.device)
+    )
+    os.makedirs(args_cli.video_dir, exist_ok=True)
 
     agent = TDMPC2(cfg)
     buffer = Buffer(cfg)
@@ -202,6 +280,7 @@ def main():
     tds = None
     start = time()
     num_updates_done = 0
+    next_eval_at = args_cli.eval_every
 
     while step <= cfg.steps:
         if done:
@@ -209,6 +288,14 @@ def main():
                 ep_idx = buffer.add(torch.cat(tds))
                 print(f"[INFO] step {step}: episode {ep_idx} added to buffer "
                       f"(len={len(tds)}, reward_sum={sum(td['reward'].item() for td in tds[1:]):.3f})")
+
+            if not args_cli.smoke_test and step >= next_eval_at:
+                video_path = os.path.join(args_cli.video_dir, f"eval_step_{step:06d}.mp4")
+                eval_reward, eval_success = run_eval_episode(env, base_env, agent, cfg, video_path)
+                print(f"[INFO] step {step}: EVAL episode -- reward={eval_reward:+.3f} "
+                      f"success={eval_success} video={video_path}")
+                next_eval_at += args_cli.eval_every
+
             obs = env.reset()
             # THE FIX: wrap in TensorDict before calling agent.act() -- see
             # module docstring. Their reference OnlineTrainer.train() does
@@ -238,7 +325,8 @@ def main():
         step += 1
 
     elapsed = time() - start
-    print("\n[RESULT] === TD-MPC2 pipeline smoke test summary ===")
+    label = "smoke test" if args_cli.smoke_test else "training run"
+    print(f"\n[RESULT] === TD-MPC2 {label} summary ===")
     print(f"[RESULT] Ran {step} env steps, {ep_idx} episodes added to buffer, "
           f"{num_updates_done} agent.update() calls, in {elapsed:.1f}s.")
     print("[RESULT] No crash -- full pipeline (env -> adapter -> agent.act -> buffer -> agent.update) runs end to end.")

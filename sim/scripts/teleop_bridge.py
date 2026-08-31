@@ -29,14 +29,37 @@ side_camera, top_camera, wrist_camera) render every frame regardless of
 whether their output is read, and having 3-4 active was a real, measurable
 source of lag during teleop. No --enable_cameras needed here.
 
+Cube position: randomized at session start, and re-randomizable between
+reps via a simple trigger file (see RESET_TRIGGER_FILE below) -- both
+sampled from the exact same train region PickPlaceEnvCfg uses for TD-MPC2
+(sim/envs/pickplace_env.py's cube_x_range/cube_y_range). This was a real
+gap, found while planning the diffusion policy's data collection: this
+script previously left the cube at the scene's one fixed default spawn
+position for an entire session, with its position across "reps" only ever
+determined by wherever a human happened to leave it after the previous
+pick (already documented as a source of confusion once, in
+docs/reward_function.md's validate_reward_function.py section). For a
+FAIR comparison against TD-MPC2 later (docs/evaluation_plan.md's Test 2,
+novel-position generalization), any demonstrations collected for the
+diffusion policy need to respect the same train/held-out position split,
+not scatter across whatever positions a human happened to leave the cube.
+
 Usage (run non-headless, on the machine with the monitor + leader arm):
     ./isaaclab.sh -p /path/to/teleop_bridge.py
+
+To re-randomize the cube position between reps during a session, from a
+DIFFERENT terminal on the same machine:
+    touch /tmp/teleop_reset_cube
+This script polls for that file every step and deletes it once handled --
+avoids needing a real-time keyboard listener inside the sim loop, same
+lightweight file-based IPC pattern as leader_reader.py's shared state file.
 """
 
 import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 
@@ -66,6 +89,17 @@ from isaaclab.sim import SimulationContext
 sys.path.insert(0, "/home/keerthan/SO-101-WM/sim")
 from scenes.pickplace_scene import PickPlaceSceneBaseCfg  # isort:skip
 
+# Kept in sync BY HAND with PickPlaceEnvCfg.cube_x_range/cube_y_range
+# (sim/envs/pickplace_env.py) -- not imported directly to avoid pulling in
+# that env's reward/training machinery into a simple teleop script. Two
+# float tuples are a low enough duplication risk to accept; if these ever
+# drift apart, TD-MPC2 and diffusion-policy demonstrations would no longer
+# share a train region, silently breaking Test 2's fairness guarantee
+# (docs/evaluation_plan.md).
+_CUBE_X_RANGE = (0.05, 0.25)
+_CUBE_Y_RANGE = (-0.20, 0.20)
+RESET_TRIGGER_FILE = "/tmp/teleop_reset_cube"
+
 # Leader gripper is a 0-100 range; our sim's gripper joint is in radians,
 # URDF range -0.174533 (confirmed CLOSED) to 1.74533 (confirmed OPEN) --
 # see run_pickplace_demo.py's comments. Assuming leader 0% = closed,
@@ -84,6 +118,27 @@ def leader_action_to_sim_joint_pos(action: dict[str, float]) -> dict[str, float]
     gripper_pct = action["gripper.pos"] / 100.0
     sim_pos["gripper"] = _SIM_GRIPPER_CLOSED + gripper_pct * (_SIM_GRIPPER_OPEN - _SIM_GRIPPER_CLOSED)
     return sim_pos
+
+
+def randomize_cube_position(scene):
+    """Teleports the (simulated) cube to a fresh random position sampled
+    from the same train region PickPlaceEnvCfg uses -- see _CUBE_X_RANGE/
+    _CUBE_Y_RANGE's comment above for why this must stay in sync with it.
+    Safe to call at any time (the cube is a simple RigidObject, teleporting
+    it doesn't disturb the robot)."""
+    cube = scene["cube"]
+    default_state = cube.data.default_root_state.clone()
+    default_state[0, 0] = random.uniform(*_CUBE_X_RANGE)
+    default_state[0, 1] = random.uniform(*_CUBE_Y_RANGE)
+    # default_root_state is per-env-LOCAL (same numeric values regardless
+    # of which env clone), not world-frame -- env_origins must always be
+    # added when writing it back, same convention as
+    # PickPlaceEnv._reset_idx() (verified there against IsaacLab's own
+    # cartpole_env.py reference). Only ever (0,0,0) here since this script
+    # always runs num_envs=1, but kept for correctness/consistency anyway.
+    default_state[0, 0:3] += scene.env_origins[0]
+    cube.write_root_pose_to_sim(default_state[:, :7])
+    cube.write_root_velocity_to_sim(torch.zeros_like(default_state[:, 7:]))
 
 
 def atomic_save_json(data, path):
@@ -122,6 +177,11 @@ def main():
     scene_cfg = PickPlaceSceneBaseCfg(num_envs=1, env_spacing=2.0)
     scene = InteractiveScene(scene_cfg)
     sim.reset()
+    randomize_cube_position(scene)
+    if os.path.exists(RESET_TRIGGER_FILE):
+        os.remove(RESET_TRIGGER_FILE)  # stale from a previous session -- don't immediately re-trigger
+    print(f"[INFO]: Cube randomized within the train region {_CUBE_X_RANGE} x {_CUBE_Y_RANGE}.")
+    print(f"[INFO]: To re-randomize between reps, from another terminal: touch {RESET_TRIGGER_FILE}")
 
     robot = scene["robot"]
     joint_names = robot.data.joint_names
@@ -139,6 +199,11 @@ def main():
 
     try:
         while simulation_app.is_running():
+            if os.path.exists(RESET_TRIGGER_FILE):
+                os.remove(RESET_TRIGGER_FILE)
+                randomize_cube_position(scene)
+                print(f"[INFO]: Cube re-randomized at step {step}.")
+
             action, last_t = read_leader_state(args_cli.leader_state_file, last_t)
             if action is not None:
                 current_sim_joint_pos = leader_action_to_sim_joint_pos(action)
