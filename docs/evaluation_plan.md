@@ -251,15 +251,22 @@ wrong and some tests can only be fixed by recollecting data from scratch:
 
 1. **Cube start-position split**: define and document the training
    region vs. the held-out generalization-test region (Test 2) before
-   generating sim rollouts.
+   generating sim rollouts. **In progress 2026-08-30**: running
+   `sim/scripts/reachability_sweep.py` to empirically map the arm's
+   actual IK-reachable workspace on the enlarged 1.2m table, rather than
+   guessing bounds -- see docs/progress.md for the result once complete.
 2. **Target position randomization**: currently fixed in
-   `pickplace_reward.py` (documented open item). Decide whether training
-   randomizes it before generating bulk data -- if novel-target
-   generalization matters, it needs the same train/held-out split
-   treatment as cube position.
+   `pickplace_reward.py` (documented open item). **Decided 2026-08-30**:
+   fixed for the first actual training run (isolates pipeline bugs from
+   generalization questions), randomized for the real bulk-data-
+   generation run once that's validated -- see decisions.md.
 3. **Visual randomization ranges**: decide and document lighting/color/
    texture ranges used in training, with specific values deliberately
-   reserved as out-of-range for the domain-shift test (Test 4).
+   reserved as out-of-range for the domain-shift test (Test 4). **Cube
+   color specifically decided 2026-08-30**: stays a fixed, constant red
+   during training; a different, never-trained-on color is reserved for
+   Test 4 -- see decisions.md. Lighting/table-color ranges still pending,
+   need Isaac Lab's domain randomization tooling (not yet set up).
 4. **Distractor object handling**: decide whether it's a pure eval-time
    addition (default assumption here) or needs its own training data
    variant; either way, check the observation/reward pipeline tolerates
@@ -271,7 +278,8 @@ wrong and some tests can only be fixed by recollecting data from scratch:
 6. **Demonstration style variety**: if multi-modal handling (Test 8)
    matters, deliberately vary teleop approach style across reps during
    collection -- this is a live decision for whoever is at the leader arm,
-   not something fixable afterward.
+   not something fixable afterward. **Decided 2026-08-30**: yes, future
+   teleop sessions should vary approach style -- see decisions.md.
 7. **Reserved real-world eval set**: mark a small, fixed set of real cube
    positions for zero-shot/before-after evaluation (Test 6) *before*
    collecting the real fine-tuning demonstration batch, and keep the

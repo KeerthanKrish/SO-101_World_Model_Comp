@@ -129,3 +129,44 @@ fixed position is what allowed empirical validation against real recorded
 (fixed-position) demonstrations -- will need to become randomized once
 domain randomization for object/target pose is wired in, per the project
 plan.
+
+---
+
+**Decision**: The place target will be randomized eventually, but stays
+fixed for the first actual training run once the training pipeline is
+built.
+
+**Why**: Isolates infrastructure bugs (does the training loop even work)
+from generalization questions (does the policy handle novel targets) --
+validate the simple, fixed-target case works end-to-end first, then add
+target randomization for the real bulk-data-generation run. Made ahead of
+time while planning docs/evaluation_plan.md's data-collection checklist,
+not yet acted on since no training pipeline exists yet.
+
+---
+
+**Decision**: Cube color/appearance stays a fixed, constant red during
+training. A different color (not used anywhere in training) is reserved
+exclusively for the visual domain-shift evaluation test
+(docs/evaluation_plan.md, Test 4).
+
+**Why**: This is a single known-object task, not a general color-invariant
+grasping system -- randomizing cube color during training isn't needed
+for this scope and would add noise without benefit. Keeping it constant
+also means a genuinely novel color at test time is a clean, meaningful
+out-of-distribution probe, rather than something partially already seen
+during training randomization.
+
+---
+
+**Decision**: Future teleop demonstration sessions should deliberately
+vary approach style (e.g. sometimes approaching the cube from the left,
+sometimes the right, varying grip depth) rather than repeating the same
+motion every rep.
+
+**Why**: Keeps the option open to test multi-modal grasp handling later
+(docs/evaluation_plan.md, Test 8) -- diffusion policies are known to
+represent multi-modal action distributions well, but there's nothing to
+test if every demonstration used one identical rigid style. Low cost to
+start now; expensive (impossible without recollecting data) to add
+retroactively.
