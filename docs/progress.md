@@ -648,3 +648,70 @@ width and most of the height, arm near the top).
 **Status**: Table enlarged and top-down camera re-matched; all four
 camera views re-rendered and confirmed working together on the new
 table size.
+
+### 2026-08-31 -- Correctness audit, TD-MPC2 wired in and trained, diffusion policy data strategy planned
+
+Before wiring in either algorithm, went back through pickplace_reward.py,
+grasp_geometry.py, and pickplace_env.py line by line rather than trusting
+earlier validation was sufficient. Found and fixed a real bug: is_grasped()'s
+height check also drove the reward's approach/transport phase switch, but
+the place target's resting height (0.015m) is below the lift-detection
+threshold (0.02m) by construction -- so lowering an already-held cube onto
+the target silently fell back to approach-phase shaping right when
+transport-phase precision mattered most. Fixed with a new, deliberately
+stateful is_holding() function (the one explicit exception to the module's
+otherwise stateless design) -- see docs/reward_function.md's correctness-
+audit section for the full writeup, including a second flawed self-test
+assertion caught in the process.
+
+Integrated the official TD-MPC2 reference implementation (cloned to
+tdmpc2/, never modified in place) against PickPlaceEnv. Found and fixed
+five more real, previously-unexercised bugs along the way -- three in
+TD-MPC2's own reference code (never actually run with a genuine multi-
+modal observation by any of its shipped examples), one in pickplace_env.py
+(extras dict never populated, so no caller could distinguish success from
+failure), and a namespace collision between our envs/ package and theirs.
+Full writeup in docs/tdmpc2_integration.md. Smoke test (300 steps, shrunk
+config) confirmed the whole pipeline mechanically: env -> two-camera
+fusion adapter -> agent.act (real MPC planning) -> replay buffer ->
+agent.update, with real gradient updates producing finite, sensible losses.
+
+Ran the first real training run: 30,000 steps, full 500-step episodes,
+default batch size, num_envs=1 (required -- TD-MPC2's reference trainer
+expects a single non-batched env; sample efficiency from one env stream
+is the whole point of the algorithm, not a limitation worked around).
+Took 3935s (~66 min). 60 episodes collected, 27,501 real gradient updates,
+no crash. Added periodic evaluation interleaved with training in the same
+env instance (a second SimulationContext isn't possible in this process) --
+every 5000 steps, one deterministic (eval_mode=True) episode, not added to
+the buffer, with scene_camera frames captured into an mp4 for a visual
+checkpoint. Eval rewards across the run: +14.6, +90.3, +12.6, +54.1,
++97.9 -- noisy (each is a single episode at a random cube position) but
+trending upward overall. No successful placement yet in any eval episode
+(success=False throughout) -- 30k steps with num_envs=1 shows real
+learning signal but isn't enough to fully solve the task yet, consistent
+with TD-MPC2's benchmark tasks typically needing substantially more
+environment steps even for simpler continuous control.
+
+While training ran, worked through what else needed settling before
+diffusion policy's data-collection strategy. Found and fixed one real gap:
+teleop_bridge.py never randomized the cube's position at all -- it sat at
+one fixed spawn point for an entire session, position across "reps" only
+ever determined by wherever a human happened to leave it. Fixed to
+randomize within the same train region TD-MPC2 uses, re-randomizable
+between reps via a simple trigger file. Researched how others solve the
+"need bulk demonstration data but real demos are expensive" problem --
+found MimicGen (NVIDIA, CoRL 2023), which generates large datasets from a
+handful of human demonstrations via per-subtask SE(3) trajectory
+transformation. User decided to implement a simplified version of that
+core idea directly (not the full published framework, given how much
+simpler our single-object task is) once they return to it -- full
+discussion and decision in docs/diffusion_policy_data_strategy.md.
+
+**Status**: Reward function and env now audited and trusted. TD-MPC2
+pipeline proven correct end to end with one real training run completed
+-- promising reward trend, task not yet solved, more training time would
+be the natural next experiment. Diffusion policy blocked only on the
+demonstration-data decision, execution deferred by the user; the strategy
+itself (small human-demo seed + custom SE(3) augmentation) is decided and
+documented.

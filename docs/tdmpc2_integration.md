@@ -208,20 +208,42 @@ mostly-random actions is nowhere near enough to expect the agent to
 learn anything about actually picking up the cube. That's real training,
 not yet started.
 
+## First real training run (2026-08-31)
+
+30,000 steps, full 500-step episodes, default batch size (256), `num_envs=1`
+(required -- see the core-mismatch section above). Periodic evaluation
+added on top of the smoke-test design: every `--eval-every` real training
+steps (checked at episode boundaries only), one deterministic
+(`eval_mode=True`) episode runs using the SAME env instance (a second
+`SimulationContext` isn't possible in this process), is NOT added to the
+replay buffer, and has `scene_camera` frames captured into an mp4 for a
+visual checkpoint -- deliberately not tdmpc2's own `save_video` mechanism,
+which only activates when wandb is enabled (`common/logger.py`'s
+`VideoRecorder`), and real wandb logging was deliberately not stood up.
+
+**Results**: 3935s (~66 min) total, 60 episodes collected, 27,501 real
+gradient updates, no crash. Eval episode rewards across the run: +14.6,
++90.3, +12.6, +54.1, +97.9 -- noisy (each is a single episode at one
+random cube position, not an average) but trending upward overall. No
+successful placement in any eval checkpoint (`success=False` throughout).
+**Interpretation**: real learning signal (the agent is doing something
+meaningfully better than random, reflected in the reward trend), but not
+enough environment interaction yet to fully solve the task -- consistent
+with TD-MPC2's own benchmark tasks typically needing substantially more
+steps even for simpler continuous control problems. Not a red flag on its
+own; the natural next experiment is simply more training time, not a
+different design.
+
 ## Known limitations / not yet done
 
-- Real training (the full 500-step episode length, default
-  hyperparameters, many more steps) has not been run -- only the
-  smoke test's shrunk, fast configuration.
-- `eval()` is not wired up (disabled via a very high `eval_freq` in the
-  smoke-test config) -- it needs its own separate env instance (parallel
-  to the training env), not yet built.
-- Checkpointing/logging beyond console output is not wired up
-  (`save_agent`/`enable_wandb` both `False` for the smoke test).
+- Only one training run has been done (30,000 steps) -- no sweep over
+  training duration, hyperparameters, or fusion strategy yet.
+- Checkpointing/logging beyond console output + eval videos is not wired
+  up (`save_agent`/`enable_wandb` both `False`).
 - The fusion strategy (elementwise sum of two SimNorm-normalized
   encodings) is a deliberately minimal first choice, not tuned or
   compared against alternatives (e.g. concatenation plus a learned
-  projection) -- worth revisiting once real training results exist to
+  projection) -- worth revisiting once more training results exist to
   motivate the added complexity.
 - `torch.compile` is disabled (`compile: false`) for fast, debuggable
   iteration -- real training would likely want it re-enabled for speed,
