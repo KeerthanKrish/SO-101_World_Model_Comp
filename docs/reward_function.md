@@ -31,15 +31,24 @@ hardware.
 
 ## Design
 
-### Two-phase potential-based shaping, not a single continuous term
+**Note**: the two subsections immediately below describe the *original*
+(2026-08-30) design. Both the shaping formula and the grasp bonus changed
+in the 2026-08-31 potential-based-shaping redesign -- see that section
+further down for what's actually running now. Kept here, clearly marked,
+because the *reasoning* in both subsections (why two phases, why a
+bounded shape) still applies unchanged to the new formula; only "reward
+the absolute value" became "reward the change in value."
+
+### Two-phase shaping, not a single continuous term
 
 The reward switches cleanly at the grasp event:
 
 - **Approach** (ungrasped): reward for closing the distance between the
   gripper's actual grasp point and the cube.
-- **Transport** (grasped): a flat per-step bonus for holding on, plus
-  reward for closing the distance between the cube and a fixed 3D target
-  point.
+- **Transport** (grasped): (originally) a flat per-step bonus for holding
+  on, plus reward for closing the distance between the cube and a fixed
+  3D target point. The flat per-step holding bonus was removed in the
+  redesign -- see below.
 
 This split is deliberate. An earlier, simpler idea -- just reward cube
 height once grasped -- was rejected: height-chasing has no incentive to
@@ -51,8 +60,8 @@ cube is at rest at the target -- not fighting against the actual goal.
 
 ### Bounded (tanh) shaping, not raw negative distance
 
-Both phases use `weight * (1 - tanh(distance / scale))` rather than
-`-distance`. Two reasons:
+Both phases' potential function is `1 - tanh(distance / scale)` rather
+than `-distance`. Two reasons:
 1. It saturates smoothly instead of handing out unbounded penalties for
    being far away, so one bad early state can't dominate an entire
    trajectory's return.
@@ -117,15 +126,21 @@ scale), not treated as final.
 
 ### Level 1: synthetic self-test (`python sim/envs/pickplace_reward.py`)
 
-Hand-constructed states checking: reach reward strictly improves when
-approaching the cube; an open gripper touching the cube doesn't count as
-grasped; a lifted+closed gripper does and switches to transport phase;
-transport reward depends only on cube-to-target distance, not height
-(confirming the phase-2 design goal); the success bonus fires only when
-actually at rest at the target, not when swinging through it; the action
-penalty reduces reward; failure detection catches a fallen/off-table
-cube. All pass. This is fast, deterministic, and needs no simulator --
-runs in well under a second.
+Hand-constructed states checking (post-2026-08-31 redesign, see that
+section above for what changed): holding still at any distance earns
+exactly zero shaping reward, regardless of whether "still" is near or
+far (the key hack-closing property); genuine progress between steps
+earns positive shaping, regression negative; an open gripper touching
+the cube doesn't count as holding; a lifted+closed gripper does, switches
+to transport phase, and fires `grasp_bonus` exactly once (not on
+subsequent still-holding steps); `touch_bonus` fires exactly once the
+first time touch range is reached; transport-phase shaping depends only
+on cube-to-target distance, not direction/height (confirming the
+phase-2 design goal); the success bonus fires only when actually at rest
+at the target, not when swinging through it; the action penalty reduces
+reward; failure detection catches a fallen/off-table cube. All pass.
+This is fast, deterministic, and needs no simulator -- runs in well under
+a second.
 
 ### Level 2: replay against real captured teleop demonstrations
 
@@ -170,7 +185,12 @@ and falls sensibly as the gripper's real trajectory moves toward and away
 from the cube (e.g. episode_000: 0.023 -> 0.401 as the gripper closes in,
 easing back down as it drifts away during a messier stretch of the
 teleop rep) -- exactly the shape the shaping function is supposed to
-produce given a real, noisy human-driven trajectory.
+produce given a real, noisy human-driven trajectory. (This specific
+absolute-value reading of "dense" predates the 2026-08-31 redesign below,
+where `dense` became a per-step delta rather than an absolute value --
+the re-run against the same episodes after that redesign is documented
+in that section, and confirms the same underlying no-crash/sane-values
+result under the new formulation.)
 
 **What is NOT confirmed by real data**: neither tested episode ever
 reproduced an actual successful lift in open-loop replay, even the one
@@ -193,6 +213,128 @@ actual policy correcting for drift in real time -- not available until
 training starts) or improving open-loop replay fidelity specifically
 (neither was pursued further here, to avoid scope creep into a separate,
 harder problem).
+
+## Reward-hacking finding and potential-based-shaping redesign (2026-08-31)
+
+### The finding
+
+The first real TD-MPC2 training run (30,000 steps, see
+docs/tdmpc2_integration.md) produced its single highest-scoring eval
+episode (+97.9) around the middle of training. Watching that episode's
+video directly (not just its printed score) showed the arm never touched
+the cube at all -- it just moved into and held a plausible-looking
+position. The arithmetic confirmed it: the old approach-phase shaping,
+`reach_weight * (1 - tanh(d / reach_scale))`, paid out an *absolute*
+reward every step based on current distance alone, regardless of whether
+that distance had ever changed. At `reach_scale = 0.15`, merely occupying
+a position ~0.1-0.15m from *some* plausible cube-adjacent spot -- without
+tracking that specific episode's actual cube position -- was worth
+roughly +0.2/step, and 0.2 x 500 steps ~= 100, matching the observed score
+almost exactly. This is textbook reward hacking: the proxy (distance-based
+shaping) was satisfiable without doing the thing it was meant to
+approximate (actually reaching the cube).
+
+### First attempt: narrowing reach_scale (superseded)
+
+The first fix tried was shrinking `reach_scale` from 0.15 to 0.08, on the
+theory that a sharper falloff would make "vague proximity" worth much
+less. A second training run (also 30,000 steps planned, stopped early
+after 4 eval checkpoints) showed this addressed the symptom but created a
+new problem: eval reward was consistently negative and non-improving
+(-3.8, -18.7, -11.2, -33.2 across checkpoints), and extracted video frames
+(`sim/output/frame_extract/`, since there's no video-viewing tool
+available -- frames were pulled via `ffmpeg -vf
+"select=not(mod(n\,100))"` and inspected directly) showed genuinely
+undirected motion in both sampled episodes, never engaging the cube. A
+scale narrow enough to kill the hovering exploit was also narrow enough
+to remove most of the usable gradient for a policy that starts far from
+the cube -- the old absolute-value formulation ties "safe from hacking"
+and "provides a gradient" to the same one knob (scale), and there was no
+setting of that knob that satisfied both.
+
+### The actual fix: potential-based shaping
+
+The real fix is a change in *kind*, not degree: potential-based reward
+shaping (Ng, Harada & Russell, "Policy Invariance Under Reward
+Transformations," ICML 1999). Instead of paying the *absolute* value of a
+potential function every step, pay only the *change*:
+`reward = weight * (Phi(state') - Phi(state))`, where `Phi(d) = 1 -
+tanh(d / scale)` is the same bounded shape as before. This form has a
+proven guarantee -- it never changes the optimal policy of the underlying
+MDP, for *any* choice of potential function, so it can only make a good
+policy easier to find, never bias what "good" means. Practically: a
+policy that holds still anywhere, however "good" that position looks,
+earns *exactly zero* shaping reward every step it does so, since the
+potential isn't changing. This closes the hacking mechanism at its root,
+rather than fighting it by narrowing a scale -- and since the mechanism
+that made a broad scale exploitable no longer exists, `reach_scale` was
+reverted to its original 0.15 (a broad scale is now purely beneficial: a
+smoother, more informative gradient for an undertrained policy far from
+the cube, with no hacking downside).
+
+Implementation detail: the shaping delta needs a "previous distance" to
+compare against, so `compute_reward()` gained a `prev_dist` parameter
+(the caller persists whatever it returns as `info["dist"]`, mirroring the
+existing `was_holding` pattern). On the first step after a reset, or the
+first step after the approach/transport phase switches, there is no
+valid previous value to compare against (a phase switch means the
+previous value was measuring a different quantity entirely -- gripper-to-
+cube one step, cube-to-target the next), so shaping is defined as exactly
+zero for that one step rather than computing a meaningless delta.
+
+### Two more problems fixed alongside it
+
+1. **No genuine touch signal existed.** Added `is_touching()` (a looser
+   proximity threshold, 0.08m, than the 0.05m used for `is_holding()`)
+   and a one-time `touch_bonus`, rewarding the act of reaching all the way
+   to contact as a distinct, earlier milestone than a full grasp. This is
+   still a privileged-distance heuristic, not a real contact sensor --
+   same caveat as `is_grasped()`, see Known limitations.
+2. **The old `grasp_bonus` was a flat per-step reward paid every step
+   while holding.** Since a successful place *ends the episode*
+   (termination fires on `is_placed()`), this created a real, previously
+   unnoticed incentive to grasp the cube and then simply hold it in
+   place indefinitely rather than finish -- collecting per-step
+   `grasp_bonus` forever instead of one `success_bonus`. Fixed by making
+   `grasp_bonus` a one-time milestone too (fires once, the step holding
+   is first established), matching `touch_bonus` and `success_bonus`.
+   Under the new design there is no reward source left that pays for
+   merely *occupying* a state -- only for genuine progress (the shaping
+   delta) or crossing a genuine milestone (the three one-time bonuses).
+
+### Verification done before relying on this (2026-08-31)
+
+Mirrored the rigor of the original correctness audit rather than trusting
+the redesign by construction alone:
+
+- **Self-test** (`python sim/envs/pickplace_reward.py`), rewritten with
+  13 cases, including the property that actually matters most: holding
+  perfectly still at any distance (far or already at the cube/target)
+  earns exactly zero shaping reward, and the one-time bonuses each fire
+  exactly once and not again on a subsequent still-holding/still-touching
+  step. Also re-verified every regression case from the original
+  correctness audit (the `is_holding()` hysteresis across a
+  lowering-onto-target sequence, the false-positive-grasp case) still
+  holds under the new signature. Passes both locally and on the training
+  machine.
+- **Env smoke test** (`sim/scripts/test_pickplace_env.py`), state-only
+  (4 envs, 100 random-action steps) and camera-enabled (4 envs, 60
+  steps, `--enable_cameras --use_cameras`): both ran end to end with no
+  crash, correct observation shapes, and reward magnitudes in a sane
+  small range (dominated by the action penalty under pure random
+  actions, as expected -- nothing resembling the old +97.9-style
+  exploit number).
+- **Real-data replay** (`sim/scripts/validate_reward_function.py`)
+  against two recorded teleop episodes: `episode_003.json` (374 steps,
+  gripper never within touch range, min distance 0.085m -- exercises
+  approach-phase shaping only) and `episode_000.json` (556 steps,
+  gripper *did* reach touch range at step 0) -- confirming `touch_bonus`
+  actually fires on genuine recorded motion, not just synthetic
+  self-test states. Neither episode achieves a genuine grasp (a
+  pre-existing, already-documented limitation of these specific
+  recordings, not something this redesign was expected to fix -- see
+  Known limitations), so the transport-phase shaping and `grasp_bonus`
+  remain validated only by the self-test, same as before the redesign.
 
 ## Correctness audit (2026-08-31): a real bug found by manual tracing, not by replay
 
@@ -260,12 +402,14 @@ the fix didn't disturb the previously-validated approach-phase behavior.
 
 ## Known limitations / open items
 
-- **Grasp detection is a heuristic**, not a first-class sensor signal --
-  no contact sensor currently exists on the gripper in the scene config.
-  If grasp misdetection becomes a real problem once training starts,
-  adding a `ContactSensorCfg` to the fingertip geometry would be a more
-  principled fix than further tuning the height/joint/proximity
-  thresholds.
+- **Grasp AND touch detection are both heuristics**, not first-class
+  sensor signals -- no contact sensor currently exists on the gripper in
+  the scene config; `is_touching()` (added in the 2026-08-31 redesign)
+  uses the same privileged-distance approach as `is_grasped()`/
+  `is_holding()`, just with a looser threshold. If misdetection becomes a
+  real problem once training starts, adding a `ContactSensorCfg` to the
+  fingertip geometry would be a more principled fix than further tuning
+  the height/joint/proximity thresholds.
 - **Target position is fixed**, not yet randomized. This was deliberate
   for this first version (fixed positions are what let this module be
   validated against fixed-position recorded demonstrations at all), but

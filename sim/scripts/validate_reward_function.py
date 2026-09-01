@@ -116,12 +116,18 @@ def main():
 
     rewards = []
     grasped_at = None
-    max_dense_approach = 0.0
+    touched_at = None
+    min_reach_dist = float("inf")
     max_cube_height = 0.0
     first_grasp_gripper_cube_dist = None
-    # was_holding hysteresis state -- see pickplace_reward.is_holding()'s
-    # docstring. False at episode start, updated from each step's info.
+    # was_holding/was_touched/prev_dist -- state pickplace_reward.compute_reward()
+    # needs across steps. See that module's docstring (was_holding/was_touched)
+    # and pickplace_env.py's module docstring (prev_dist, and why it must be
+    # reset -- None here plays the same role as NaN there) for why each is
+    # needed. All start "empty" at episode start, updated from each step's info.
     was_holding = False
+    was_touched = False
+    prev_dist = None
 
     for step_idx, step in enumerate(episode):
         target = torch.tensor([[step["joint_pos"][j] for j in _JOINT_ORDER]], device=sim.device)
@@ -140,19 +146,24 @@ def main():
         joint_vel = robot.data.joint_vel[0, joint_indices].cpu().tolist()
 
         reward, info = compute_reward(
-            gripper_pos, cube_pos, cube_lin_vel, gripper_joint_pos, joint_vel, was_holding, cfg
+            gripper_pos, cube_pos, cube_lin_vel, gripper_joint_pos, joint_vel,
+            was_holding, was_touched, prev_dist, cfg,
         )
         was_holding = info["holding"]
+        was_touched = info["touched"]
+        prev_dist = info["dist"]
         rewards.append(reward)
 
         max_cube_height = max(max_cube_height, cube_pos[2])
         if info["phase"] == "approach":
-            max_dense_approach = max(max_dense_approach, info["dense"])
+            min_reach_dist = min(min_reach_dist, info["dist"])
         if info["grasped"] and grasped_at is None:
             grasped_at = step_idx
             first_grasp_gripper_cube_dist = (
                 sum((gripper_pos[i] - cube_pos[i]) ** 2 for i in range(3)) ** 0.5
             )
+        if info["touched"] and touched_at is None:
+            touched_at = step_idx
 
         if step_idx % args_cli.log_every == 0 or step_idx == len(episode) - 1:
             print(
@@ -164,8 +175,17 @@ def main():
     print("\n[RESULT] === Validation summary ===")
     print(f"[RESULT] Steps: {len(episode)}")
     print(f"[RESULT] Max cube height reached: {max_cube_height:.4f} m")
-    print(f"[RESULT] Max approach-phase dense reward (should approach 1.0 as gripper nears cube): "
-          f"{max_dense_approach:.4f}")
+    # Under the 2026-08-31 potential-based-shaping redesign, "dense" is a
+    # per-step DELTA, not an absolute value -- "approaches 1.0" is no longer
+    # a meaningful expectation (see pickplace_reward.py's module docstring).
+    # The physically meaningful, formulation-independent diagnostic is how
+    # close the gripper actually got to the cube during the approach phase.
+    print(f"[RESULT] Min gripper-to-cube distance during approach phase (should approach 0): "
+          f"{min_reach_dist:.4f} m")
+    if touched_at is not None:
+        print(f"[RESULT] First touched (is_touching) at step {touched_at}")
+    else:
+        print("[RESULT] Never reached touch_threshold according to is_touching().")
     if grasped_at is not None:
         print(f"[RESULT] First grasped at step {grasped_at} "
               f"(gripper-cube distance at that moment: {first_grasp_gripper_cube_dist:.4f} m, "

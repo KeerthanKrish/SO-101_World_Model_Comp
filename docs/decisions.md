@@ -204,3 +204,48 @@ tightening further; if it can no longer learn *any* useful gradient
 (reward is now too sparse to provide signal from far away), it needs
 loosening. Judge from the next run's actual behavior, not from re-deriving
 the value analytically.
+
+**Superseded by the decision below** -- that run showed the opposite
+problem (too sparse, no gradient), which led to identifying `reach_scale`
+narrowing as the wrong kind of fix in the first place.
+
+---
+
+**Decision**: Replaced absolute-value dense shaping with potential-based
+shaping (`reward = weight * (Phi(new dist) - Phi(old dist))`, not
+`weight * Phi(current dist)`); added a one-time `touch_bonus`; converted
+`grasp_bonus` from a continuous per-step reward into a one-time bonus;
+reverted `reach_scale` from 0.08 back to its original 0.15.
+
+**Why**: The `reach_scale=0.08` run above (decision immediately prior)
+showed consistently negative, non-improving reward across all 4 eval
+checkpoints, and extracted video frames confirmed genuinely undirected
+motion, never engaging the cube -- the narrower scale killed most of the
+useful gradient for a policy that starts far away, without actually
+fixing the underlying mechanism (a policy could still profit from
+occupying any fixed position, just a smaller one). Potential-based reward
+shaping (Ng, Harada & Russell, ICML 1999) fixes the actual mechanism:
+rewarding only the *change* in a potential function is provably
+policy-invariant (never changes the MDP's optimal policy, for any choice
+of potential), and under this formulation, holding still anywhere earns
+exactly zero shaping reward every step -- closing the original hacking
+exploit without needing a narrow, gradient-starved scale to do it. Once
+the mechanism no longer depends on scale, there is no more reason to keep
+`reach_scale` narrow, so it reverted to 0.15. Separately, the old
+`grasp_bonus` (a flat reward paid every step while holding) was found to
+create its own, previously-unnoticed incentive to hold the cube
+indefinitely rather than finish the task, since finishing ends the
+episode -- fixed by making it fire once, like the new `touch_bonus`. See
+docs/reward_function.md's "Reward-hacking finding and potential-based-
+shaping redesign" section for the full writeup, including the
+verification suite run before trusting this (self-test, state-only and
+camera-enabled env smoke tests, real-data replay against two recorded
+teleop episodes).
+
+**How to apply**: A new ~15,000-step run was launched after this redesign
+and its verification suite, matching the eval/checkpoint/video cadence of
+the previous (killed) run. Judge success the same way as before --
+watch the actual eval videos, not just the printed reward trend --
+specifically checking that the arm now engages the cube (touch_bonus/
+grasp_bonus firing in the logs) rather than just occupying a static pose.
+See docs/tdmpc2_integration.md for results once available.

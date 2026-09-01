@@ -27,25 +27,45 @@ custom addition.
 
 Reward/termination reuse the already-validated pickplace_reward.py
 functions verbatim, called in a per-environment Python loop rather than
-reimplemented in batched torch. One piece of per-env state is persisted
-across steps beyond what Isaac Lab already tracks: `_was_holding`, fed
-into compute_reward()'s was_holding parameter and reset to False on
-every env reset -- required by pickplace_reward.py's is_holding()
-hysteresis (a real bug, found during a full correctness audit: the naive
-stateless height check it replaces incorrectly drops out of the
-transport phase the instant an already-held cube is lowered onto the
-target, since the target's resting height is below the lift-detection
-threshold by construction -- see docs/reward_function.md). This is a
-deliberate simplicity/
-performance tradeoff: pickplace_reward.py was specifically built and
-empirically validated as a small, dependency-free, scalar function (see
-docs/reward_function.md) -- reimplementing that same logic a second time
-in vectorized form would risk exactly the kind of silent-drift bug this
-project already hit once (see JAW_OFFSET_LOCAL's extraction into
-grasp_geometry.py) and isn't worth it at the modest num_envs this project
-runs (a single desktop GPU, not a large cluster). Revisit only if
-num_envs actually needs to scale into the thousands and this loop is
-measured to be a real bottleneck.
+reimplemented in batched torch. Three pieces of per-env state are
+persisted across steps beyond what Isaac Lab already tracks -- all three
+reset on every env reset, all three required by pickplace_reward.py's own
+compute_reward() signature:
+  - `_was_holding`: is_holding() hysteresis (a real bug, found during a
+    full correctness audit: the naive stateless height check it replaces
+    incorrectly drops out of the transport phase the instant an
+    already-held cube is lowered onto the target, since the target's
+    resting height is below the lift-detection threshold by construction
+    -- see docs/reward_function.md).
+  - `_was_touched`: whether is_touching() has ever fired this episode,
+    gating the one-time touch_bonus milestone (added in the 2026-08-31
+    potential-based-shaping redesign -- see pickplace_reward.py's module
+    docstring).
+  - `_prev_dist`: the relevant distance (gripper-to-cube or cube-to-
+    target, whichever phase was active) from the PREVIOUS step, needed to
+    compute this step's potential-based shaping delta. NaN represents
+    "no valid previous value" (right after a reset) -- converted to
+    Python None at the compute_reward() call site, since NaN can't be
+    stored in a bool/uniform way inside a plain torch tensor alongside a
+    real "no value yet" sentinel otherwise. Critically, this must be
+    reset to NaN on every env reset even though compute_reward() ALSO
+    independently zeroes shaping across any holding-state phase
+    transition -- without an explicit reset here, a new episode that
+    happens to start in the same phase as the previous episode's last
+    step (the overwhelmingly common case: gripper starts open, so
+    holding=False on both sides) would silently carry over the previous
+    episode's final distance and compute a bogus shaping delta between
+    two entirely unrelated episodes.
+
+This is a deliberate simplicity/performance tradeoff: pickplace_reward.py
+was specifically built and empirically validated as a small,
+dependency-free, scalar function (see docs/reward_function.md) --
+reimplementing that same logic a second time in vectorized form would
+risk exactly the kind of silent-drift bug this project already hit once
+(see JAW_OFFSET_LOCAL's extraction into grasp_geometry.py) and isn't
+worth it at the modest num_envs this project runs (a single desktop GPU,
+not a large cluster). Revisit only if num_envs actually needs to scale
+into the thousands and this loop is measured to be a real bottleneck.
 
 Multi-env note: cube/gripper positions read from the simulator are in
 true world coordinates, which include each cloned environment's origin
@@ -59,6 +79,7 @@ explicitly rather than assuming it out.
 
 from __future__ import annotations
 
+import math
 import sys
 
 import gymnasium as gym
@@ -177,16 +198,11 @@ class PickPlaceEnv(DirectRLEnv):
         # been reset -- see module docstring.
         self._cached_reward = torch.zeros(self.num_envs, device=self.device)
 
-        # Per-env "was the gripper holding the cube on the PREVIOUS step"
-        # state, required by pickplace_reward.compute_reward()'s
-        # was_holding parameter (see that module's is_holding() docstring
-        # for why this hysteresis is needed -- a naive per-step height
-        # check incorrectly drops out of the transport phase the instant
-        # a held cube is lowered onto the target, since the target's
-        # resting height is below the lift-detection threshold by
-        # construction). This is this env's one piece of persisted
-        # per-environment state beyond what Isaac Lab already tracks.
+        # Per-env persisted state required by pickplace_reward.compute_reward()
+        # -- see module docstring for what each one is and why it's needed.
         self._was_holding = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._was_touched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._prev_dist = torch.full((self.num_envs,), float("nan"), device=self.device)
 
     def _setup_scene(self):
         # Everything (robot, cube, table, ground, light, optional cameras)
@@ -254,6 +270,7 @@ class PickPlaceEnv(DirectRLEnv):
         failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         for i in range(self.num_envs):
+            prev_d = self._prev_dist[i].item()
             reward, info = compute_reward(
                 gripper_pos_local[i].tolist(),
                 cube_pos_local[i].tolist(),
@@ -261,11 +278,15 @@ class PickPlaceEnv(DirectRLEnv):
                 joint_pos[i, -1].item(),  # "gripper" joint is last in _JOINT_ORDER
                 joint_vel[i].tolist(),
                 bool(self._was_holding[i].item()),
+                bool(self._was_touched[i].item()),
+                None if math.isnan(prev_d) else prev_d,
                 self._reward_cfg,
             )
             rewards[i] = reward
             terminated[i] = info["placed"] or info["failed"]
             self._was_holding[i] = info["holding"]
+            self._was_touched[i] = info["touched"]
+            self._prev_dist[i] = info["dist"]
             placed[i] = info["placed"]
             failed[i] = info["failed"]
 
@@ -296,6 +317,16 @@ class PickPlaceEnv(DirectRLEnv):
         self.robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel, None, env_ids)
         self._joint_pos_target[env_ids] = default_joint_pos[:, self._joint_indices]
         self._was_holding[env_ids] = False
+        self._was_touched[env_ids] = False
+        # NaN, not 0.0 -- 0.0 is a real, meaningful distance (already at
+        # the cube/target) and must never be mistaken for "no previous
+        # value yet." See module docstring for why this reset is required
+        # even though compute_reward() also independently zeroes shaping
+        # across a holding-state phase transition -- a fresh episode
+        # starting in the SAME phase as the last episode's final step
+        # (the common case) needs this explicit reset to avoid comparing
+        # against a stale, unrelated distance.
+        self._prev_dist[env_ids] = float("nan")
 
         cube_x = sample_uniform(self.cfg.cube_x_range[0], self.cfg.cube_x_range[1], (n,), self.device)
         cube_y = sample_uniform(self.cfg.cube_y_range[0], self.cfg.cube_y_range[1], (n,), self.device)
