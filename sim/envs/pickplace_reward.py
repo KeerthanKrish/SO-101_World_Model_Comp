@@ -207,7 +207,22 @@ class PickPlaceRewardConfig:
     # to keep holding the cube forever instead of finishing the task.
     grasp_bonus: float = 2.0
     success_bonus: float = 10.0  # one-time; must clearly dominate everything else so success always wins
-    action_penalty_weight: float = 0.01  # small; discourages unrealistic/jerky motion, not a primary objective
+    # Lowered 5x from 0.01 (2026-09-01): both run4 and run5 (50k steps
+    # each, under the potential-based-shaping reward) showed the arm
+    # barely moving from its default reset pose for most of most eval
+    # episodes -- confirmed by direct frame inspection, not just the
+    # reward numbers (see docs/tdmpc2_integration.md). Since shaping
+    # correctly pays exactly zero for holding still (that's the whole
+    # point of the potential-based redesign) while ANY movement -- even
+    # useful, cube-directed movement -- immediately incurs this penalty,
+    # "don't move" is a stable, easily-discoverable local optimum on its
+    # own, independent of whether exploration ever finds the cube. This
+    # doesn't remove the penalty (still want to discourage unrealistic/
+    # jerky motion, and this is real hardware eventually), just reduces
+    # how strongly it competes with an untrained value function that
+    # hasn't yet learned that moving toward the cube pays off. A real
+    # experiment, not a proven fix -- see docs/decisions.md.
+    action_penalty_weight: float = 0.002
 
 
 def _dist3(a, b):

@@ -121,5 +121,14 @@ class PickPlaceTDMPC2Wrapper(gym.Wrapper):
             # specifically for callers like this one). On a timeout
             # (truncated, not terminated) "placed" is correctly False.
             "success": bool(extras["placed"][0].item()),
+            # Forwarded for eval-loop logging only (e.g. run_eval_episode()
+            # in train_tdmpc2_pickplace.py) -- not required by tdmpc2 itself,
+            # unlike terminated/success above. Lets an eval loop report
+            # whether the gripper ever actually touched/held the cube
+            # during an episode, instead of that having to be inferred by
+            # eye from sampled video frames (see docs/tdmpc2_integration.md's
+            # run4/run5 investigation).
+            "touched": bool(extras["touched"][0].item()),
+            "holding": bool(extras["holding"][0].item()),
         }
         return self._build_obs(obs_dict), torch.tensor(float(reward[0].item())), done, info

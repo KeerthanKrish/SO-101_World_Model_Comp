@@ -268,6 +268,8 @@ class PickPlaceEnv(DirectRLEnv):
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         placed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        touched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        holding = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         for i in range(self.num_envs):
             prev_d = self._prev_dist[i].item()
@@ -289,6 +291,8 @@ class PickPlaceEnv(DirectRLEnv):
             self._prev_dist[i] = info["dist"]
             placed[i] = info["placed"]
             failed[i] = info["failed"]
+            touched[i] = info["touched"]
+            holding[i] = info["holding"]
 
         self._cached_reward = rewards
         # Exposed via self.extras so external callers (e.g. the TD-MPC2
@@ -297,8 +301,17 @@ class PickPlaceEnv(DirectRLEnv):
         # doesn't say which, and this was a real gap caught while writing
         # that adapter (self.extras is never otherwise populated by
         # DirectRLEnv's base step(), it stays an empty dict by default).
+        # `touched`/`holding` (sticky "touched" milestone, live "is
+        # currently holding" state -- not the strict stateless
+        # is_grasped(), a different, unrelated diagnostic flag) were added
+        # specifically so eval loops can log whether the gripper ever
+        # actually engaged the cube during an episode, instead of having
+        # to infer it by eye from a handful of sampled video frames (see
+        # docs/tdmpc2_integration.md's run4/run5 investigation).
         self.extras["placed"] = placed
         self.extras["failed"] = failed
+        self.extras["touched"] = touched
+        self.extras["holding"] = holding
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, time_out

@@ -273,20 +273,33 @@ def run_eval_episode(env, base_env, agent, cfg, video_path):
     process -- see module docstring). NOT added to the replay buffer.
     Captures scene_camera frames and stitches them into an mp4 at
     video_path -- a visual check on what the policy actually does, not
-    just whether the pipeline runs. Returns (episode_reward, success).
+    just whether the pipeline runs. Returns (episode_reward, success,
+    ever_touched, ever_held).
+
+    ever_touched/ever_held (whether pickplace_reward.py's touch_bonus/
+    holding state ever fired at any point this episode, via
+    extras["touched"]/["holding"] -- see pickplace_env.py's _get_dones())
+    were added after run4/run5 (2026-09-01): judging whether the gripper
+    ever actually engaged the cube by eye, from a handful of sampled
+    video frames, turned out to be error-prone and slow (see
+    docs/tdmpc2_integration.md) -- this gives an exact, cheap, objective
+    answer straight from the reward function's own state instead.
     """
     frames_dir = video_path + "_frames"
     os.makedirs(frames_dir, exist_ok=True)
 
     obs = env.reset()
     scene_cam = base_env.scene["scene_camera"]
-    ep_reward, t, done, info = 0.0, 0, False, {"success": False}
+    ep_reward, t, done, info = 0.0, 0, False, {"success": False, "touched": False, "holding": False}
+    ever_touched, ever_held = False, False
 
     while not done:
         obs_for_act = TensorDict(obs, batch_size=(), device="cpu") if isinstance(obs, dict) else obs
         action = agent.act(obs_for_act, t0=(t == 0), eval_mode=True)
         obs, reward, done, info = env.step(action)
         ep_reward += reward.item()
+        ever_touched = ever_touched or info["touched"]
+        ever_held = ever_held or info["holding"]
 
         base_env.sim.render()
         rgb = scene_cam.data.output["rgb"][0, ..., :3].cpu().numpy()
@@ -301,7 +314,7 @@ def run_eval_episode(env, base_env, agent, cfg, video_path):
         check=True, capture_output=True,
     )
     shutil.rmtree(frames_dir)
-    return ep_reward, bool(info["success"])
+    return ep_reward, bool(info["success"]), ever_touched, ever_held
 
 
 def main():
@@ -340,9 +353,11 @@ def main():
 
             if not args_cli.smoke_test and step >= next_eval_at:
                 video_path = os.path.join(args_cli.video_dir, f"eval_step_{step:06d}.mp4")
-                eval_reward, eval_success = run_eval_episode(env, base_env, agent, cfg, video_path)
+                eval_reward, eval_success, eval_touched, eval_held = run_eval_episode(
+                    env, base_env, agent, cfg, video_path
+                )
                 print(f"[INFO] step {step}: EVAL episode -- reward={eval_reward:+.3f} "
-                      f"success={eval_success} video={video_path}")
+                      f"success={eval_success} touched={eval_touched} held={eval_held} video={video_path}")
                 ckpt_path = os.path.join(args_cli.checkpoint_dir, f"agent_step_{step:06d}.pt")
                 agent.save(ckpt_path)
                 print(f"[INFO] step {step}: checkpoint saved to {ckpt_path}")
