@@ -226,18 +226,88 @@ gradient updates, no crash. Eval episode rewards across the run: +14.6,
 +90.3, +12.6, +54.1, +97.9 -- noisy (each is a single episode at one
 random cube position, not an average) but trending upward overall. No
 successful placement in any eval checkpoint (`success=False` throughout).
-**Interpretation**: real learning signal (the agent is doing something
+~~**Interpretation**: real learning signal (the agent is doing something
 meaningfully better than random, reflected in the reward trend), but not
 enough environment interaction yet to fully solve the task -- consistent
 with TD-MPC2's own benchmark tasks typically needing substantially more
 steps even for simpler continuous control problems. Not a red flag on its
 own; the natural next experiment is simply more training time, not a
-different design.
+different design.~~
+
+**Correction (2026-08-31, later the same day)**: the interpretation above
+was wrong, and watching the actual +97.9 episode's video (rather than
+trusting the printed number) is what caught it -- the arm never touched
+the cube. The old dense reward paid the *absolute* value of a
+distance-based potential every step, so simply occupying a
+plausible-looking position was enough to accumulate that score over 500
+steps, with no relationship to actual task progress. This was genuine
+reward hacking, not learning. See docs/reward_function.md's "Reward-
+hacking finding and potential-based-shaping redesign" section and
+docs/decisions.md for the full investigation and fix. Left the original
+paragraph struck through rather than deleted, since the mistaken
+interpretation and how it was caught is itself part of this project's
+record.
+
+## Second training run (2026-08-31): reach_scale=0.08 (superseded)
+
+An interim fix (narrowing `reach_scale` from 0.15 to 0.08 to make vague
+proximity worth less) was tried next, launched as a shorter 15,000-step
+run to check the fix quickly. Stopped early after 4 eval checkpoints:
+-3.8, -18.7, -11.2, -33.2 -- consistently negative and non-improving.
+Extracted video frames (`sim/output/frame_extract/`, since there's no
+video-viewing tool available) confirmed genuinely undirected motion in
+both sampled episodes, never engaging the cube. Diagnosis: narrowing the
+scale fixed the symptom (less reward for vague proximity) but not the
+mechanism (a policy could still profit from occupying any fixed
+position, just a smaller one) -- and also removed most of the usable
+gradient for a policy starting far from the cube. This is what motivated
+looking for a fix to the *mechanism* rather than further tuning the
+scale -- see docs/reward_function.md for the potential-based-shaping
+redesign this led to.
+
+## Third training run (2026-08-31): potential-based shaping
+
+15,000 steps, same `--eval-every 2500` cadence as the second run, launched
+immediately after implementing and verifying the potential-based-shaping
+redesign (self-test, env smoke tests, real-data replay -- see
+docs/reward_function.md). 2115s (~35 min) total, 31 episodes collected,
+12,501 gradient updates, no crash.
+
+**Results**: eval episode rewards across the run: -5.7, -20.5, -3.0,
+-2.7, -1.4 -- and, more informatively, the *training*-episode reward sums
+(one per completed episode, 31 total) went from a -30 to -80 range in the
+first 5 episodes down to consistently -1 to -12 by the last 10, a much
+cleaner improving trend than the eval numbers alone suggest. No
+successful placement (`success=False` throughout, expected at this
+scale). Critically, no episode scored anywhere near the old +97.9-style
+exploit magnitude -- the hacking mechanism appears genuinely closed, not
+just harder to trigger.
+
+**Direct video/frame inspection** (both the first and last eval
+checkpoints, since the numbers alone are exactly what missed the run1
+exploit): the arm reaches partway out from its rest pose, then folds into
+a compact, low-effort static pose and stays there for most of the
+episode, in both the first (step 2994) and last (step 12976) checkpoints
+-- never approaching the cube's actual position. No self-collision/
+clipping visible in either. **Interpretation**: the exploit is fixed --
+near-zero reward now honestly means "no net progress," not "found a way
+to fake progress" -- but 15,000 steps has not yet been enough for the
+planner to discover genuine cube-directed reaching. Given the new reward
+has essentially zero gradient once the arm is idle (shaping only pays for
+*changing* distance), and the arm found a locally cheap idle pose early,
+it's plausible the policy needs either more steps to stumble into
+reward-earning exploration, or a stronger push to keep exploring rather
+than settle. Not yet resolved -- the natural next step (per the
+established short-run-then-long-run workflow) is a longer run to see
+whether more steps alone resolves this, before concluding anything more
+drastic is needed.
 
 ## Known limitations / not yet done
 
-- Only one training run has been done (30,000 steps) -- no sweep over
-  training duration, hyperparameters, or fusion strategy yet.
+- Three training runs done so far (30,000 / 15,000 / 15,000 steps, the
+  latter two under different reward designs -- see the run sections
+  above), still no systematic sweep over training duration,
+  hyperparameters, or fusion strategy.
 - Checkpointing/logging beyond console output + eval videos is not wired
   up (`save_agent`/`enable_wandb` both `False`).
 - The fusion strategy (elementwise sum of two SimNorm-normalized
