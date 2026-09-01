@@ -249,3 +249,40 @@ watch the actual eval videos, not just the printed reward trend --
 specifically checking that the arm now engages the cube (touch_bonus/
 grasp_bonus firing in the logs) rather than just occupying a static pose.
 See docs/tdmpc2_integration.md for results once available.
+
+---
+
+**Decision**: Raised TD-MPC2's seed-episode exploration budget from
+tdmpc2's own default (5 episodes, ~2500 steps) to 30 episodes (~15,000
+steps), exposed via a new `--seed-episodes` CLI flag.
+
+**Why**: Both the 15,000-step and 50,000-step runs under the new
+potential-based-shaping reward converged to the arm holding one fixed
+idle pose for the entire episode, regardless of checkpoint or the cube's
+randomized position -- confirmed by direct frame inspection at dense
+sampling across multiple checkpoints in each run, not just the reward
+numbers (which stayed small and non-hacky, but that turned out to mean
+"honestly near-zero" rather than "learning"). The likely mechanism: the
+new reward correctly gives exactly zero net reward for holding still
+anywhere (that's what closes the original hacking exploit), which also
+removes any reward pressure pushing an untrained policy to move at all,
+unless the replay buffer already contains a genuine touch/grasp
+trajectory for the value function to learn from. tdmpc2's own default
+exploration budget (a heuristic tuned for its own benchmark tasks, not
+this one) apparently never produced such a trajectory against a small,
+randomly-positioned target in either run. This is presented as a targeted
+experiment based on the likely root cause, not a proven fix -- running
+the SAME 50,000-step total budget again with only this one variable
+changed, specifically so any behavioral difference can be attributed to
+the exploration-budget change rather than confounded with other changes.
+
+**How to apply**: Judge success the same way as every run before it --
+watch the actual eval videos/frames at dense sampling across multiple
+checkpoints, not just the printed reward trend, since a small/near-zero
+reward has now been shown twice to be consistent with either genuine
+non-hacky learning OR a static idle policy that happens to score
+similarly. If this run still shows the same fixed-pose behavior, the
+next hypothesis to test would be the visual encoder's ability to
+represent the cube's position at all (a diagnostic, not a design change),
+before trying a further reward-design change. See
+docs/tdmpc2_integration.md for results once available.

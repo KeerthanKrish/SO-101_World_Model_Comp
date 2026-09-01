@@ -302,12 +302,63 @@ established short-run-then-long-run workflow) is a longer run to see
 whether more steps alone resolves this, before concluding anything more
 drastic is needed.
 
+At the time, the user separately reviewed `eval_step_010481.mp4` (a
+checkpoint in between the two sampled above) and flagged it as visually
+the closest the arm got to the cube -- denser frame sampling of that
+specific video did show the gripper hovering right at the cube's position
+for a good stretch of the episode. **This is now believed to have been
+coincidental**, not learned reaching -- see the fourth run below, where
+the *same* fixed idle pose recurred across multiple checkpoints and
+runs while only the cube's randomized spawn position differed, meaning a
+"close" eval episode most likely just means the cube happened to spawn
+near wherever the idle pose already rests, not that the policy moved
+toward it.
+
+## Fourth training run (2026-09-01): same reward, 50,000 steps
+
+50,000 steps, `--eval-every 5000`, launched to test whether more training
+time alone resolves run3's lack of visible reaching, per the user's own
+suggestion after confirming no reward hacking or self-collision issues in
+run3. 8503s (~2h22m) total, 100 episodes collected, 47,501 gradient
+updates, no crash.
+
+**Results**: eval episode rewards across the run: -7.6, -11.1, -3.0,
+-1.2, -2.9, -4.2, -1.5, -1.2, -1.9 -- still noisy, still no exploit-scale
+numbers, but also no longer a clearly improving trend the way run3's
+*training*-episode sums were (those hover in a -2 to -50 range throughout
+without a clean late-run tightening this time).
+
+**Direct frame inspection across three checkpoints** (steps 20459, 40419,
+45409, sampled every 25 frames instead of every 60 this time, after
+under-sampling missed real detail in run3's review): the arm holds the
+**exact same folded resting pose** in every single sampled frame across
+all three checkpoints, regardless of the cube's (randomized, clearly
+visible and differently-positioned each time) location. **Interpretation
+-- corrects the run3 interpretation above**: the policy has not been
+exploring toward the cube at all, in either run. It converges to one
+fixed, low-effort static configuration and stays there for the whole
+episode; the eval reward's small variance is almost entirely explained by
+the brief settling transient at episode start (and pure chance in how
+close that fixed pose happens to land relative to that episode's random
+cube spawn), not by any real cube-tracking. Likely mechanism: the
+potential-based shaping correctly gives *zero* net reward for holding
+still anywhere (the whole point of the fix), which also means there is no
+reward pressure at all pushing an untrained policy to move, unless its
+experience already contains a genuine touch/grasp trajectory for the
+value function to learn from -- and tdmpc2's default exploration budget
+(5 random episodes, 2500 steps) apparently never produced one against a
+small, randomly-positioned target. "Just run longer" is therefore a
+weaker bet than it looked after run3 alone, since a second, 3.3x-longer
+run reproduced the identical qualitative behavior rather than showing
+progress toward reaching. See docs/decisions.md for the resulting fix
+(raising the seed-episode exploration budget) tried next.
+
 ## Known limitations / not yet done
 
-- Three training runs done so far (30,000 / 15,000 / 15,000 steps, the
-  latter two under different reward designs -- see the run sections
-  above), still no systematic sweep over training duration,
-  hyperparameters, or fusion strategy.
+- Four training runs done so far (30,000 / 15,000 / 15,000 / 50,000
+  steps, under three different reward/exploration configurations -- see
+  the run sections above), still no systematic sweep over training
+  duration, hyperparameters, or fusion strategy.
 - Checkpointing/logging beyond console output + eval videos is not wired
   up (`save_agent`/`enable_wandb` both `False`).
 - The fusion strategy (elementwise sum of two SimNorm-normalized
