@@ -39,8 +39,9 @@ importing it -- see that module's own docstring.
 pipeline pass (collect an episode, sample from the buffer, compute a real
 update) can be verified quickly -- confirmed working, see
 docs/tdmpc2_integration.md. Without it, this runs REAL training: full
-500-step episodes, default batch size, seed_steps computed the same way
-envs.make_env() would (max(1000, 5*episode_length)).
+500-step episodes, default batch size, seed_steps set from
+--seed-episodes (default 30, overriding tdmpc2's own 5-episode default --
+see build_cfg()'s docstring for why).
 
 Periodic evaluation is interleaved with training in the SAME env
 instance, not a separate one -- Isaac Sim only allows one
@@ -87,6 +88,11 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--smoke-test", action="store_true", help="Short episode/buffer for a fast pipeline check.")
 parser.add_argument("--steps", type=int, default=None, help="Override total env steps.")
 parser.add_argument("--eval-every", type=int, default=5000, help="Real training steps between eval+video episodes.")
+parser.add_argument(
+    "--seed-episodes", type=int, default=None,
+    help="Episodes of pure-random exploration before the agent's own policy starts acting. "
+    "Overrides tdmpc2's own default (5 episodes) -- see build_cfg()'s docstring for why.",
+)
 parser.add_argument(
     "--video-dir", type=str, default="/home/keerthan/SO-101-WM/sim/output/tdmpc2_eval_videos", help="Eval video output dir."
 )
@@ -165,9 +171,34 @@ def episode_length_s() -> float:
 def build_cfg():
     base = OmegaConf.load("/home/keerthan/SO-101-WM/tdmpc2/tdmpc2/config.yaml")
     episode_length = int(episode_length_s() / 0.02)
-    # Same formula envs.make_env() itself uses (see tdmpc2/tdmpc2/envs/__init__.py)
-    # -- not applicable to smoke-test's tiny episode_length, kept low there on purpose.
-    seed_steps = 5 if args_cli.smoke_test else max(1000, 5 * episode_length)
+    # tdmpc2's own default is max(1000, 5*episode_length) -- see
+    # envs.make_env() in tdmpc2/tdmpc2/envs/__init__.py -- 5 episodes of
+    # pure-random exploration before the agent's own (learned) policy
+    # starts acting. That default is a reasonable heuristic for TD-MPC2's
+    # own benchmark tasks, but proved NOT NEARLY enough here: both the
+    # second (15k-step) and third (50k-step) training runs under the
+    # potential-based-shaping reward converged to the arm holding one
+    # fixed idle pose for the entire episode, regardless of checkpoint or
+    # the cube's (randomized) position -- confirmed by direct frame
+    # inspection, not just the reward numbers (see docs/tdmpc2_integration.md).
+    # Likely mechanism: the new reward correctly gives zero net reward for
+    # holding still (that's the whole point -- it closed the original
+    # reward-hacking exploit), which also means there's no reward pressure
+    # pushing an untrained policy to move at all UNLESS its experience
+    # already contains a genuine touch/grasp/reward-earning trajectory for
+    # the value function to learn from. With only 5 random episodes (2500
+    # steps) to find one by chance against a small, randomly-positioned
+    # target, none apparently ever occurred. `--seed-episodes` lets this
+    # be overridden independently of tdmpc2's own formula -- default here
+    # raised 6x to 30 episodes, giving random exploration a substantially
+    # larger, still-bounded budget to stumble into a rewarding trajectory
+    # before the learned policy takes over. Not guaranteed to fix it --
+    # this is a real experiment, not a proven solution -- but directly
+    # targets the likely root cause rather than just running longer with
+    # the same 5-episode budget again (see docs/decisions.md).
+    default_seed_episodes = 5 if args_cli.smoke_test else 30
+    seed_episodes = args_cli.seed_episodes or default_seed_episodes
+    seed_steps = 5 if args_cli.smoke_test else max(1000, seed_episodes * episode_length)
 
     overrides = {
         "task": "so101-pickplace",
@@ -276,7 +307,7 @@ def run_eval_episode(env, base_env, agent, cfg, video_path):
 def main():
     cfg = build_cfg()
     print(f"[INFO] task={cfg.task} model_size={cfg.model_size} latent_dim={cfg.latent_dim} "
-          f"episode_length={cfg.episode_length} steps={cfg.steps}")
+          f"episode_length={cfg.episode_length} steps={cfg.steps} seed_steps={cfg.seed_steps}")
 
     base_env = PickPlaceEnv(PickPlaceEnvCfg(use_cameras=True, num_envs=1, episode_length_s=episode_length_s()))
     env = PickPlaceTDMPC2Wrapper(base_env)
