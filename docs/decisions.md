@@ -286,3 +286,54 @@ next hypothesis to test would be the visual encoder's ability to
 represent the cube's position at all (a diagnostic, not a design change),
 before trying a further reward-design change. See
 docs/tdmpc2_integration.md for results once available.
+
+**Update**: this run (the fifth overall) showed the identical fixed-pose
+behavior -- raising the seed-episode budget alone was not the fix. See
+the decision below for what actually moved the needle.
+
+---
+
+**Decision**: Added two curriculum/exploration levers, `--cube-pos` (fix
+the cube to one point instead of randomizing it every episode) and
+`--min-std` (raise the floor under TD-MPC2's own CEM planning noise from
+0.05 to 0.5), and used both together for a sixth training run.
+
+**Why**: Raising the random-exploration seed budget 6x (the previous
+decision) didn't change anything -- run5 reproduced run4's exact
+fixed-idle-pose behavior. Rather than keep scaling that same knob further
+on faith, traced TD-MPC2's own planning code (`_plan()` in tdmpc2.py)
+directly. Two things stood out: (1) random exploration has to relocate a
+small, randomly-placed target from scratch every single episode, which is
+a genuinely hard search problem on its own, independent of how much of it
+there is; (2) TD-MPC2's CEM planner samples 512 candidate action
+sequences and narrows to 64 elites over 6 iterations every single step --
+and CEM is known to over-confidently narrow its own sampling std even
+when the value estimates it's ranking by are pure noise (no real learned
+signal yet), which is exactly the mechanism that would produce a
+falsely-precise, repeatably-idle action. The actual training-time
+exploration noise (`a = a + std * randn(...)`, added only when
+`eval_mode=False`) uses exactly that potentially-falsely-converged std.
+`--cube-pos` attacks the first problem by making the target trivially
+easy to find (curriculum learning: solve the easier version -- can this
+learn to reach/grasp at all -- before asking the harder one -- can it
+generalize across positions). `--min-std` attacks the second directly by
+putting a floor under how confidently-wrong CEM's std collapse can get,
+with zero effect on eval-time behavior (`eval_mode` skips the
+noise-injection line entirely, so this can't be "cheating" by making
+eval look artificially better -- it only changes what the training
+rollout itself explores).
+
+**How to apply**: This run (the sixth) is a real result, not just an
+experiment sent off to run -- `touched=True` fired on every eval
+checkpoint from step 20,459 onward (5 in a row), the first time any run
+has shown reliable, repeated contact with the cube rather than either
+static idling or a single lucky-looking frame. `held` never went true and
+no episode succeeded. Both levers were changed together, so this doesn't
+tell us which one mattered more, or whether both were needed -- not worth
+disentangling yet given neither had been tried at all before. A seventh
+run at 70,000 steps with identical settings was launched immediately
+(per explicit standing instruction: launch the next run automatically
+once the current one finishes, without waiting for confirmation) to see
+whether more of the same training converts reliable touching into
+reliable holding. See docs/tdmpc2_integration.md for results as they
+land.
