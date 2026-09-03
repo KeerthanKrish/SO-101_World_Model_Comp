@@ -75,6 +75,11 @@ every future run saves a checkpoint at each eval point plus a final one.
 Usage:
     ./isaaclab.sh -p /path/to/train_tdmpc2_pickplace.py --headless --enable_cameras --smoke-test
     ./isaaclab.sh -p /path/to/train_tdmpc2_pickplace.py --headless --enable_cameras --steps 30000 --eval-every 5000
+    # Curriculum experiment (2026-09-02, after runs 4/5 converged to a
+    # static idle pose regardless of checkpoint) -- see build_cfg()'s
+    # docstring for the full reasoning behind these two:
+    ./isaaclab.sh -p /path/to/train_tdmpc2_pickplace.py --headless --enable_cameras \\
+        --steps 50000 --eval-every 5000 --cube-pos 0.15 0.0 --min-std 0.5
 """
 
 import argparse
@@ -92,6 +97,18 @@ parser.add_argument(
     "--seed-episodes", type=int, default=None,
     help="Episodes of pure-random exploration before the agent's own policy starts acting. "
     "Overrides tdmpc2's own default (5 episodes) -- see build_cfg()'s docstring for why.",
+)
+parser.add_argument(
+    "--cube-pos", type=float, nargs=2, default=None, metavar=("X", "Y"),
+    help="Fix the cube's spawn position to one point (both training AND eval episodes, since "
+    "they share the same env instance) instead of randomizing across PickPlaceEnvCfg's default "
+    "train region. A curriculum lever, not a permanent setting -- see build_cfg()'s docstring "
+    "for why this was added. Omit for the original fully-randomized behavior.",
+)
+parser.add_argument(
+    "--min-std", type=float, default=None,
+    help="Floor on TD-MPC2's own CEM planning std (tdmpc2/config.yaml's default: 0.05). "
+    "See build_cfg()'s docstring for why this was raised. Omit to keep tdmpc2's own default.",
 )
 parser.add_argument(
     "--video-dir", type=str, default="/home/keerthan/SO-101-WM/sim/output/tdmpc2_eval_videos", help="Eval video output dir."
@@ -200,6 +217,54 @@ def build_cfg():
     seed_episodes = args_cli.seed_episodes or default_seed_episodes
     seed_steps = 5 if args_cli.smoke_test else max(1000, seed_episodes * episode_length)
 
+    # Raising seed_episodes 6x (above) was NOT enough on its own -- runs 4
+    # and 5 (30k/50k steps, 5 and 30 seed episodes respectively) both
+    # converged to the arm holding one fixed idle pose for essentially the
+    # whole episode, confirmed by direct frame inspection across multiple
+    # checkpoints in each run (see docs/tdmpc2_integration.md). Tracing
+    # TD-MPC2's own planning code (tdmpc2.py's _plan()) surfaced a second,
+    # more precise mechanism on top of "random exploration rarely finds a
+    # small randomized target": at every single env step, its CEM planner
+    # samples 512 candidate action sequences, narrows to the best 64 over
+    # 6 refinement iterations, and picks one -- but CEM is well known to
+    # over-confidently narrow its own std even when the underlying value
+    # estimates it's ranking by are pure noise (no real learned signal yet
+    # to distinguish a genuinely good sequence from a bad one). The one
+    # line that matters most: `if not eval_mode: a = a + std *
+    # torch.randn(...)` -- the actual exploration noise added to the
+    # action during TRAINING rollouts uses exactly this same std, which
+    # can (and, empirically, does) collapse toward min_std well before any
+    # real signal justifies that confidence, producing a falsely-precise,
+    # repeatably-idle action. Raising min_std puts a hard floor under how
+    # confidently-wrong that collapse can get. Deliberately NOT touching
+    # max_std (2, unchanged) -- CEM should still be ALLOWED to narrow
+    # toward something tight if it ever does find a real signal to
+    # exploit, just not below this floor. This change is safe on eval:
+    # `eval_mode` skips the `a = a + std * randn(...)` line entirely, so
+    # eval-time behavior (and the underlying planning/mean-action quality)
+    # is completely unaffected -- this only changes how much the TRAINING
+    # rollout itself explores. Kept as an explicit opt-in override
+    # (--min-std) rather than a new permanent default, since it's a real
+    # experiment, not a proven fix.
+    #
+    # Separately, --cube-pos fixes the cube to one specific point instead
+    # of randomizing across the full train region for both training and
+    # eval (they share one env instance -- see run_eval_episode()'s
+    # docstring). This is a curriculum lever attacking the OTHER half of
+    # the same underlying problem: even with better exploration noise,
+    # random exploration still has to relocate a small, randomly-placed
+    # target from scratch every single episode. Fixing the target for a
+    # run isolates "can this reward/architecture learn to reach and grasp
+    # AT ALL" from "can it generalize across positions" -- the harder
+    # question we haven't earned the right to ask yet, given no run has
+    # solved the easier one. (0.15, 0.0) -- the geometric center of
+    # PickPlaceEnvCfg's existing (0.05-0.25, -0.20-0.20) train region --
+    # is a principled, unbiased choice: the middle of the already-
+    # validated reachable core, not a position picked by looking at where
+    # a previous run's idle pose happened to rest (which would bias this
+    # experiment toward a false positive). Also opt-in, not a new default,
+    # for the same reason as min_std above.
+
     overrides = {
         "task": "so101-pickplace",
         "obs": "rgb",  # informational only post-patch (encode() no longer branches on this), kept for parse_cfg/logging
@@ -222,6 +287,13 @@ def build_cfg():
         "exp_name": "smoke_test" if args_cli.smoke_test else "run1",
         "data_dir": "/home/keerthan/SO-101-WM/sim/output/tdmpc2_data",
     }
+    # Conditional, not baked into `overrides` unconditionally like the
+    # keys above -- when --min-std isn't passed, we want tdmpc2's own
+    # config.yaml default (0.05) to pass through `base` untouched, not a
+    # second hardcoded copy of that default here that could silently drift
+    # from the real one.
+    if args_cli.min_std is not None:
+        overrides["min_std"] = args_cli.min_std
     cfg = OmegaConf.merge(base, overrides)
     cfg.obs_shape = {"state": (12,), "rgb": (6, 64, 64)}
     cfg.action_dim = 6
@@ -320,9 +392,21 @@ def run_eval_episode(env, base_env, agent, cfg, video_path):
 def main():
     cfg = build_cfg()
     print(f"[INFO] task={cfg.task} model_size={cfg.model_size} latent_dim={cfg.latent_dim} "
-          f"episode_length={cfg.episode_length} steps={cfg.steps} seed_steps={cfg.seed_steps}")
+          f"episode_length={cfg.episode_length} steps={cfg.steps} seed_steps={cfg.seed_steps} "
+          f"min_std={cfg.min_std} cube_pos={args_cli.cube_pos}")
 
-    base_env = PickPlaceEnv(PickPlaceEnvCfg(use_cameras=True, num_envs=1, episode_length_s=episode_length_s()))
+    # --cube-pos fixes cube_x_range/cube_y_range to a single (degenerate,
+    # zero-width) range -- sample_uniform(x, x, ...) returns exactly x
+    # every call (torch.rand(...) * (x - x) + x = x, regardless of the
+    # random draw), so this needed no changes to PickPlaceEnv itself, just
+    # feeding it a single-point range instead of the default wide one. See
+    # build_cfg()'s docstring for why this run might use it.
+    env_cfg_kwargs = dict(use_cameras=True, num_envs=1, episode_length_s=episode_length_s())
+    if args_cli.cube_pos is not None:
+        cube_x, cube_y = args_cli.cube_pos
+        env_cfg_kwargs["cube_x_range"] = (cube_x, cube_x)
+        env_cfg_kwargs["cube_y_range"] = (cube_y, cube_y)
+    base_env = PickPlaceEnv(PickPlaceEnvCfg(**env_cfg_kwargs))
     env = PickPlaceTDMPC2Wrapper(base_env)
 
     # Aimed once -- same third-person view as record_pickplace_env_video.py.
