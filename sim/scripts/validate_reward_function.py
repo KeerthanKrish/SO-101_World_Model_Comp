@@ -117,17 +117,20 @@ def main():
     rewards = []
     grasped_at = None
     touched_at = None
+    between_jaws_at = None
     min_reach_dist = float("inf")
     max_cube_height = 0.0
     first_grasp_gripper_cube_dist = None
-    # was_holding/was_touched/prev_dist -- state pickplace_reward.compute_reward()
-    # needs across steps. See that module's docstring (was_holding/was_touched)
-    # and pickplace_env.py's module docstring (prev_dist, and why it must be
+    # was_holding/was_touched/prev_dist/prev_joint_pos -- state
+    # pickplace_reward.compute_reward() needs across steps. See that
+    # module's docstring (was_holding/was_touched/prev_joint_pos) and
+    # pickplace_env.py's module docstring (prev_dist, and why it must be
     # reset -- None here plays the same role as NaN there) for why each is
     # needed. All start "empty" at episode start, updated from each step's info.
     was_holding = False
     was_touched = False
     prev_dist = None
+    prev_joint_pos = None
 
     for step_idx, step in enumerate(episode):
         target = torch.tensor([[step["joint_pos"][j] for j in _JOINT_ORDER]], device=sim.device)
@@ -146,12 +149,13 @@ def main():
         joint_vel = robot.data.joint_vel[0, joint_indices].cpu().tolist()
 
         reward, info = compute_reward(
-            gripper_pos, cube_pos, cube_lin_vel, gripper_joint_pos, joint_vel,
-            was_holding, was_touched, prev_dist, cfg,
+            gripper_pos, ee_quat_w, cube_pos, cube_lin_vel, gripper_joint_pos, joint_vel,
+            was_holding, was_touched, prev_dist, prev_joint_pos, cfg,
         )
         was_holding = info["holding"]
         was_touched = info["touched"]
         prev_dist = info["dist"]
+        prev_joint_pos = info["joint_pos"]
         rewards.append(reward)
 
         max_cube_height = max(max_cube_height, cube_pos[2])
@@ -164,6 +168,8 @@ def main():
             )
         if info["touched"] and touched_at is None:
             touched_at = step_idx
+        if info["between_jaws"] and between_jaws_at is None:
+            between_jaws_at = step_idx
 
         if step_idx % args_cli.log_every == 0 or step_idx == len(episode) - 1:
             print(
@@ -186,6 +192,10 @@ def main():
         print(f"[RESULT] First touched (is_touching) at step {touched_at}")
     else:
         print("[RESULT] Never reached touch_threshold according to is_touching().")
+    if between_jaws_at is not None:
+        print(f"[RESULT] First positioned between the jaws (is_between_jaws, added 2026-09-03) at step {between_jaws_at}")
+    else:
+        print("[RESULT] Never positioned between the jaws according to is_between_jaws().")
     if grasped_at is not None:
         print(f"[RESULT] First grasped at step {grasped_at} "
               f"(gripper-cube distance at that moment: {first_grasp_gripper_cube_dist:.4f} m, "

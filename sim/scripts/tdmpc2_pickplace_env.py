@@ -130,5 +130,6 @@ class PickPlaceTDMPC2Wrapper(gym.Wrapper):
             # run4/run5 investigation).
             "touched": bool(extras["touched"][0].item()),
             "holding": bool(extras["holding"][0].item()),
+            "between_jaws": bool(extras["between_jaws"][0].item()),
         }
         return self._build_obs(obs_dict), torch.tensor(float(reward[0].item())), done, info

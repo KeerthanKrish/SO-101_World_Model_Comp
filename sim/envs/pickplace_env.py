@@ -27,9 +27,9 @@ custom addition.
 
 Reward/termination reuse the already-validated pickplace_reward.py
 functions verbatim, called in a per-environment Python loop rather than
-reimplemented in batched torch. Three pieces of per-env state are
-persisted across steps beyond what Isaac Lab already tracks -- all three
-reset on every env reset, all three required by pickplace_reward.py's own
+reimplemented in batched torch. Four pieces of per-env state are
+persisted across steps beyond what Isaac Lab already tracks -- all four
+reset on every env reset, all four required by pickplace_reward.py's own
 compute_reward() signature:
   - `_was_holding`: is_holding() hysteresis (a real bug, found during a
     full correctness audit: the naive stateless height check it replaces
@@ -56,6 +56,13 @@ compute_reward() signature:
     holding=False on both sides) would silently carry over the previous
     episode's final distance and compute a bogus shaping delta between
     two entirely unrelated episodes.
+  - `_prev_joint_pos`: the gripper joint's position from the PREVIOUS
+    step, needed for the grasp_close_weight shaping term (added
+    2026-09-03 -- see pickplace_reward.py's module docstring). Same
+    NaN-sentinel/None-conversion pattern as `_prev_dist`, but -- unlike
+    `_prev_dist` -- NOT reset across a holding phase transition, since the
+    joint angle is the same physical quantity regardless of phase (see
+    compute_reward()'s own docstring for why).
 
 This is a deliberate simplicity/performance tradeoff: pickplace_reward.py
 was specifically built and empirically validated as a small,
@@ -203,6 +210,11 @@ class PickPlaceEnv(DirectRLEnv):
         self._was_holding = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._was_touched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._prev_dist = torch.full((self.num_envs,), float("nan"), device=self.device)
+        # Same NaN-sentinel pattern as _prev_dist, for compute_reward()'s
+        # grasp_close_weight shaping term (added 2026-09-03) -- see that
+        # function's docstring for why this one does NOT need to be reset
+        # across a holding phase transition the way _prev_dist does.
+        self._prev_joint_pos = torch.full((self.num_envs,), float("nan"), device=self.device)
 
     def _setup_scene(self):
         # Everything (robot, cube, table, ground, light, optional cameras)
@@ -220,8 +232,17 @@ class PickPlaceEnv(DirectRLEnv):
     def _apply_action(self) -> None:
         self.robot.set_joint_position_target(self._joint_pos_target, joint_ids=self._joint_indices)
 
-    def _grasp_points_local(self) -> torch.Tensor:
-        """Per-env grasp point, in EACH ENV'S OWN LOCAL frame -- (num_envs, 3)."""
+    def _grasp_points_local(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-env grasp point, in EACH ENV'S OWN LOCAL frame -- (num_envs, 3)
+        -- plus the gripper's world orientation, (num_envs, 4) wxyz.
+        Orientation needs no local-frame conversion (env_origins is a pure
+        translation, and rotation is unaffected by it), unlike the point,
+        which does. The orientation is needed by is_between_jaws() (via
+        compute_reward()'s gripper_quat parameter) -- added 2026-09-03
+        after a real false positive (see pickplace_reward.py's module
+        docstring) showed that a spherical distance from this same point
+        alone isn't enough to tell whether the cube is actually positioned
+        to be caught by the closing jaws."""
         ee_pos_w = self.robot.data.body_pos_w[:, self._ee_body_id]
         ee_quat_w = self.robot.data.body_quat_w[:, self._ee_body_id]
         out = torch.zeros_like(ee_pos_w)
@@ -229,7 +250,7 @@ class PickPlaceEnv(DirectRLEnv):
             out[i] = torch.tensor(
                 grasp_point_world(ee_pos_w[i].tolist(), ee_quat_w[i].tolist()), device=self.device
             )
-        return out - self.scene.env_origins
+        return out - self.scene.env_origins, ee_quat_w
 
     def _get_observations(self) -> dict:
         joint_pos = self.robot.data.joint_pos[:, self._joint_indices]
@@ -239,7 +260,7 @@ class PickPlaceEnv(DirectRLEnv):
             policy_obs["wrist_rgb"] = self.scene["wrist_camera"].data.output["rgb"][..., :3]
             policy_obs["top_rgb"] = self.scene["top_camera"].data.output["rgb"][..., :3]
 
-        gripper_pos_local = self._grasp_points_local()
+        gripper_pos_local, _gripper_quat = self._grasp_points_local()
         cube_pos_local = self.cube.data.root_pos_w - self.scene.env_origins
         cube_lin_vel = self.cube.data.root_lin_vel_w
         target_pos = self._target_pos_local.expand(self.num_envs, 3)
@@ -258,7 +279,7 @@ class PickPlaceEnv(DirectRLEnv):
         return self._get_observations().get("critic")
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        gripper_pos_local = self._grasp_points_local()
+        gripper_pos_local, gripper_quat = self._grasp_points_local()
         cube_pos_local = self.cube.data.root_pos_w - self.scene.env_origins
         cube_lin_vel = self.cube.data.root_lin_vel_w
         joint_pos = self.robot.data.joint_pos[:, self._joint_indices]
@@ -270,11 +291,14 @@ class PickPlaceEnv(DirectRLEnv):
         failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         touched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         holding = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        between_jaws = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         for i in range(self.num_envs):
             prev_d = self._prev_dist[i].item()
+            prev_j = self._prev_joint_pos[i].item()
             reward, info = compute_reward(
                 gripper_pos_local[i].tolist(),
+                gripper_quat[i].tolist(),
                 cube_pos_local[i].tolist(),
                 cube_lin_vel[i].tolist(),
                 joint_pos[i, -1].item(),  # "gripper" joint is last in _JOINT_ORDER
@@ -282,6 +306,7 @@ class PickPlaceEnv(DirectRLEnv):
                 bool(self._was_holding[i].item()),
                 bool(self._was_touched[i].item()),
                 None if math.isnan(prev_d) else prev_d,
+                None if math.isnan(prev_j) else prev_j,
                 self._reward_cfg,
             )
             rewards[i] = reward
@@ -289,10 +314,12 @@ class PickPlaceEnv(DirectRLEnv):
             self._was_holding[i] = info["holding"]
             self._was_touched[i] = info["touched"]
             self._prev_dist[i] = info["dist"]
+            self._prev_joint_pos[i] = info["joint_pos"]
             placed[i] = info["placed"]
             failed[i] = info["failed"]
             touched[i] = info["touched"]
             holding[i] = info["holding"]
+            between_jaws[i] = info["between_jaws"]
 
         self._cached_reward = rewards
         # Exposed via self.extras so external callers (e.g. the TD-MPC2
@@ -307,11 +334,16 @@ class PickPlaceEnv(DirectRLEnv):
         # specifically so eval loops can log whether the gripper ever
         # actually engaged the cube during an episode, instead of having
         # to infer it by eye from a handful of sampled video frames (see
-        # docs/tdmpc2_integration.md's run4/run5 investigation).
+        # docs/tdmpc2_integration.md's run4/run5 investigation). `between_jaws`
+        # (added 2026-09-03 alongside is_between_jaws() -- see
+        # pickplace_reward.py's module docstring) is live, not sticky --
+        # lets an eval loop distinguish "never even got positioned
+        # correctly" from "got positioned but didn't close in time."
         self.extras["placed"] = placed
         self.extras["failed"] = failed
         self.extras["touched"] = touched
         self.extras["holding"] = holding
+        self.extras["between_jaws"] = between_jaws
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, time_out
@@ -340,6 +372,10 @@ class PickPlaceEnv(DirectRLEnv):
         # (the common case) needs this explicit reset to avoid comparing
         # against a stale, unrelated distance.
         self._prev_dist[env_ids] = float("nan")
+        # Same reasoning as _prev_dist immediately above -- a fresh episode
+        # must not compare its first real joint-angle delta against
+        # whatever the previous episode's gripper happened to end at.
+        self._prev_joint_pos[env_ids] = float("nan")
 
         cube_x = sample_uniform(self.cfg.cube_x_range[0], self.cfg.cube_x_range[1], (n,), self.device)
         cube_y = sample_uniform(self.cfg.cube_y_range[0], self.cfg.cube_y_range[1], (n,), self.device)
