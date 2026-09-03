@@ -90,3 +90,61 @@ mechanism, new input). The world-model planner re-imagines from the new
 state at every step, explicitly re-planning around the slip (e.g. "reopen and
 re-center" vs. "keep closing") — this is the mechanism the project's
 disturbance-robustness evaluation is designed to test.
+
+---
+
+### Q: Is there any other way to introduce a reward gradient without allowing reward hacking? (Asked after killing run2, which showed no directed movement.)
+
+Yes — **potential-based reward shaping** (Ng, Harada & Russell, ICML
+1999). The old design rewarded the ABSOLUTE value of a "how close am I"
+score every step, which is exactly why a policy could hack it: just
+occupy a decent-looking spot and collect that score repeatedly, with no
+requirement to have ever tracked the actual target. The fix is to reward
+only the CHANGE in that score between steps — `reward = Phi(new state) -
+Phi(old state)`. This has a real mathematical guarantee behind it: adding
+a term of exactly this form can NEVER change what the optimal policy is,
+no matter how the potential function `Phi` is chosen — it can only
+change how quickly/easily that policy is found. Practically, it means
+holding still anywhere earns exactly zero reward every step, since
+nothing is changing — the "sit in a good spot and collect reward"
+exploit stops being possible by construction, not by tuning a threshold
+tighter. This became the core fix for the run1 exploit (see
+docs/reward_function.md and docs/decisions.md) and was later reused for
+the gripper-closing shaping term too (docs/decisions.md, 2026-09-03).
+
+---
+
+### Q: Why did the arm just sit still instead of exploring, once reward hacking was fixed? (Asked after two consecutive 50k-step runs showed zero directed movement.)
+
+Traced into TD-MPC2's own planning code rather than guessing. Two
+compounding reasons:
+
+1. **A "nothing rewarding has happened yet" bootstrapping problem.**
+   TD-MPC2 only plans 3 steps directly ahead (`horizon: 3`); anything
+   beyond that relies entirely on a learned VALUE function, which only
+   knows what it's seen in the replay buffer. Once reward-hacking was
+   fixed, holding still correctly earns zero reward — which also means
+   there's no reward-based pressure pushing an untrained policy to move
+   at all, unless the buffer already contains a genuine touch/grasp
+   trajectory for the value function to learn "reaching pays off" from.
+   Pure random exploration essentially never stumbles onto touching a
+   small, randomly-placed target by chance, so that experience never
+   showed up.
+2. **A planning-algorithm pathology on top of that.** TD-MPC2's action
+   selection (CEM/MPPI) samples 512 candidate action sequences every
+   step and iteratively narrows toward the best-scoring ones over 6
+   refinement rounds. CEM is well known to over-confidently narrow its
+   own sampling spread even when the scores it's ranking by are pure
+   noise (no real signal yet to distinguish good from bad) — producing a
+   falsely-precise, repeatably-idle action instead of continued
+   exploration. The actual exploration noise added during training
+   (`a = a + std * randn(...)`) uses exactly that potentially-
+   falsely-converged spread.
+
+Fix: a curriculum lever (fix the cube to one known position instead of
+randomizing it every episode, so the "find the target" half of the
+problem is trivial while learning "reach and grasp" from scratch) plus
+raising the floor under that planning noise (`min_std`) so it can't
+collapse into false confidence quite so easily. Together these produced
+the first reliable cube contact across any run (see docs/progress.md,
+2026-09-02/03 entry).

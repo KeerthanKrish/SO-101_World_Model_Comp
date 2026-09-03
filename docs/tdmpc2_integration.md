@@ -421,8 +421,19 @@ touching into reliable holding/success -- see below once it completes.
 standing instruction from the user ("start a 70k run once its done,
 don't wait for me to confirm"). Purpose: isolate whether run6's
 touched-but-not-held plateau resolves with more of the exact same
-training, before considering any further design changes. Results to be
-added here once complete.
+training, before considering any further design changes.
+
+**Mid-run finding (not the final result -- full writeup once this run
+completes)**: two eval checkpoints so far logged `held=True` (steps
+20459 and 30439). Watched the first one on video before trusting it --
+same standing practice that caught run1's exploit -- and it was a false
+positive: the gripper closed fully beside the cube, never around it,
+cube untouched the whole episode. Root cause and fix (`is_between_jaws()`,
+a `grasp_close_weight` shaping term, and a new cube position) are in
+docs/decisions.md and docs/reward_function.md; an eighth run using both
+fixes is queued once this one finishes. Full run7 results (including
+whether step 30439's `held=True` was a second false positive or
+something genuinely different) to be added here once complete.
 
 ## Known limitations / not yet done
 

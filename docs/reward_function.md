@@ -400,16 +400,77 @@ before the fix, exactly as expected, since that episode never reaches a
 genuine hold and so never touches the fixed code path at all -- confirms
 the fix didn't disturb the previously-validated approach-phase behavior.
 
+## Between-jaws geometry and gripper-closing shaping (2026-09-03)
+
+Runs 6 and 7 (potential-based reward, plus a fixed-position curriculum
+and a raised exploration floor -- see docs/decisions.md) got the arm
+reliably reaching and touching the cube for the first time, but not
+reliably grasping it. Then a real false positive surfaced: one run7 eval
+episode logged `held=True`, but the video showed the gripper closing
+fully right BESIDE the cube -- never around it, cube untouched on the
+table the whole episode.
+
+**Root cause**: `is_grasped()`/`is_holding()` only ever checked a
+SPHERICAL distance from the jaw pivot (`grasp_point_world()`) to the
+cube. That distance is identical whether the cube sits directly in front
+of the closing jaws or off to one side of them -- there was no notion of
+*direction* at all, only *how far*.
+
+**Fix**: added `is_between_jaws()`, which decomposes the cube's position
+relative to the jaw pivot along `jaw_approach_axis_world()` -- the
+gripper's live world-frame reach direction (`sim/robots/grasp_geometry.py`)
+-- into an axial component (roughly within the fingers' own reach) and a
+lateral component (genuinely centered, not off to one side). Both
+required no new hardware calibration: `jaw_approach_axis_world()` reuses
+the exact same already-calibrated `JAW_OFFSET_LOCAL` offset
+`grasp_point_world()` has always used, just normalized into a direction
+instead of a point. A live measurement (rotating the gripper's moving-jaw
+body through its full joint range and reading its world position) ruled
+out the naive alternative first -- the two jaw bodies' ORIGINS stay a
+constant ~3.6cm apart regardless of joint angle, since the joint rotates
+the moving jaw about a pivot rather than translating it, so raw
+origin-to-origin distance carries no information about how open the
+gripper currently is.
+
+`is_grasped()` now requires `is_between_jaws()` to fire at all.
+`is_holding()` requires it only to *establish* holding, not to persist
+it -- persistence still only needs proximity + closed, deliberately, to
+avoid a new failure mode where minor sway while genuinely carrying the
+cube could flicker a real hold back out of these intentionally tight
+thresholds (tuned for precisely establishing a grasp, not for tolerating
+in-transit jitter).
+
+**Also added**: a `grasp_close_weight` potential-based shaping term
+(same delta pattern as reach/place) over the gripper joint's own
+closedness, so there's finally a reward signal for the specific act of
+closing the gripper once correctly positioned -- previously nothing
+rewarded this at all, only gripper-to-cube distance. Explicitly gated on
+`is_between_jaws()`, not mere proximity -- a direct, deliberate design
+requirement (the user specifically flagged that closing must not be
+rewarded just for happening "near" the cube, only for happening with the
+cube genuinely positioned to be caught). A policy that snaps the gripper
+shut beside the cube earns nothing from this term, closing the exact
+incentive gap that produced the run7 false positive in the first place.
+
+Verified via 6 new self-test cases (`sim/envs/pickplace_reward.py`),
+including a direct regression test reproducing run7's exact false
+positive (a closed gripper positioned beside, not around, the cube --
+within the old proximity threshold, above the height threshold, but
+failing the new geometric check) and confirming it's now correctly
+rejected by both `is_grasped()` and `is_holding()`.
+
 ## Known limitations / open items
 
 - **Grasp AND touch detection are both heuristics**, not first-class
   sensor signals -- no contact sensor currently exists on the gripper in
   the scene config; `is_touching()` (added in the 2026-08-31 redesign)
-  uses the same privileged-distance approach as `is_grasped()`/
-  `is_holding()`, just with a looser threshold. If misdetection becomes a
-  real problem once training starts, adding a `ContactSensorCfg` to the
-  fingertip geometry would be a more principled fix than further tuning
-  the height/joint/proximity thresholds.
+  and `is_between_jaws()` (added 2026-09-03, see above) both use the same
+  privileged-distance/geometry approach as `is_grasped()`/`is_holding()`.
+  `is_between_jaws()`'s reach range (`grasp_reach_max`) in particular is a
+  principled guess at the SO-101 gripper's finger length, not a measured
+  spec. If misdetection becomes a real problem once training starts,
+  adding a `ContactSensorCfg` to the fingertip geometry would be a more
+  principled fix than further tuning these thresholds.
 - **Target position is fixed**, not yet randomized. This was deliberate
   for this first version (fixed positions are what let this module be
   validated against fixed-position recorded demonstrations at all), but
@@ -436,6 +497,8 @@ the fix didn't disturb the previously-validated approach-phase behavior.
   self-test.
 - `sim/robots/grasp_geometry.py` -- the extracted, dependency-free
   `JAW_OFFSET_LOCAL` constant and `grasp_point_world()` helper, now
-  shared between `run_pickplace_demo.py` and the reward function.
+  shared between `run_pickplace_demo.py` and the reward function. Also
+  `JAW_AXIS_LOCAL`/`jaw_approach_axis_world()` (added 2026-09-03), the
+  normalized-direction counterpart used by `is_between_jaws()`.
 - `sim/scripts/validate_reward_function.py` -- replays a real captured
   episode through the reward function for empirical validation.

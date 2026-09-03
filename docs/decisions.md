@@ -86,6 +86,17 @@ user explicitly asks), not automatically.
 and avoids syncing on a timer for no reason. Implementation work (code,
 running experiments, robots, GPU) all happens on the Ubuntu machine.
 
+**Update (2026-09-02)**: Superseded for CODE specifically -- the user
+migrated their local machine (Windows -> a new MacBook Pro) and switched
+code sync to git (Ubuntu pushes, local machine pulls) instead of scp.
+The underlying reasoning here (Ubuntu is where implementation actually
+happens, local machine is a consumer/mirror) is unchanged and is exactly
+why git's one-directional flow fits -- only the sync MECHANISM for code
+changed. scp/rsync is still used, on-demand, for the large binary
+artifacts `.gitignore` deliberately excludes and git will never carry
+(`sim/output/`, `assets/`). See docs/preferences.md for the current
+arrangement.
+
 ---
 
 **Decision**: The pick-and-place reward function (`sim/envs/pickplace_reward.py`)
@@ -337,3 +348,63 @@ once the current one finishes, without waiting for confirmation) to see
 whether more of the same training converts reliable touching into
 reliable holding. See docs/tdmpc2_integration.md for results as they
 land.
+
+**Update**: run7 (still in progress at time of the next decision below)
+logged one eval episode's `held=True` -- checked directly on video, since
+this project always watches before trusting a success flag, and it was
+the right call: the gripper closed fully BESIDE the cube, never around
+it. A real detection false positive, not progress. See the next decision.
+
+---
+
+**Decision**: Added `is_between_jaws()` (a directional geometry check
+replacing the old spherical-distance-only grasp/hold detection) and a new
+`grasp_close_weight` potential-based shaping term for the specific act of
+closing the gripper, gated on that same check. Also moved the training
+cube position from `(0.15, 0.0)` (the train region's geometric center) to
+`(0.25, 0.0)` (the far edge of the same region) for run8.
+
+**Why**: The run7 false positive above traced to a real, specific gap --
+`is_grasped()`/`is_holding()` only ever checked "is the jaw pivot within
+some radius of the cube," which is identical whether the cube is in
+front of the closing jaws or off to the side of them. Fixed by
+decomposing the cube's position relative to the jaw pivot along the
+gripper's live reach direction (`jaw_approach_axis_world()`,
+`sim/robots/grasp_geometry.py`) into an axial (within-reach) and lateral
+(centered) component -- reusing the ALREADY-calibrated `JAW_OFFSET_LOCAL`
+offset as a direction rather than deriving new hardware calibration. A
+live measurement first ruled out the naive alternative (raw distance
+between the two jaw bodies' origins) -- that distance stays constant
+(~3.6cm) across the gripper's full joint range, since the joint rotates
+the moving jaw about a pivot rather than translating it, so it carries no
+information about openness at all.
+
+Separately, no reward signal existed for the act of closing the gripper
+once well-positioned -- reach-shaping only ever measured gripper-to-cube
+distance, never the gripper's own closedness. The user's explicit,
+specific requirement for this term: it must NOT reward closing just for
+happening near the cube (that would reproduce the run7 incentive at the
+shaping level even after fixing detection) -- only for happening with the
+cube genuinely positioned to be caught, which is exactly what gating on
+`is_between_jaws()` enforces.
+
+The cube position moved to the region's far edge based on the user's own
+direct observation from run6/7 video review: the cube felt too close to
+the base for a clean grasp angle. Checked against
+`sim/output/reachability_sweep.json` rather than picked freely --
+`(0.25, 0.0)` turned out to have the BEST empirically-measured IK
+convergence of any point checked in the entire train region (error
+0.0009, tied for lowest), not just "further away," so this isn't a
+tradeoff against reachability.
+
+**How to apply**: Verified via 6 new self-test cases in
+`pickplace_reward.py`, including a direct regression test reproducing
+run7's exact false positive (cube positioned beside, not around, a
+closed gripper -- within the old proximity threshold, above the height
+threshold, failing only the new geometric check) and confirming both
+`is_grasped()` and `is_holding()` now correctly reject it. An eighth
+run using both new levers, with the far-edge cube position, is the next
+real test -- judge the same way as every run before it: watch the actual
+eval videos, not just the printed flags, especially now that `held=True`
+has been shown capable of a false positive once already. See
+docs/tdmpc2_integration.md for results as they land.
