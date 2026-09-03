@@ -353,12 +353,94 @@ run reproduced the identical qualitative behavior rather than showing
 progress toward reaching. See docs/decisions.md for the resulting fix
 (raising the seed-episode exploration budget) tried next.
 
+## Fifth training run (2026-09-01): seed_episodes raised 5 -> 30
+
+50,000 steps, `--eval-every 5000`, same reward as run4 but with the
+random-exploration seed budget raised 6x (2,500 -> 15,000 steps / 5 -> 30
+episodes) -- the fix decided after run4 (see docs/decisions.md). 7090s
+(~2h) total, 101 episodes collected, 35,001 gradient updates, no crash.
+
+**Results**: eval episode rewards across the run: -5.6, -5.4, -8.9, -1.3,
+-4.3, -2.8, -1.1, -0.7, -3.1 -- similar range to run4, no exploit-scale
+numbers. **Direct frame inspection** (checkpoints 020469, 040429,
+045419, every 25 frames): identical finding to run4 -- the arm holds one
+fixed resting pose across every sampled frame, regardless of checkpoint
+or the cube's randomized position. **This is the run that ruled out
+"just needs more random exploration"**: 6x more random-seed budget
+produced the qualitatively identical failure mode, which is what
+motivated actually tracing TD-MPC2's own planning code (`_plan()` in
+tdmpc2.py) rather than continuing to scale the seed budget further --
+see docs/decisions.md for what that tracing found (a CEM std-collapse
+mechanism, not just insufficient random-exploration volume) and the two
+levers it led to.
+
+This run's results were not written up at the time (the project moved
+directly into the CEM investigation and then a device migration) --
+added retroactively while documenting run6 below, so the record stays
+complete.
+
+## Sixth training run (2026-09-02): fixed cube position + raised min_std
+
+50,000 steps, `--eval-every 5000 --cube-pos 0.15 0.0 --min-std 0.5` --
+the two curriculum/exploration levers from tracing `_plan()` (see
+docs/decisions.md): fixing the cube to one point (the geometric center of
+the train region) instead of randomizing it every episode, and raising
+the floor under CEM's training-time exploration noise from 0.05 to 0.5.
+7273s (~2h1m) total, 100 episodes collected, 35,001 gradient updates, no
+crash. Also the first run to log `touched`/`held` directly
+(extras["touched"]/["holding"], added just before this run -- see the
+commit adding this) instead of relying on sampled-frame guessing.
+
+**Results**: eval episode rewards: -14.0, -19.9, -2.7, -4.4, -2.3, -1.6,
+-2.4, -2.3, -2.1. **touched=True from step 20459 onward, on every single
+remaining checkpoint (5 in a row)** -- a genuine qualitative break from
+every prior run, where touched was never observed to be reliably true
+across consecutive checkpoints (run4/run5 showed it essentially never via
+frame inspection; run3 showed one plausible-looking but likely-lucky
+frame given the cube was randomized then). `held` never went true and no
+episode succeeded, so the arm reaches and touches the cube reliably but
+hasn't learned to close the gripper and complete a hold yet. Reward also
+settled into a visibly tighter band (-1.6 to -2.4) in the second half of
+the run, consistent with a policy that has learned a real, repeatable
+behavior rather than one dominated by episode-to-episode luck.
+
+**Interpretation**: this is the first run since the reward-hacking fix
+where there is direct, repeated, logged evidence of real learned
+progress (not exploit-driven, not static-idle-driven). Both levers were
+changed together, so this doesn't isolate which one mattered more (or
+whether both were needed) -- not a priority to disentangle yet given
+neither has been tried alone. Launched a seventh run at 70,000 steps
+with the identical settings immediately after this one finished, per the
+user's standing instruction, to see whether more time converts reliable
+touching into reliable holding/success -- see below once it completes.
+
+## Seventh training run (2026-09-03, in progress)
+
+70,000 steps, identical settings to run6 (`--cube-pos 0.15 0.0 --min-std
+0.5`), launched automatically the moment run6 finished per explicit
+standing instruction from the user ("start a 70k run once its done,
+don't wait for me to confirm"). Purpose: isolate whether run6's
+touched-but-not-held plateau resolves with more of the exact same
+training, before considering any further design changes.
+
+**Mid-run finding (not the final result -- full writeup once this run
+completes)**: two eval checkpoints so far logged `held=True` (steps
+20459 and 30439). Watched the first one on video before trusting it --
+same standing practice that caught run1's exploit -- and it was a false
+positive: the gripper closed fully beside the cube, never around it,
+cube untouched the whole episode. Root cause and fix (`is_between_jaws()`,
+a `grasp_close_weight` shaping term, and a new cube position) are in
+docs/decisions.md and docs/reward_function.md; an eighth run using both
+fixes is queued once this one finishes. Full run7 results (including
+whether step 30439's `held=True` was a second false positive or
+something genuinely different) to be added here once complete.
+
 ## Known limitations / not yet done
 
-- Four training runs done so far (30,000 / 15,000 / 15,000 / 50,000
-  steps, under three different reward/exploration configurations -- see
-  the run sections above), still no systematic sweep over training
-  duration, hyperparameters, or fusion strategy.
+- Seven training runs done so far (30,000 / 15,000 / 15,000 / 50,000 /
+  50,000 / 50,000 / 70,000 steps, under four different reward/exploration
+  configurations -- see the run sections above), still no systematic
+  sweep over training duration, hyperparameters, or fusion strategy.
 - Checkpointing/logging beyond console output + eval videos is not wired
   up (`save_agent`/`enable_wandb` both `False`).
 - The fusion strategy (elementwise sum of two SimNorm-normalized

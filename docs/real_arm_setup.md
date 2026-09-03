@@ -7,12 +7,30 @@ Created 2026-08-29.
 ## Connecting to the machine
 
 - The machine's LAN IP changes on reboot (DHCP) -- it has been
-  `10.0.0.91` and `10.0.0.240` at different points. If a known IP times
-  out, check with the user for the current one, or try the Tailscale IP
-  (`100.71.12.16`) as a fallback -- Tailscale auto-starts on boot, but
-  reconnection can occasionally be slow/flaky (seen a few times this
-  session as spurious connection timeouts that resolved on retry).
-- SSH access is passwordless (key-based) as `keerthan@<ip>`.
+  `10.0.0.91`, `10.0.0.240` (seen again on 2026-09-02/03, from a
+  different client machine), and others at different points. If a known
+  IP times out, check with the user for the current one, or try the
+  Tailscale IP (`100.71.12.16`) as a fallback -- Tailscale auto-starts on
+  boot, but reconnection can occasionally be slow/flaky (seen a few times
+  as spurious connection timeouts that resolved on retry), and on a fresh
+  client machine Tailscale may not even be installed/active yet.
+- **Rediscovering the current LAN IP without asking**, when reachable
+  from the same local network: check `~/.ssh/known_hosts` on the client
+  for previously-seen `10.0.0.x` entries -- several rows sharing the
+  EXACT SAME host-key text are the same physical machine across past
+  DHCP leases, even though the IP differs. Ping-sweep the subnet
+  (`for i in $(seq 1 254); do ping -c1 -W200 10.0.0.$i ...; done`) for
+  live hosts, then `ssh-keyscan -t ed25519 <candidate-ip>` each one and
+  compare against the known host-key text -- a match, plus an Ubuntu SSH
+  banner, confirms identity before ever connecting. This worked cleanly
+  when re-establishing access from a brand new Mac on 2026-09-02 with no
+  prior known_hosts entry of its own -- the technique only needs ONE
+  prior client's known_hosts to have seen the machine before, not the
+  current client.
+- SSH access is passwordless (key-based) as `keerthan@<ip>` -- set up
+  per-client via `ssh-keygen` + `ssh-copy-id` (the latter needs the
+  account password once, interactively, so run it in the user's own
+  terminal, not through a tool call).
 
 ## Getting a GUI window onto the physical monitor
 

@@ -1,6 +1,8 @@
 # Project Plan: Sim-to-Real World Models vs. Diffusion Policy on SO-101
 
-Last updated: 2026-08-26
+Last updated: 2026-09-03 (Status/Immediate Next Step sections; the plan
+itself -- research question, task, scope, phases -- is unchanged since
+2026-08-26)
 
 ## Research Question
 
@@ -21,8 +23,9 @@ object / one task so the comparison between the two approaches stays clean.
 - Simulator: NVIDIA Isaac Lab (GPU-parallelized; chosen over Genesis /
   ManiSkill3 / MuJoCo MJX for domain-randomization tooling and fit with
   available NVIDIA GPU)
-- Compute: Ubuntu machine (keerthan@100.71.12.16, via Tailscale), NVIDIA GPU,
-  robots physically connected there
+- Compute: Ubuntu machine (`keerthan@<LAN IP, DHCP-assigned -- see
+  docs/real_arm_setup.md>`, Tailscale `100.71.12.16` as fallback), NVIDIA
+  GPU, robots physically connected there
 - Data format: LeRobot dataset format, for compatibility with both the
   diffusion policy trainer and the world-model pipeline
 
@@ -64,9 +67,28 @@ decisions.md for reasoning).
 
 ## Immediate Next Step
 
-Get an SO-101 asset into Isaac Lab and a minimal scripted pick-and-place scene
-running — this unblocks everything downstream (data generation, both models).
+Watch run8 (TD-MPC2, launching once run7 finishes -- see docs/progress.md)
+for whether the new gripper-closing shaping/detection fix converts
+reliable touching into reliable holding and eventual success. Once
+TD-MPC2 shows at least occasional real successes, shift attention to
+starting the diffusion policy side (currently fully dormant -- the data
+strategy is decided, see docs/diffusion_policy_data_strategy.md, but
+execution hasn't started).
 
 ## Status
 
-Not yet started on implementation. Planning phase complete as of 2026-08-26.
+(Last updated 2026-09-03 -- see docs/progress.md for the full narrative.)
+Phase 1 (sim environment) and most of phase 3 (train world model) are
+well underway for the TD-MPC2 side: SO-101 asset, scene, reward function,
+and training env are built, audited, and validated; eight TD-MPC2
+training runs completed so far, iterating through a real reward-hacking
+bug, two grasp-detection false positives (each caught by watching video
+rather than trusting a logged flag), and a mechanistic diagnosis of
+TD-MPC2's own planning code. Current state: the arm reliably reaches and
+touches the cube (run6/7) but has not yet reliably completed a grasp;
+run8 tests a targeted fix for that specific gap. No successful
+pick-and-place yet. Diffusion policy side (phase 2 data collection
+onward) has not started -- the bulk-demonstration-data strategy is
+decided (docs/diffusion_policy_data_strategy.md) but deliberately
+deferred by the user until the TD-MPC2 side is further along. Phases 4
+(evaluation) and 5 (write-up) not started.

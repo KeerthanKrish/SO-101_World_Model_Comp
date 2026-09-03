@@ -715,3 +715,211 @@ be the natural next experiment. Diffusion policy blocked only on the
 demonstration-data decision, execution deferred by the user; the strategy
 itself (small human-demo seed + custom SE(3) augmentation) is decided and
 documented.
+
+### 2026-08-31 (continued) -- The "promising" run1 trend was reward hacking
+
+Before starting a longer run on the strength of run1's rising eval trend,
+the user asked a pointed question after actually watching the highest-
+scoring (+97.9) episode's video: the arm never touches the cube, and
+nearly clips into itself. This was the right catch -- I had called the
+trend "promising" from the printed numbers alone, without watching the
+video myself first, and the real explanation was reward hacking: the old
+dense shaping term (`reach_weight * (1 - tanh(d / reach_scale))`) paid
+its ABSOLUTE value every step based on current distance alone, so simply
+hovering somewhere plausible-looking -- without tracking that episode's
+actual cube -- could accumulate ~+0.2/step x 500 steps ~= +97.9 with zero
+real engagement. Separately, `enabled_self_collisions` had been left at
+its inherited `False` default in `so101.py`, letting the arm pass through
+itself -- fixed to `True`.
+
+First attempted reward fix: narrowed `reach_scale` 0.15 -> 0.08 (make
+vague proximity worth less) and added direct checkpoint saving to
+`train_tdmpc2_pickplace.py` (run1's policy couldn't be reloaded once
+concerns surfaced). Launched a second, shorter (15,000-step) run
+specifically to check the fix quickly before committing to a longer run.
+**Result: worse, not better** -- eval rewards were consistently negative
+and non-improving (-3.8, -18.7, -11.2, -33.2), and extracted video frames
+(no video-viewer tool available, so frames pulled via ffmpeg and
+inspected directly -- an approach used repeatedly from here on) showed
+genuinely undirected motion, never engaging the cube in either sampled
+episode. Diagnosis: narrowing the scale reduced the reward for vague
+proximity but didn't fix the actual mechanism (a policy could still
+profit from occupying any fixed position, just a smaller one), while also
+removing most of the usable gradient for a policy that starts far from
+the cube.
+
+**The actual fix**: potential-based reward shaping (Ng, Harada & Russell,
+ICML 1999) -- reward the CHANGE in a potential function between steps,
+never its absolute value. Provably policy-invariant (never changes the
+optimal policy, for any choice of potential), and practically: a policy
+that holds still anywhere now earns exactly zero shaping reward, closing
+the hacking mechanism at its root rather than by narrowing a scale.
+`reach_scale` reverted to 0.15 (broad is fine again once the exploit that
+motivated narrowing it no longer exists). Added a `touch_bonus`
+(one-time, genuine contact range) and fixed a second, separately-found
+incentive bug: the old `grasp_bonus` was a flat per-step reward while
+holding, which -- since placing ends the episode -- made holding the cube
+forever a better strategy than finishing. Made it one-time too. Full
+technical writeup in docs/reward_function.md's "Reward-hacking finding
+and potential-based-shaping redesign" section.
+
+Launched a third training run (15,000 steps) under the new reward.
+Reward numbers looked sane throughout (no exploit-scale spikes), and one
+checkpoint's video showed the gripper genuinely reaching toward and
+briefly hovering at the cube -- real progress, though only one data
+point and possibly partly lucky given the cube's position was still
+randomized.
+
+**Status**: Reward redesigned around a proven-correct mechanism
+(potential-based shaping) rather than a re-tuned scale. Self-collision
+bug fixed. Next: confirm this generalizes with a longer run.
+
+### 2026-09-01 -- Two more 50k-step runs, both static, then a mechanistic diagnosis
+
+Ran a fourth (50,000-step) training run under the same potential-based
+reward, per the user's own suggestion to see if more time alone resolved
+run3's inconclusive result. It didn't -- **direct frame inspection**
+across three checkpoints (sampled every 25 frames this time, after
+under-sampling missed detail in run3's review) showed the arm holding
+the *exact same* folded resting pose in every single frame, regardless
+of checkpoint or the cube's randomized position. The small variance in
+eval reward turned out to be almost entirely explained by the brief
+settling transient at episode start, not real cube-tracking.
+
+Diagnosed the likely mechanism: potential-based shaping correctly pays
+*zero* net reward for holding still (that's the whole point of the fix),
+which also means there's no reward pressure at all pushing an untrained
+policy to move, unless its experience already contains a genuine
+touch/grasp trajectory for the value function to learn from -- and
+TD-MPC2's default exploration budget (5 random episodes before its own
+policy takes over) apparently never produced one against a small,
+randomly-positioned target. Raised the seed-episode budget 6x (5 -> 30
+episodes) and ran a fifth 50,000-step run to test this directly.
+
+**Result: identical failure mode.** Run5 reproduced run4's exact
+fixed-idle-pose behavior. This ruled out "just needs more random
+exploration" as the fix, and motivated actually tracing TD-MPC2's own
+planning code (`_plan()` in tdmpc2.py) instead of continuing to scale
+that one knob. Found a more precise mechanism: TD-MPC2's CEM planner
+samples 512 candidate action sequences and narrows to 64 elites over 6
+iterations every single env step, but CEM is known to over-confidently
+narrow its own sampling std even when the value estimates it's ranking
+by are pure noise (no learned signal yet) -- and the actual
+training-time exploration noise (`a = a + std * randn(...)`, added only
+when not in eval mode) uses exactly that potentially-falsely-converged
+std. Also lowered `action_penalty_weight` 5x (0.01 -> 0.002): any
+movement, even useful movement, was being penalized on top of zero
+reward for standing still, making "don't move" a doubly-safe local
+optimum. Added exact `touched`/`holding` logging to eval output
+(`extras["touched"]`/`["holding"]` in pickplace_env.py), replacing
+error-prone frame-by-frame visual guessing with a precise, objective
+signal.
+
+**Status**: Two consecutive 50k-step runs under the (correctly
+non-hackable) potential-based reward showed zero directed behavior --
+established this is a bootstrapping/exploration problem, not a reward-
+correctness problem, and pinpointed the mechanism precisely enough to
+design two targeted fixes (see next entry) rather than guessing further.
+
+### 2026-09-02/03 -- Migrated to a new Mac; two curriculum levers produce the first reliable cube contact
+
+User set up a new MacBook Pro and transferred the conversation over.
+Local development now happens here instead of the Windows laptop --
+practically, this meant re-establishing SSH access from scratch (the
+Ubuntu box's LAN IP had changed again, per the DHCP-changes-on-reboot
+note in docs/real_arm_setup.md; refound it via `~/.ssh/known_hosts` host-
+key matching against previously-seen `10.0.0.x` addresses, confirmed by
+matching SSH banner + host key fingerprint before trusting it) and
+generating a new passwordless SSH key pair for this machine. **The
+sync workflow itself also changed for the better**: code now flows
+Ubuntu -> `git push` -> GitHub -> `git pull` on the Mac, replacing the
+old scp-based mirroring for code entirely. scp is still used, but now
+only for the things `.gitignore` deliberately excludes and always will
+(`sim/output/` -- eval videos, checkpoints, recorded teleop episodes;
+and `assets/`, the robot USD files) -- these get synced to the Mac
+periodically, not on every change. See docs/preferences.md for the
+updated arrangement.
+
+With the CEM-collapse mechanism diagnosed, implemented and launched a
+sixth training run with two targeted levers: `--cube-pos 0.15 0.0`
+(fixing the cube to one point -- the train region's geometric center --
+instead of randomizing it every episode, isolating "can this learn to
+reach and grasp at all" from the harder "can it generalize across
+positions" question) and `--min-std 0.5` (raising the floor under CEM's
+training-time exploration noise from its default 0.05, so the planner
+can't collapse into false confidence about a flat value landscape quite
+so easily). Both were real experiments, not proven fixes, changed
+together rather than one at a time given how much time two consecutive
+identical-failure runs had already cost.
+
+**Result: the first real behavioral change since the reward redesign.**
+`touched=True` fired on every eval checkpoint from step 20,459 onward (6
+in a row, through the end of the run) -- reliable, repeated cube contact,
+not a static idle pose and not a single lucky-looking frame. `held`
+never went true and no episode succeeded, but this was a genuine,
+qualitative break from every prior run. Per standing instruction ("start
+a 70k run once this one's done, don't wait for me to confirm"), launched
+a seventh run automatically at 70,000 steps with identical settings the
+moment run6 finished.
+
+**A second false positive, caught the same way as the first.** Partway
+through run7, an eval episode logged `held=True` -- watched the video
+before trusting it (this project's standing practice, now paying off a
+second time), and the gripper had closed fully BESIDE the cube, never
+around it, cube untouched the whole episode. Root cause: `is_grasped()`/
+`is_holding()` only ever checked a spherical distance from the jaw pivot
+to the cube -- identical whether the cube was in front of the closing
+jaws or off to one side of them. The user, watching the same run6/7
+videos independently, separately flagged two things worth fixing before
+another run: the cube felt positioned too close to the arm's base for a
+clean grasp angle, and any gripper-closing reward needed to specifically
+require the cube be *between* the jaws as they close, not just "closing
+somewhere near the cube."
+
+Fixed both, carefully:
+- Added `is_between_jaws()` (`sim/envs/pickplace_reward.py`), decomposing
+  the cube's position relative to the jaw pivot along the gripper's live
+  reach direction (a new `jaw_approach_axis_world()` helper in
+  `sim/robots/grasp_geometry.py`, reusing the already-calibrated
+  `JAW_OFFSET_LOCAL` offset as a direction rather than needing new
+  hardware calibration) into an axial (within-reach) and lateral
+  (centered) component. A live measurement first ruled out the naive
+  alternative -- the two jaw bodies' origins stay a constant ~3.6cm apart
+  regardless of joint angle, since the joint rotates the moving jaw about
+  a pivot rather than translating it, so raw origin-to-origin distance
+  carries no information about openness at all. `is_grasped()` now
+  requires this check to fire at all; `is_holding()` requires it only to
+  *establish* holding, not to persist it (deliberately, to avoid a new
+  failure mode where minor sway while genuinely carrying the cube could
+  flicker a real hold back out of these intentionally tight thresholds).
+- Added a `grasp_close_weight` potential-based shaping term for the
+  specific act of closing the gripper, gated on `is_between_jaws()` --
+  previously nothing rewarded closing at all, only gripper-to-cube
+  distance. Gating on the geometric check rather than mere proximity was
+  a specific, explicit user requirement: a policy that just snaps the
+  gripper shut near-but-not-around the cube must earn nothing, or the fix
+  would reproduce the exact run7 incentive one level up.
+- Moved the training cube position from `(0.15, 0.0)` to `(0.25, 0.0)` --
+  the far edge of the same train region -- based on the user's direct
+  observation. Checked against `sim/output/reachability_sweep.json`
+  rather than picked freely: `(0.25, 0.0)` has the best empirically-
+  measured IK convergence of any point checked in the whole region, so
+  this isn't a reachability tradeoff.
+
+Verified via 6 new self-test cases (including a direct regression test
+reproducing run7's exact false positive and confirming it's now
+correctly rejected), a full local + remote self-test pass, and pushed.
+An eighth run, using both new levers with the far-edge cube position, is
+queued to launch once run7 finishes.
+
+**Status**: TD-MPC2 has gone from "no directed behavior at all" (runs
+3-5) to "reliably reaches and touches the cube" (run6) in the space of
+one mechanistic diagnosis and two targeted levers. The remaining gap is
+finishing the grasp itself, not finding the cube -- run8 tests whether
+the newly-added geometric grasp-closing signal closes that gap. Two
+real, video-confirmed false positives in the detection logic have now
+been caught and fixed (is_holding()'s height-based flip in the
+correctness audit, and now is_between_jaws()) -- both times by watching
+video rather than trusting a logged flag, which remains this project's
+single most reliable debugging tool. Diffusion policy side is still
+fully dormant, deferred since 2026-08-31 pending the user's return to it.
