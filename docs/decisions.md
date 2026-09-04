@@ -408,3 +408,74 @@ real test -- judge the same way as every run before it: watch the actual
 eval videos, not just the printed flags, especially now that `held=True`
 has been shown capable of a false positive once already. See
 docs/tdmpc2_integration.md for results as they land.
+
+---
+
+**Decision**: Add `lateral_align_weight` (continuous potential-based
+alignment shaping) and `premature_close_weight` (an absolute penalty for
+closing at the wrong time) to `pickplace_reward.py`, and add
+`--resume-from` warm-start support to `train_tdmpc2_pickplace.py`.
+
+**Why**: Run8 (the `is_between_jaws()` fix, cube moved to the train
+region's far edge) produced the best behavior yet -- reliable, purposeful
+reaching and touching -- but zero `between_jaws=True` across all 14 eval
+checkpoints. Direct video review of the best checkpoint showed two
+specific, correctable patterns rather than "just needs more training":
+the arm approaches from directly above and pokes the cube with a single
+fingertip, never straddling it with both jaws, and separately closes the
+gripper almost immediately on approach, well before correctly positioned
+(the second one specifically flagged by the user from the same video).
+
+Two different gaps, not one. `is_between_jaws()` is a binary gate with no
+gradient leading up to it -- improving alignment from wildly-off to
+almost-centered earned the same (zero) reward as not improving at all.
+`lateral_align_weight` fixes this the same way every other shaping term
+in this reward works: potential-based, over the raw lateral offset itself
+(reusing `is_between_jaws()`'s own decomposition, factored into a shared
+`_jaw_offsets()` helper), gated on being within a slightly looser
+activation range than `touch_threshold` so the gradient can start before
+actual contact.
+
+Separately, nothing discouraged closing at the wrong time -- it was
+simply neutral (no reward, no cost), plausibly compounded by `min_std`'s
+exploration floor (raised for run6 onward) applying uniformly across all
+action dimensions including the gripper, injecting persistent noise into
+gripper actuation with nothing counteracting it. `premature_close_weight`
+adds a small, deliberately ABSOLUTE (not potential-based) penalty for
+being closed while not correctly positioned and not yet holding.
+Explicitly confirmed this does NOT reintroduce the original reward-
+hacking mechanism (docs/reward_function.md, 2026-08-31 redesign): that
+was specifically an absolute-value REWARD farmable by occupying a state
+indefinitely; a pure PENALTY has the opposite incentive structure
+(minimized by avoiding a state, never maximized by dwelling in it), so
+there's nothing to exploit. Mutually exclusive with `grasp_close_weight`
+by construction (opposite gating condition), so the two never compete on
+the same step.
+
+`--resume-from` warm-starts training from a saved checkpoint (`TDMPC2.load()`
+already existed in the vendored reference code, simply never wired up)
+rather than training from scratch -- run8 genuinely learned to reach and
+touch with real, repeatable intent, and restarting from zero to train
+against these two new terms would discard that skill and make the agent
+re-learn reaching before it could even attempt alignment. Weights only
+(`TDMPC2.save()` never persisted the replay buffer), paired with a much
+smaller `--seed-episodes` than any from-scratch run, since a resumed
+policy that already knows how to act gets little value from a long
+pure-random warmup.
+
+**How to apply**: Verified via 13 new self-test cases (the same
+symmetric improve/worsen and no-free-lunch properties already required of
+every other shaping term in this module), a full local + remote self-test
+pass, state-only and camera-enabled env smoke tests, and real-data replay
+validation -- all pass with no crash. Caught and fixed two real bugs
+while wiring this up, neither in the reward design itself: the self-test's
+own `compute_reward()` calls were passing `cfg` positionally in a slot
+that silently became `prev_lateral` the moment that parameter was
+inserted (caught by an actual test failure, fixed by passing `cfg=cfg`
+explicitly everywhere), and a stale test fixture (`gripper_open_joint`)
+that was only ever "open enough" for the old binary check, not the true
+physical open limit, which registered as partially closed under the new
+continuous potential. A ninth run, warm-started from run8's final
+checkpoint with both new terms active, is the next real test -- judge it
+the same way as every run before it: watch the actual eval videos. See
+docs/tdmpc2_integration.md for results once available.

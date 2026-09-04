@@ -459,6 +459,98 @@ within the old proximity threshold, above the height threshold, but
 failing the new geometric check) and confirming it's now correctly
 rejected by both `is_grasped()` and `is_holding()`.
 
+## Lateral-alignment shaping and premature-close penalty (2026-09-03)
+
+Run8 (the fix above, cube moved to the train region's far edge per the
+user's own observation of run6/7 video -- see docs/decisions.md) produced
+the best behavior yet: the arm reaches for the cube with clear, directed
+intent, and `touched=True` fired on 10 of 14 eval checkpoints. But
+`is_between_jaws()` never fired once across the entire 70,000-step run --
+and direct video review of the best checkpoint showed exactly why. Two
+specific, correctable patterns, confirmed by watching the arm approach
+across several frames of the episode:
+
+1. **It approaches from directly above and pokes the cube with a single
+   fingertip**, never straddling it with both open jaws. A pincer gripper
+   closing on an object needs the object centered in the gap *between*
+   the two fingers -- a one-fingered poke from above puts the cube off to
+   one side of that gap by construction, which is exactly the geometric
+   distinction `is_between_jaws()` is designed to require, and exactly
+   why it correctly never fired for this behavior. The gate isn't broken;
+   the arm simply hasn't learned the harder skill (straddling) yet, only
+   the easier one (reaching a single point of contact).
+2. **It closes the gripper almost immediately on approach**, well before
+   anywhere near correctly positioned -- a separate behavior the user
+   specifically flagged after watching the same video.
+
+Neither problem is "just needs more training" on its own -- both trace to
+genuine gaps in the reward, not a lack of steps:
+
+**Gap 1: no gradient toward correct alignment.** `is_between_jaws()` is a
+binary gate -- a policy that improves its lateral alignment from wildly
+off to almost-centered earns exactly the same (zero) reward as one that
+doesn't improve at all, right up until the instant it fully qualifies.
+Fixed by adding `lateral_align_weight`, a genuine POTENTIAL-BASED shaping
+term (same delta pattern as every other shaping term in this module) over
+the raw lateral offset itself -- `_jaw_offsets()`, the exact decomposition
+`is_between_jaws()` already thresholds, factored out into a shared
+helper so both use identical geometry. Gated on being within
+`align_activation_range` (deliberately looser than `touch_threshold`, so
+the gradient can start pulling the approach into alignment slightly
+*before* contact, not only after) and not yet holding.
+
+**Gap 2: nothing discouraged closing at the wrong time.** Before this,
+closing the gripper far from the cube was simply NEUTRAL -- no reward,
+no cost -- so nothing pushed back against whatever caused the premature
+closing (a plausible mechanism: `min_std`'s exploration floor, raised for
+run6 onward, applies uniformly across *all* action dimensions including
+the gripper, injecting persistent noise into gripper actuation regardless
+of position, with nothing counteracting it). Fixed by adding
+`premature_close_weight`, a small penalty proportional to closedness,
+charged whenever the gripper is closed while NOT `is_between_jaws()` and
+not yet holding.
+
+This penalty is deliberately an ABSOLUTE value, not potential-based --
+worth confirming explicitly that this does NOT reintroduce the original
+reward-hacking mechanism from the 2026-08-31 redesign above. That
+mechanism was specifically about an absolute-value *reward* that could be
+farmed by occupying a state indefinitely (hover somewhere decent, collect
+reward every step). A pure *penalty* has the opposite incentive
+structure -- it's minimized by *avoiding* a state, never maximized by
+*dwelling* in it, so there's nothing to farm. `premature_close_weight` and
+`grasp_close_weight` are mutually exclusive by construction (gated on
+`is_between_jaws()` being false vs. true respectively), so they never
+fight each other on the same step.
+
+**Also added**: `--resume-from`, a warm-start capability for
+`train_tdmpc2_pickplace.py` (`TDMPC2.load()` already existed in the
+vendored reference code, just never wired up). Run8 genuinely learned to
+reach and touch with real, repeatable intent -- restarting from scratch
+to train against these two new terms would discard that and make the
+agent re-learn reaching before it could even attempt alignment. Weights
+only (`TDMPC2.save()` never persisted the replay buffer), paired with a
+much smaller `--seed-episodes` than a from-scratch run, since a resumed
+policy that already knows how to act gets little value from a long
+pure-random warmup.
+
+Verified via 13 new self-test cases covering both terms (the same
+symmetric improve/worsen and no-free-lunch properties already required of
+every other shaping term in this module), state-only and camera-enabled
+env smoke tests, and real-data replay validation. Caught and fixed two
+real bugs while wiring this up, neither in the reward *design* itself:
+(1) the self-test's own `compute_reward()` calls passed `cfg` as a bare
+positional argument immediately after `prev_joint_pos` in all ~27 call
+sites -- correct under the old signature, but silently reinterpreted as
+the newly-inserted `prev_lateral` parameter the moment it was added
+before `cfg`, caught by an actual test failure rather than by inspection;
+fixed by passing `cfg=cfg` explicitly everywhere. (2) the self-test's
+`gripper_open_joint` fixture (`1.0`) was only ever "open enough" for the
+old binary closed/not-closed cutoff, not the gripper's true physical open
+limit -- with the new continuous closedness potential reading the actual
+joint angle, that placeholder registered as partially closed and
+incorrectly triggered `premature_close_penalty` in unrelated tests; fixed
+to use the real `gripper_joint_open_limit`.
+
 ## Known limitations / open items
 
 - **Grasp AND touch detection are both heuristics**, not first-class
@@ -479,8 +571,11 @@ rejected by both `is_grasped()` and `is_holding()`.
 - **Weights/thresholds are principled guesses**, sized from known scene
   geometry (table extent, cube size, existing segmentation thresholds
   from `segment_teleop_episodes.py`), not tuned against actual training
-  runs -- there are none yet. Expect to revisit once training exposes
-  problems.
+  runs. This now includes `align_activation_range`/`lateral_align_weight`/
+  `premature_close_weight` (2026-09-03) -- reasoned from first principles
+  (see that section above) but not yet empirically validated against a
+  completed run at time of writing (run9, in progress). Expect to revisit
+  once training exposes problems.
 - **The transport-phase hold-and-lower path is still not empirically
   validated against real data** -- only against the synthetic self-test
   (see the correctness audit above). Real validation of that half would

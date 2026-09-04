@@ -923,3 +923,102 @@ correctness audit, and now is_between_jaws()) -- both times by watching
 video rather than trusting a logged flag, which remains this project's
 single most reliable debugging tool. Diffusion policy side is still
 fully dormant, deferred since 2026-08-31 pending the user's return to it.
+
+### 2026-09-03 (continued) -- Run7 completes (second false positive), run8's fix holds up, two new reward terms and warm-start capability added
+
+Run7 finished: 70,000 steps, no crash, ~3h31m. Both `held=True`
+checkpoints from mid-run turned out to be false positives once watched --
+step 20459's gripper closed beside the cube (already root-caused, see
+above), step 30439's closed near the cube's base/pivot rather than around
+its body, a related but distinct misalignment. Nothing in run7's extra
+20,000 steps over run6 produced genuinely new behavior -- the
+touched-but-not-held plateau held exactly as before, which is what
+actually justified moving to a geometric fix rather than a fourth
+uniform-length repeat: "just run longer" had now been tried and had
+stopped teaching us anything new.
+
+Ran the full verification suite for the `is_between_jaws()`/
+`grasp_close_weight` fix (self-test, both env smoke tests, real-data
+replay) before committing, then launched run8: 70,000 steps, cube moved
+to `(0.25, 0.0)` -- the train region's far edge, checked against the
+empirical reachability sweep data rather than picked freely (turned out
+to have the single best measured IK convergence of any point in the
+region). Result: real, visible progress -- `touched=True` on 10 of 14
+checkpoints, consistent purposeful reaching -- and, just as important,
+**zero** `between_jaws=True`/`held=True` false positives across the
+entire run, confirming the geometric fix isn't just strict, it's
+correctly strict. Direct video review of the best checkpoint (step
+55389) showed exactly why the milestone still hadn't fired: the arm
+approaches from directly above and pokes the cube with a single
+fingertip, repeatably and with clear intent, but never straddles it with
+both open jaws.
+
+The user, watching the same video, separately flagged a second pattern:
+the gripper closes almost immediately on approach, well before anywhere
+near correctly positioned -- and asked directly whether the two fixes
+already planned (see below) would address it. They wouldn't have, on
+their own -- lateral-alignment shaping only concerns *where* the arm is,
+not the gripper's joint angle, and warm-starting just continues training
+under whatever incentive already exists. Working through why surfaced a
+concrete, testable hypothesis: `min_std` (raised uniformly for run6
+onward to fight CEM's own exploration collapse) applies identically
+across *every* action dimension, including the gripper -- injecting
+persistent noise into gripper actuation regardless of position, with
+nothing in the reward pushing back against it, since closing early was
+previously just neutral (no reward, no cost).
+
+Implemented three things together, carefully, taking the time the user
+explicitly asked for rather than rushing it:
+
+1. `lateral_align_weight` -- a genuine potential-based shaping term over
+   the raw lateral offset from `is_between_jaws()`'s own decomposition
+   (factored into a shared `_jaw_offsets()` helper so both use identical
+   geometry), fixing the binary-gate-with-no-gradient problem directly.
+2. `premature_close_weight` -- a small, deliberately ABSOLUTE (not
+   potential-based) penalty for closing while not correctly positioned,
+   directly targeting the behavior the user flagged. Explicitly confirmed
+   this doesn't reintroduce the original reward-hacking mechanism: that
+   was an absolute-value *reward* farmable by dwelling in a state; a pure
+   *penalty* is minimized by avoiding one instead, so there's nothing to
+   exploit. Mutually exclusive with `grasp_close_weight` by construction.
+3. `--resume-from` -- warm-start support for `train_tdmpc2_pickplace.py`
+   (`TDMPC2.load()` already existed, just unused), so run8's genuinely-
+   learned reach/touch skill isn't thrown away while training against the
+   two new terms above.
+
+Caught and fixed two real bugs while wiring this up, both in test
+plumbing rather than the reward design: the self-test's own
+`compute_reward()` calls passed `cfg` as a bare positional argument
+immediately after `prev_joint_pos` across all ~27 call sites -- correct
+under the signature at the time, but silently reinterpreted as the newly
+inserted `prev_lateral` parameter the moment it was added before `cfg`,
+caught by an actual test failure and fixed by passing `cfg=cfg`
+explicitly everywhere; and a stale test fixture (`gripper_open_joint`,
+`1.0`) that was only ever "open enough" for the old binary closed check,
+not the gripper's true physical open limit, which the new continuous
+closedness potential read as partially closed, incorrectly tripping the
+new penalty in unrelated tests.
+
+Verified via 13 new self-test cases, a full local + remote self-test
+pass, both env smoke tests, and real-data replay validation -- all clean.
+Committed, pushed, and launched a ninth run (40,000 steps -- shorter than
+the from-scratch runs, since this is refinement of an existing skill, not
+acquisition of a new one -- warm-started from run8's final checkpoint,
+minimal 1,000-step seed-exploration phase given the resumed policy
+already knows how to act). Confirmed the resumed weights actually loaded
+(`[INFO] Resumed agent weights from ...` in the log) before trusting the
+run. In progress at time of writing.
+
+**Status**: three real, video-confirmed false positives in the detection
+logic have now been caught and fixed over the life of this project
+(is_holding()'s height-based flip, is_between_jaws() for the beside-the-
+cube case, and implicitly the base/pivot case it also covers) -- all
+three caught by watching actual video, none by the printed numbers alone,
+which remains the project's single most reliable debugging discipline.
+The reward has evolved from "rewards absolute proximity" (exploitable) to
+"rewards genuine progress plus milestones" (run1's fix) to "rewards
+genuine progress toward a *correctly positioned* grasp, not merely a
+nearby one" (this entry) -- each step motivated by a specific, directly-
+observed failure mode, not by speculation. Whether the two newest terms
+actually close the remaining gap is run9's open question. Diffusion
+policy side remains fully dormant, deferred since 2026-08-31.

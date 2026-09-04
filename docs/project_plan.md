@@ -67,28 +67,31 @@ decisions.md for reasoning).
 
 ## Immediate Next Step
 
-Watch run8 (TD-MPC2, launching once run7 finishes -- see docs/progress.md)
-for whether the new gripper-closing shaping/detection fix converts
-reliable touching into reliable holding and eventual success. Once
-TD-MPC2 shows at least occasional real successes, shift attention to
-starting the diffusion policy side (currently fully dormant -- the data
-strategy is decided, see docs/diffusion_policy_data_strategy.md, but
-execution hasn't started).
+Watch run9 (TD-MPC2, in progress -- see docs/progress.md), a warm-started
+continuation of run8 training against two newly-added reward terms
+(continuous lateral-alignment shaping, a premature-gripper-close
+penalty), for whether it converts run8's reliable-touching-but-not-
+straddling behavior into a genuine grasp. Once TD-MPC2 shows at least
+occasional real successes, shift attention to starting the diffusion
+policy side (currently fully dormant -- the data strategy is decided, see
+docs/diffusion_policy_data_strategy.md, but execution hasn't started).
 
 ## Status
 
 (Last updated 2026-09-03 -- see docs/progress.md for the full narrative.)
 Phase 1 (sim environment) and most of phase 3 (train world model) are
 well underway for the TD-MPC2 side: SO-101 asset, scene, reward function,
-and training env are built, audited, and validated; eight TD-MPC2
-training runs completed so far, iterating through a real reward-hacking
-bug, two grasp-detection false positives (each caught by watching video
-rather than trusting a logged flag), and a mechanistic diagnosis of
-TD-MPC2's own planning code. Current state: the arm reliably reaches and
-touches the cube (run6/7) but has not yet reliably completed a grasp;
-run8 tests a targeted fix for that specific gap. No successful
-pick-and-place yet. Diffusion policy side (phase 2 data collection
-onward) has not started -- the bulk-demonstration-data strategy is
-decided (docs/diffusion_policy_data_strategy.md) but deliberately
-deferred by the user until the TD-MPC2 side is further along. Phases 4
-(evaluation) and 5 (write-up) not started.
+and training env are built, audited, and validated; nine TD-MPC2 training
+runs completed or in progress so far, iterating through a real
+reward-hacking bug, three grasp-detection false positives (each caught by
+watching video rather than trusting a logged flag), a mechanistic
+diagnosis of TD-MPC2's own planning code, and a geometric fix
+(`is_between_jaws()`) that closed the false positives but revealed the
+arm hasn't yet learned to straddle the cube with both jaws, only to
+reach a single point of contact. Current state: run9 (warm-started from
+run8, two new reward terms addressing that specific gap) is in progress.
+No successful pick-and-place yet. Diffusion policy side (phase 2 data
+collection onward) has not started -- the bulk-demonstration-data
+strategy is decided (docs/diffusion_policy_data_strategy.md) but
+deliberately deferred by the user until the TD-MPC2 side is further
+along. Phases 4 (evaluation) and 5 (write-up) not started.

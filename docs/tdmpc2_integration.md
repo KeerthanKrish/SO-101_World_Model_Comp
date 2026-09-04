@@ -414,33 +414,102 @@ with the identical settings immediately after this one finished, per the
 user's standing instruction, to see whether more time converts reliable
 touching into reliable holding/success -- see below once it completes.
 
-## Seventh training run (2026-09-03, in progress)
+## Seventh training run (2026-09-03)
 
 70,000 steps, identical settings to run6 (`--cube-pos 0.15 0.0 --min-std
 0.5`), launched automatically the moment run6 finished per explicit
 standing instruction from the user ("start a 70k run once its done,
 don't wait for me to confirm"). Purpose: isolate whether run6's
 touched-but-not-held plateau resolves with more of the exact same
-training, before considering any further design changes.
+training, before considering any further design changes. 12671.2s
+(~3h31m) total, 140 episodes collected, 55,001 gradient updates, no
+crash. Two leftover hung processes from an earlier, unrelated jaw-
+geometry measurement script were found still running (and competing for
+GPU) the entire time this run trained, discovered only once the run
+finished -- a real oversight, not cleaned up promptly after their own
+results were captured; killed by exact PID once noticed.
 
-**Mid-run finding (not the final result -- full writeup once this run
-completes)**: two eval checkpoints so far logged `held=True` (steps
-20459 and 30439). Watched the first one on video before trusting it --
-same standing practice that caught run1's exploit -- and it was a false
-positive: the gripper closed fully beside the cube, never around it,
-cube untouched the whole episode. Root cause and fix (`is_between_jaws()`,
-a `grasp_close_weight` shaping term, and a new cube position) are in
-docs/decisions.md and docs/reward_function.md; an eighth run using both
-fixes is queued once this one finishes. Full run7 results (including
-whether step 30439's `held=True` was a second false positive or
-something genuinely different) to be added here once complete.
+**Results**: eval episode rewards: -9.1, -8.5, -2.1, -4.4, -13.4, -1.2,
+-2.2 (steps 5489 through 65369, `--eval-every 5000`). Two checkpoints
+logged `held=True` (steps 20459 and 30439) -- both watched on video
+before trusting them (same standing practice that caught run1's exploit),
+and BOTH turned out to be false positives, in two different specific
+geometries: step 20459's gripper closed fully beside the cube (the one
+already root-caused -- see docs/decisions.md and docs/reward_function.md
+for the `is_between_jaws()` fix this produced); step 30439's gripper
+closed near the cube's base/pivot area rather than around its body,
+a related but distinct misalignment the same geometric fix also covers.
+`touched=True` fired on the same 5 of 7 checkpoints as before touching
+became reliable in run6, confirming that behavior held under a full
+70,000-step budget rather than being a run6-specific fluke.
+
+**Interpretation**: more of the exact same training did NOT resolve the
+touched-but-not-held plateau -- it surfaced a second, related false
+positive instead, and no genuinely new behavior emerged from the extra
+20,000 steps over run6. This is the evidence that "just run longer" had
+already been exhausted as a strategy for this specific gap (unlike
+earlier in the project, where it hadn't yet been tried before being
+dismissed) -- motivating the `is_between_jaws()` geometric fix that run8
+tests below, rather than a fourth uniform-length repeat.
+
+## Eighth training run (2026-09-03)
+
+70,000 steps, `--cube-pos 0.25 0.0 --min-std 0.5` -- the `is_between_jaws()`
+fix plus the cube moved to the train region's far edge (see
+docs/decisions.md for why that specific point). 10972.4s (~3h3m) total,
+140 episodes collected, 55,001 gradient updates, no crash.
+
+**Results**: eval episode rewards across all 14 checkpoints (steps 5489
+through 65369): -3.4, -3.4, -3.1, -1.8, -2.5, -2.9, -7.1, -3.4, -7.9,
+-2.9, -1.1, -3.5, -3.4. `touched=True` on 10 of 14 checkpoints --
+consistent with run6/7's reliable-touching finding, now confirmed under
+the new detection logic too. Critically: **`between_jaws=True` and
+`held=True` on ZERO checkpoints, all 14** -- meaning the fix is
+demonstrably not creating any new false positives (a real risk with any
+tightened detection logic), at the cost of not yet seeing the milestone
+it exists to enable either.
+
+**Direct video review** (best checkpoint, step 55389) explains why,
+concretely: the arm approaches the cube from directly above and pokes it
+with a single fingertip, sustained and clearly purposeful, but never
+straddles it with both open jaws -- exactly the geometric distinction
+`is_between_jaws()` is built to require, and exactly why it correctly
+never fires for this specific behavior. Separately, the user flagged
+from the same video that the gripper closes almost immediately on
+approach, well before anywhere near correctly positioned. Full mechanism
+and the two-part fix (`lateral_align_weight` continuous alignment
+shaping, `premature_close_weight` penalty) in docs/reward_function.md
+and docs/decisions.md.
+
+**Interpretation**: real, visible qualitative progress (purposeful,
+repeatable single-point contact) with a correctly-strict detector
+withholding credit for the harder skill (straddling) it hasn't learned
+yet. Not evidence the fix is wrong -- evidence it's precisely rejecting
+exactly the behavior it was built to reject.
+
+## Ninth training run (2026-09-03, in progress)
+
+40,000 steps, `--cube-pos 0.25 0.0 --min-std 0.5 --seed-episodes 2
+--resume-from <run8's final checkpoint>` -- WARM-STARTED from run8
+rather than trained from scratch, specifically so the reach/touch skill
+run8 already learned isn't discarded while training against the two new
+terms (`lateral_align_weight`, `premature_close_weight`) added after
+reviewing run8's video. Shorter than the preceding from-scratch runs
+(40k vs. 70k) since this is refinement of an existing skill, not primary
+skill acquisition -- confirmed loading correctly (`[INFO] Resumed agent
+weights from ...`) and using a much smaller seed-exploration phase
+(1,000 steps, the floor) than any prior run, since a resumed policy that
+already knows how to act gets little value from a long pure-random
+warmup. Full results once complete.
 
 ## Known limitations / not yet done
 
-- Seven training runs done so far (30,000 / 15,000 / 15,000 / 50,000 /
-  50,000 / 50,000 / 70,000 steps, under four different reward/exploration
-  configurations -- see the run sections above), still no systematic
-  sweep over training duration, hyperparameters, or fusion strategy.
+- Nine training runs done so far (30,000 / 15,000 / 15,000 / 50,000 /
+  50,000 / 50,000 / 70,000 / 70,000 / 40,000 steps, under six different
+  reward/exploration/curriculum configurations, one of them warm-started
+  rather than from-scratch -- see the run sections above), still no
+  systematic sweep over training duration, hyperparameters, or fusion
+  strategy.
 - Checkpointing/logging beyond console output + eval videos is not wired
   up (`save_agent`/`enable_wandb` both `False`).
 - The fusion strategy (elementwise sum of two SimNorm-normalized
