@@ -479,3 +479,47 @@ continuous potential. A ninth run, warm-started from run8's final
 checkpoint with both new terms active, is the next real test -- judge it
 the same way as every run before it: watch the actual eval videos. See
 docs/tdmpc2_integration.md for results once available.
+
+---
+
+**Decision**: Every TD-MPC2 training run now writes its eval videos and
+checkpoints into its own `run_name` subfolder (`--run-name`, defaulting
+to an auto-generated timestamp) under `sim/output/tdmpc2_eval_videos/`
+and `tdmpc2_checkpoints/`, instead of directly into those directories.
+
+**Why**: Asked to organize existing run videos into per-run folders for
+easier navigation, and discovered why that was hard in the first place --
+eval checkpoint step numbers depend only on episode length and eval
+cadence, which most runs share, so most runs produced identical
+checkpoint filenames. Every run had been writing flat into the same two
+directories since run1, meaning each later run's save silently
+overwrote an earlier run's file at that exact name, with nothing
+surfacing an error either way.
+
+Reconstructed the damage from the training logs that still exist (runs
+6-9) plus file timestamps: **runs 2, 3, 4, 6, and 7's raw video and
+checkpoint files are unrecoverable**, overwritten by whichever run came
+right after them. Partial visual evidence for runs 3, 4, and 7 survives
+only because individual frames happened to be extracted and saved as
+PNGs during live analysis of those runs at the time (now under
+`sim/output/frame_extract/runN/`); run 6 has no surviving images at all,
+only the written notes already in docs/. One video (run7's step-20459
+false positive) was recovered from an early manual copy made before the
+overwrite happened, and restored to its rightful place. Runs 1, 5, 8, and
+9 are intact -- each happened to be the last run to use its particular
+step-number range. The reward numbers and interpretations already
+written into docs/ are unaffected by any of this, since they were
+recorded from live logs at the time, not derived from these files after
+the fact.
+
+**How to apply**: Existing surviving files reorganized into `runN/`
+subfolders on both machines (an `_ambiguous_runs2-3-4/` folder holds
+files that collided among exactly those three runs and can no longer be
+attributed with certainty; `_verification_smoke_tests/` holds ad-hoc test
+runs that were never part of the numbered sequence -- see the README.txt
+in each directory). Going forward, every run's `--run-name` is printed at
+startup (`[INFO] run_name=...`) -- worth glancing at when launching a
+run, since nothing currently checks that an explicitly-passed name
+doesn't collide with an existing one (the auto-generated timestamp
+default always will avoid this; only a manually-chosen `--run-name`
+could still collide).
