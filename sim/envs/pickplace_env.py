@@ -215,6 +215,15 @@ class PickPlaceEnv(DirectRLEnv):
         # function's docstring for why this one does NOT need to be reset
         # across a holding phase transition the way _prev_dist does.
         self._prev_joint_pos = torch.full((self.num_envs,), float("nan"), device=self.device)
+        # Same NaN-sentinel pattern again, for compute_reward()'s
+        # lateral-alignment shaping term (also added 2026-09-03) -- unlike
+        # _prev_joint_pos, this one DOES need resetting on both episode
+        # reset AND whenever compute_reward() reports it wasn't in the
+        # alignment activation zone (handled by compute_reward() itself
+        # returning None in that case -- see its docstring's `prev_lateral`
+        # entry), which is why NaN here always means "no valid previous
+        # value," never "was in the zone but happened to be far off-axis."
+        self._prev_lateral = torch.full((self.num_envs,), float("nan"), device=self.device)
 
     def _setup_scene(self):
         # Everything (robot, cube, table, ground, light, optional cameras)
@@ -296,6 +305,7 @@ class PickPlaceEnv(DirectRLEnv):
         for i in range(self.num_envs):
             prev_d = self._prev_dist[i].item()
             prev_j = self._prev_joint_pos[i].item()
+            prev_lat = self._prev_lateral[i].item()
             reward, info = compute_reward(
                 gripper_pos_local[i].tolist(),
                 gripper_quat[i].tolist(),
@@ -307,7 +317,8 @@ class PickPlaceEnv(DirectRLEnv):
                 bool(self._was_touched[i].item()),
                 None if math.isnan(prev_d) else prev_d,
                 None if math.isnan(prev_j) else prev_j,
-                self._reward_cfg,
+                prev_lateral=None if math.isnan(prev_lat) else prev_lat,
+                cfg=self._reward_cfg,
             )
             rewards[i] = reward
             terminated[i] = info["placed"] or info["failed"]
@@ -315,6 +326,7 @@ class PickPlaceEnv(DirectRLEnv):
             self._was_touched[i] = info["touched"]
             self._prev_dist[i] = info["dist"]
             self._prev_joint_pos[i] = info["joint_pos"]
+            self._prev_lateral[i] = float("nan") if info["lateral"] is None else info["lateral"]
             placed[i] = info["placed"]
             failed[i] = info["failed"]
             touched[i] = info["touched"]
@@ -376,6 +388,8 @@ class PickPlaceEnv(DirectRLEnv):
         # must not compare its first real joint-angle delta against
         # whatever the previous episode's gripper happened to end at.
         self._prev_joint_pos[env_ids] = float("nan")
+        # Same reasoning again, for the lateral-alignment shaping term.
+        self._prev_lateral[env_ids] = float("nan")
 
         cube_x = sample_uniform(self.cfg.cube_x_range[0], self.cfg.cube_x_range[1], (n,), self.device)
         cube_y = sample_uniform(self.cfg.cube_y_range[0], self.cfg.cube_y_range[1], (n,), self.device)

@@ -132,6 +132,40 @@ fixed together:
    closing when close"), since a proximity-only gate would reproduce
    exactly the run7 false-positive incentive at the SHAPING level even
    after fixing it at the DETECTION level.
+
+## Lateral-alignment shaping and premature-close penalty (2026-09-03)
+
+Run8 (the reward above, run from a fixed cube position further from the
+base per the user's direct observation of run7's video -- see
+docs/decisions.md) got the arm reaching and touching the cube with clear
+directed intent for the first time. Direct video review of the best
+checkpoint (not just the numbers -- `is_between_jaws()` never once fired
+across the whole run) showed why: the arm approaches from directly above
+and pokes the cube with a single fingertip, never straddling it with both
+open jaws, and separately closes the gripper almost immediately on
+approach, well before anywhere near correctly positioned.
+
+Two different gaps, fixed together (full mechanism and reasoning in
+`compute_reward()`'s own docstring, under the matching heading):
+
+1. `is_between_jaws()` is a binary gate with no gradient leading up to
+   it -- improving alignment from "wildly off" to "almost centered" earned
+   the same (zero) reward as not improving at all. Added a genuine
+   potential-based shaping term over the raw lateral offset itself
+   (`lateral_align_weight`), so partial progress toward correct alignment
+   is rewarded continuously, not just the final binary threshold.
+
+2. Nothing discouraged closing the gripper at the wrong time -- it was
+   simply neutral (no reward, no cost) rather than actively discouraged,
+   plausibly compounded by the exploration-noise floor (`min_std`)
+   applying uniformly to the gripper action dimension along with the arm
+   joints. Added `premature_close_weight`, a small absolute (not
+   potential-based) penalty for being closed while not correctly
+   positioned and not yet holding -- explicitly confirmed this does NOT
+   reintroduce the original reward-hacking mechanism, since a pure penalty
+   is minimized by avoiding a state, never maximized by dwelling in it
+   (the opposite incentive structure from the absolute-value REWARD that
+   caused the original exploit).
 """
 
 import os
@@ -280,6 +314,44 @@ class PickPlaceRewardConfig:
     # footing with them, not as an afterthought.
     grasp_close_weight: float = 1.0
 
+    # -- Lateral-alignment shaping and premature-close penalty (2026-09-03,
+    # after run8) -- see this module's docstring for the full story: run8
+    # (this reward, plus the between-jaws fix above) got the arm reaching
+    # and touching purposefully, but video review showed a specific,
+    # correctable pattern -- it approaches from directly above and pokes
+    # the cube with one fingertip, never straddling it, and separately
+    # closes the gripper almost immediately on approach rather than
+    # waiting until positioned. Two gaps, not one: is_between_jaws() is a
+    # binary gate with no gradient leading up to it (nothing rewards
+    # IMPROVING alignment, only fully achieving it), and nothing
+    # discourages closing at the wrong time in the first place.
+    #
+    # How close (spatially) the gripper must be before the lateral-
+    # alignment shaping activates at all -- deliberately a bit LOOSER than
+    # touch_threshold (0.08), so the gradient can start pulling the
+    # approach into alignment slightly before contact, not only after.
+    align_activation_range: float = 0.10
+    # Weight for the alignment shaping term. Smaller than reach_weight
+    # (1.0) on purpose -- this is a secondary, fine-grained refinement
+    # signal layered on top of the primary reach shaping once already
+    # close, not meant to compete with or override it.
+    lateral_align_weight: float = 0.5
+    # Saturation scale for the lateral potential -- about 2x
+    # grasp_lateral_threshold (0.02), so the potential is still
+    # meaningfully below its max right at the threshold boundary, giving
+    # a smooth gradient leading up to it rather than a hard cliff.
+    align_scale: float = 0.04
+    # Penalty (not potential-based -- see compute_reward()'s docstring for
+    # why an absolute-value penalty is fine here, unlike the original
+    # reward-hacking mechanism) for being closed while NOT correctly
+    # positioned (is_between_jaws() false) and not yet holding. Directly
+    # targets the "closes almost immediately" behavior observed in run8's
+    # video -- previously nothing discouraged this at all, since closing
+    # early was simply neutral (no reward, no cost) rather than actively
+    # discouraged. Comparable in scale to touch_bonus (0.3), enough to
+    # matter without destabilizing everything else.
+    premature_close_weight: float = 0.3
+
     # -- One-time milestone bonuses (sparse), each firing exactly once
     # per episode, the step its condition is first met. Layered on top of
     # the continuous potential-based shaping above, not a substitute for
@@ -352,6 +424,34 @@ def _gripper_close_potential(joint_pos, cfg: PickPlaceRewardConfig):
     return max(0.0, min(1.0, frac))
 
 
+def _lateral_potential(lateral, cfg: PickPlaceRewardConfig):
+    """Bounded (0, 1) potential for the lateral-alignment shaping term --
+    1 when perfectly centered (lateral=0), ~0 once lateral >> align_scale.
+    Same shape/role as _potential() above, kept separate since it has its
+    own dedicated scale (align_scale, not reach/place_scale)."""
+    return 1.0 - _tanh(lateral / cfg.align_scale)
+
+
+def _jaw_offsets(gripper_pos, gripper_quat, cube_pos):
+    """Decomposes the cube's position relative to the jaw pivot
+    (gripper_pos) into (axial, lateral) components along the gripper's
+    live approach axis (jaw_approach_axis_world()) -- shared by
+    is_between_jaws() (thresholds both into a single pass/fail) and
+    compute_reward()'s continuous lateral-alignment shaping (uses the raw
+    `lateral` value directly). See is_between_jaws()'s docstring for what
+    these two components mean physically.
+
+    Returns:
+        (axial, lateral) -- both floats, in meters.
+    """
+    axis = jaw_approach_axis_world(gripper_quat)
+    to_cube = tuple(c - g for c, g in zip(cube_pos, gripper_pos))
+    axial = sum(t * a for t, a in zip(to_cube, axis))
+    lateral_vec = tuple(t - axial * a for t, a in zip(to_cube, axis))
+    lateral = _norm3(lateral_vec)
+    return axial, lateral
+
+
 def is_between_jaws(gripper_pos, gripper_quat, cube_pos, cfg: PickPlaceRewardConfig) -> bool:
     """True if the cube is positioned in front of the jaws, roughly
     centered along the direction the gripper is currently reaching --
@@ -396,11 +496,7 @@ def is_between_jaws(gripper_pos, gripper_quat, cube_pos, cfg: PickPlaceRewardCon
         True if the cube lies within the reach-and-lateral cone in front
         of the jaws.
     """
-    axis = jaw_approach_axis_world(gripper_quat)
-    to_cube = tuple(c - g for c, g in zip(cube_pos, gripper_pos))
-    axial = sum(t * a for t, a in zip(to_cube, axis))
-    lateral_vec = tuple(t - axial * a for t, a in zip(to_cube, axis))
-    lateral = _norm3(lateral_vec)
+    axial, lateral = _jaw_offsets(gripper_pos, gripper_quat, cube_pos)
     return cfg.grasp_reach_min <= axial <= cfg.grasp_reach_max and lateral <= cfg.grasp_lateral_threshold
 
 
@@ -541,6 +637,7 @@ def compute_reward(
     was_touched: bool,
     prev_dist,
     prev_joint_pos,
+    prev_lateral=None,
     cfg: PickPlaceRewardConfig = PickPlaceRewardConfig(),
 ):
     """Computes one step's scalar reward plus a diagnostics dict.
@@ -605,6 +702,55 @@ def compute_reward(
     re-opening, since that round trip nets zero at best under the
     potential-based formulation, same as any other non-progress.
 
+    ## Lateral-alignment shaping and premature-close penalty (2026-09-03)
+
+    Run8 (this reward, plus the between-jaws fix directly above) got the
+    arm reliably reaching and touching the cube with clear directed
+    intent -- genuine progress -- but direct video review of the best
+    checkpoint showed two specific, correctable problems, neither of which
+    is what "just needs more training" would fix on its own: (1) it
+    approaches from directly above and pokes the cube with one fingertip,
+    never straddling it with both jaws, and (2) it closes the gripper
+    almost immediately on approach, well before it's anywhere near
+    correctly positioned.
+
+    Problem (1)'s root cause: `is_between_jaws()` is a binary gate with no
+    gradient leading up to it -- a policy that improves its lateral
+    alignment from "wildly off" to "almost centered" earns exactly the
+    same (zero) reward as one that doesn't improve at all, right up until
+    the instant it fully qualifies. Added a genuine, POTENTIAL-BASED
+    continuous shaping term over the raw `lateral` offset itself (from
+    `_jaw_offsets()`, the same decomposition `is_between_jaws()` already
+    thresholds) -- `lateral_align_weight * (Phi_lateral(now) -
+    Phi_lateral(prev))`, same delta pattern as everything else, gated on
+    being within `align_activation_range` (looser than touch_threshold, so
+    the gradient starts pulling the approach into alignment a bit before
+    actual contact) and `not holding` (irrelevant once already grasped).
+    This gives the policy continuous credit for genuinely improving its
+    approach angle, not just an all-or-nothing jump at the end.
+
+    Problem (2) is a DIFFERENT kind of gap: not "missing gradient toward a
+    goal," but "nothing discourages an action with no upside and a real
+    downside." Before this, closing the gripper far from the cube was
+    simply NEUTRAL -- no reward, no cost -- so nothing pushed back against
+    whatever noise-driven or under-trained behavior caused it (plausible
+    mechanism: the raised exploration floor, `min_std`, applies uniformly
+    across ALL action dimensions including the gripper, injecting
+    persistent noise into gripper actuation regardless of position, with
+    nothing to counteract it). Added a small, ABSOLUTE (not potential-
+    based) `premature_close_penalty` -- proportional to how closed the
+    gripper is, charged every step it's closed while NOT holding AND NOT
+    between the jaws. Using an absolute value here does NOT reintroduce
+    the original reward-hacking mechanism (see this module's top-level
+    docstring): that problem was specifically about an absolute-value
+    REWARD that could be farmed by occupying a state indefinitely: a pure
+    PENALTY has the opposite incentive structure (minimized by avoiding
+    the state, never maximized by dwelling in it), so there's nothing to
+    exploit by holding still in it. Mutually exclusive with
+    grasp_close_weight by construction (that pays out only when
+    `between_jaws` is true; this penalizes only when it's false), so the
+    two never fight each other the same step.
+
     On top of the continuous shaping, three ONE-TIME milestone bonuses
     fire the step their condition is first met this episode: touch_bonus
     (genuine contact range reached), grasp_bonus (a real hold
@@ -651,18 +797,30 @@ def compute_reward(
             simply stops the term from paying out once holding begins).
             The caller persists whatever this function returns as
             `info["joint_pos"]`.
+        prev_lateral: the `lateral` value THIS function returned in its
+            info dict on the PREVIOUS step, or None if that step wasn't
+            within `align_activation_range` (or this is a fresh episode).
+            Defaults to None (unlike prev_dist/prev_joint_pos, which have
+            no default) purely to keep simple/synthetic call sites (this
+            module's own self-test) from needing to pass it explicitly
+            when not specifically testing this feature -- real callers
+            (pickplace_env.py, validate_reward_function.py) always pass
+            the real persisted value. The caller persists whatever this
+            function returns as `info["lateral"]`.
         cfg: reward configuration/weights.
 
     Returns:
         (reward: float, info: dict) -- info carries the boolean
         holding/touched/grasped/placed/failed/between_jaws flags, the
         individual reward components, `dist` (to be passed back as next
-        step's `prev_dist`), and `joint_pos` (to be passed back as next
-        step's `prev_joint_pos`).
+        step's `prev_dist`), `joint_pos` (to be passed back as next step's
+        `prev_joint_pos`), and `lateral` (to be passed back as next step's
+        `prev_lateral`).
     """
     holding = is_holding(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, was_holding, cfg)
     grasped = is_grasped(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, cfg)
     between_jaws = is_between_jaws(gripper_pos, gripper_quat, cube_pos, cfg)
+    _axial, lateral = _jaw_offsets(gripper_pos, gripper_quat, cube_pos)
     touching_now = is_touching(gripper_pos, cube_pos, cfg)
     touched = touching_now or was_touched
     placed = is_placed(cube_pos, cube_lin_vel, cfg)
@@ -705,6 +863,44 @@ def compute_reward(
     else:
         close_shaping = 0.0
 
+    # Lateral-alignment shaping (added 2026-09-03, see this function's
+    # docstring) -- potential-based, same delta pattern as everything
+    # else, but over the raw `lateral` offset rather than a threshold.
+    # Gated on `not holding` (only relevant while still trying to grasp)
+    # AND being within `align_activation_range` THIS step -- a bit looser
+    # than touch_threshold, so the gradient can start pulling the approach
+    # into alignment slightly before actual contact. `effective_prev_lateral`
+    # follows the exact same "None means no valid comparison" pattern as
+    # `effective_prev_dist` above: forced to None whenever this step isn't
+    # in the activation range (regardless of what the caller passed), so
+    # entering the range for the first time correctly earns zero shaping
+    # (nothing to compare against yet) rather than a bogus delta against a
+    # stale value from outside the range.
+    in_align_zone = (not holding) and (dist <= cfg.align_activation_range)
+    effective_prev_lateral = prev_lateral if in_align_zone else None
+    if effective_prev_lateral is None:
+        align_shaping = 0.0
+    else:
+        align_shaping = cfg.lateral_align_weight * (
+            _lateral_potential(lateral, cfg) - _lateral_potential(effective_prev_lateral, cfg)
+        )
+
+    # Premature-close penalty (added 2026-09-03) -- see this function's
+    # docstring for why an ABSOLUTE (not delta) penalty is fine here,
+    # unlike the original absolute-REWARD hacking mechanism this module
+    # otherwise avoids: this only ever subtracts, so there's nothing to
+    # "farm" by holding a state -- a policy minimizes this by simply not
+    # closing early, not by exploiting it. Gated on `not holding` (once
+    # actually holding, the gripper should obviously stay closed) AND
+    # `not between_jaws` (closing WHILE correctly positioned is exactly
+    # what grasp_close_weight already rewards -- this penalty and that
+    # shaping are mutually exclusive by construction, never both nonzero
+    # the same step).
+    if not holding and not between_jaws:
+        premature_close_penalty = cfg.premature_close_weight * _gripper_close_potential(gripper_joint_pos, cfg)
+    else:
+        premature_close_penalty = 0.0
+
     milestone_bonus = 0.0
     if touching_now and not was_touched:
         milestone_bonus += cfg.touch_bonus
@@ -713,7 +909,7 @@ def compute_reward(
 
     action_penalty = cfg.action_penalty_weight * sum(v * v for v in joint_vel)
 
-    reward = shaping + close_shaping + milestone_bonus - action_penalty
+    reward = shaping + close_shaping + align_shaping + milestone_bonus - action_penalty - premature_close_penalty
     if placed:
         reward += cfg.success_bonus
 
@@ -727,10 +923,13 @@ def compute_reward(
         "failed": failed,
         "dense": shaping,
         "grasp_close": close_shaping,
+        "lateral_align": align_shaping,
+        "premature_close_penalty": premature_close_penalty,
         "milestone_bonus": milestone_bonus,
         "action_penalty": action_penalty,
         "dist": dist,
         "joint_pos": gripper_joint_pos,
+        "lateral": lateral if in_align_zone else None,
     }
     return reward, info
 
@@ -740,7 +939,16 @@ def _self_test():
     cube_at_start = (0.28, 0.0, 0.015)
     zero_vel = (0.0, 0.0, 0.0)
     zero_joint_vel = (0.0,) * 6
-    gripper_open_joint = 1.0  # above gripper_closed_threshold -> not "closed"
+    # The TRUE physical open limit, not just "some value above
+    # gripper_closed_threshold" -- matters now that _gripper_close_potential()
+    # reads the actual joint angle continuously (grasp_close_weight,
+    # premature_close_penalty), not just the old binary closed/not-closed
+    # cutoff. Using anything less than fully open would register as
+    # PARTIALLY closed on that continuous scale, incorrectly triggering
+    # premature_close_penalty in tests that were never meant to exercise
+    # it (caught by an actual test failure: test 1 unexpectedly returned
+    # a nonzero reward with the old placeholder value of 1.0).
+    gripper_open_joint = cfg.gripper_joint_open_limit
     gripper_closed_joint = -0.1  # below gripper_closed_threshold -> "closed"
     F = False  # was_holding/was_touched=False, prev_dist=None -- a "fresh" (first-step) call
     # Identity rotation throughout tests 1-13 below -- every gripper/cube
@@ -753,6 +961,12 @@ def _self_test():
     # geometry and construct their own vectors relative to the actual
     # jaw_approach_axis_world() direction.
     Q = (1.0, 0.0, 0.0, 0.0)
+    # Every call below passes `cfg=cfg` as a KEYWORD, never positionally,
+    # deliberately -- compute_reward() has two optional trailing params
+    # (`prev_lateral`, then `cfg`), and passing cfg positionally would
+    # silently bind it to `prev_lateral` instead the moment any earlier
+    # positional argument shifted (exactly what happened when
+    # `prev_lateral` was first added -- caught before it ever shipped).
 
     # 1. With no previous distance (fresh call), shaping is always zero --
     #    there's nothing to compare against yet. This replaces the old
@@ -760,13 +974,13 @@ def _self_test():
     #    ABSOLUTE reward's dependence on distance -- meaningless now that
     #    reward depends on the CHANGE in distance, not its current value.
     far_fresh, info_far_fresh = compute_reward(
-        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg
+        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg=cfg
     )
     # Deliberately just outside touch_threshold (dist ~0.10m > 0.08m), so
     # this isolates the shaping-only property without also tripping
     # touch_bonus -- that's covered separately by test 12 below.
     near_fresh, info_near_fresh = compute_reward(
-        (0.18, 0.0, 0.015), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg
+        (0.18, 0.0, 0.015), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg=cfg
     )
     assert not info_near_fresh["touched"], "test setup error: this point must be outside touch range"
     assert info_far_fresh["dense"] == 0.0 and info_near_fresh["dense"] == 0.0, (info_far_fresh, info_near_fresh)
@@ -779,12 +993,12 @@ def _self_test():
     #    decent position) impossible now -- only CHANGING distance pays.
     d = _dist3((0.1, 0.1, 0.1), cube_at_start)
     _, info_still_far = compute_reward(
-        (0.1, 0.1, 0.1), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, d, None, cfg
+        (0.1, 0.1, 0.1), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, d, None, cfg=cfg
     )
     assert info_still_far["dense"] == 0.0, "holding still at a FAR distance must earn zero shaping reward"
     d_close = _dist3(cube_at_start, cube_at_start)
     _, info_still_close = compute_reward(
-        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, d_close, None, cfg
+        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, d_close, None, cfg=cfg
     )
     assert info_still_close["dense"] == 0.0, "holding still EVEN AT THE CUBE must earn zero shaping reward"
 
@@ -792,12 +1006,12 @@ def _self_test():
     #    positive shaping; moving away must earn negative shaping.
     prev_d = _dist3((0.0, 0.0, 0.3), cube_at_start)
     _, info_closer = compute_reward(
-        (0.27, 0.0, 0.02), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, prev_d, None, cfg
+        (0.27, 0.0, 0.02), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, prev_d, None, cfg=cfg
     )
     assert info_closer["dense"] > 0.0, "moving closer since last step must earn positive shaping"
     prev_d2 = _dist3((0.27, 0.0, 0.02), cube_at_start)
     _, info_farther = compute_reward(
-        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, prev_d2, None, cfg
+        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, prev_d2, None, cfg=cfg
     )
     assert info_farther["dense"] < 0.0, "moving farther since last step must earn negative shaping"
 
@@ -806,7 +1020,7 @@ def _self_test():
     #    regardless of joint angle, but this also checks the joint gate
     #    directly: closed-but-not-lifted should also not count as holding).
     _, info = compute_reward(
-        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg
+        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg=cfg
     )
     assert not info["holding"], info
     lifted_but_open = (0.28, 0.0, 0.10)
@@ -814,7 +1028,7 @@ def _self_test():
     # and cube coincide (dist=0, within touch_threshold), so this is also
     # the natural point to establish touched=True before grasping.
     _, info_touch_step = compute_reward(
-        lifted_but_open, Q, lifted_but_open, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg
+        lifted_but_open, Q, lifted_but_open, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg=cfg
     )
     assert not info_touch_step["holding"], "lifted with an open gripper should not count as holding"
     assert info_touch_step["touched"] and info_touch_step["milestone_bonus"] == cfg.touch_bonus, info_touch_step
@@ -828,7 +1042,7 @@ def _self_test():
     lifted = (0.28, 0.0, 0.10)
     _, info = compute_reward(
         lifted, Q, lifted, zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, info_touch_step["touched"], info_touch_step["dist"], None, cfg,
+        F, info_touch_step["touched"], info_touch_step["dist"], None, cfg=cfg,
     )
     assert info["holding"] and info["phase"] == "transport", info
     assert info["milestone_bonus"] == cfg.grasp_bonus, "first step of holding must fire grasp_bonus exactly, not touch_bonus again"
@@ -841,7 +1055,7 @@ def _self_test():
     #     here), removing any reason to delay finishing.
     _, info_still_holding = compute_reward(
         lifted, Q, lifted, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, info["touched"], info["dist"], None, cfg,
+        True, info["touched"], info["dist"], None, cfg=cfg,
     )
     assert info_still_holding["holding"] and info_still_holding["milestone_bonus"] == 0.0, (
         "grasp_bonus must fire only once, not every step holding continues"
@@ -857,7 +1071,7 @@ def _self_test():
     gripper_far_away = (-0.1, 0.3, 0.15)
     _, info = compute_reward(
         gripper_far_away, Q, cube_barely_elevated, zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, F, None, None, cfg,
+        F, F, None, None, cfg=cfg,
     )
     assert not info["holding"], "closed gripper far from a barely-elevated cube must not count as holding"
 
@@ -870,12 +1084,12 @@ def _self_test():
     # lowered onto the target, despite the height drop.
     _, info_step1 = compute_reward(
         (0.28, 0.0, 0.10), Q, (0.28, 0.0, 0.10), zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, F, None, None, cfg,
+        F, F, None, None, cfg=cfg,
     )
     assert info_step1["holding"], "step 1 should establish a genuine hold while elevated"
     _, info_step2 = compute_reward(
         cfg.target_pos, Q, cfg.target_pos, zero_vel, gripper_closed_joint, zero_joint_vel,
-        info_step1["holding"], info_step1["touched"], info_step1["dist"], None, cfg,
+        info_step1["holding"], info_step1["touched"], info_step1["dist"], None, cfg=cfg,
     )
     assert info_step2["holding"] and info_step2["phase"] == "transport", (
         "still-closed gripper lowering an already-held cube onto the target must stay in the "
@@ -893,7 +1107,7 @@ def _self_test():
     # with was_holding=True carried in from the previous step.
     _, info_released = compute_reward(
         cfg.target_pos, Q, cfg.target_pos, zero_vel, gripper_open_joint, zero_joint_vel,
-        True, True, 0.0, None, cfg,
+        True, True, 0.0, None, cfg=cfg,
     )
     assert not info_released["holding"], "an opened gripper must not count as holding regardless of was_holding"
 
@@ -916,11 +1130,11 @@ def _self_test():
     assert abs(_dist3(horizontal_step_pos, cfg.target_pos) - d1) < 1e-9
     _, info_vertical = compute_reward(
         vertical_step_pos, Q, vertical_step_pos, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, start_dist, None, cfg,
+        True, True, start_dist, None, cfg=cfg,
     )
     _, info_horizontal = compute_reward(
         horizontal_step_pos, Q, horizontal_step_pos, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, start_dist, None, cfg,
+        True, True, start_dist, None, cfg=cfg,
     )
     assert abs(info_vertical["dense"] - info_horizontal["dense"]) < 1e-9, (
         info_vertical["dense"], info_horizontal["dense"],
@@ -929,23 +1143,23 @@ def _self_test():
     # 10. Success bonus only fires when actually placed (at rest, at the target).
     reward_at_target_still, info = compute_reward(
         cfg.target_pos, Q, cfg.target_pos, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, 0.05, None, cfg,
+        True, True, 0.05, None, cfg=cfg,
     )
     assert info["placed"], info
     fast_vel = (1.0, 0.0, 0.0)  # swinging through, not resting
     reward_at_target_moving, info = compute_reward(
         cfg.target_pos, Q, cfg.target_pos, fast_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, 0.05, None, cfg,
+        True, True, 0.05, None, cfg=cfg,
     )
     assert not info["placed"], "fast-moving cube passing through the target should not count as placed"
     assert reward_at_target_still > reward_at_target_moving + cfg.success_bonus - 0.1
 
     # 11. Action penalty must reduce reward, all else equal.
     still = compute_reward(
-        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, 0.0, None, cfg
+        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, 0.0, None, cfg=cfg
     )[0]
     moving = compute_reward(
-        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, (5.0,) * 6, F, F, 0.0, None, cfg
+        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, (5.0,) * 6, F, F, 0.0, None, cfg=cfg
     )[0]
     assert moving < still, (moving, still)
 
@@ -954,12 +1168,12 @@ def _self_test():
     near_cube = (0.29, 0.0, 0.02)  # within touch_threshold of cube_at_start but not holding (gripper open)
     assert _dist3(near_cube, cube_at_start) < cfg.touch_threshold
     _, info_first_touch = compute_reward(
-        near_cube, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg
+        near_cube, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg=cfg
     )
     assert info_first_touch["touched"] and info_first_touch["milestone_bonus"] == cfg.touch_bonus, info_first_touch
     _, info_second_touch = compute_reward(
         near_cube, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, info_first_touch["touched"], info_first_touch["dist"], None, cfg,
+        F, info_first_touch["touched"], info_first_touch["dist"], None, cfg=cfg,
     )
     assert info_second_touch["milestone_bonus"] == 0.0, "touch_bonus must fire only once, not every step touching"
 
@@ -1020,7 +1234,7 @@ def _self_test():
     assert cube_beside[2] - cfg.table_z > cfg.lift_threshold, "test setup: must satisfy the height check too"
     assert not is_between_jaws(lifted, Q, cube_beside, cfg), "test setup: must fail the new geometric check"
     _, info_beside = compute_reward(
-        lifted, Q, cube_beside, zero_vel, gripper_closed_joint, zero_joint_vel, F, F, None, None, cfg
+        lifted, Q, cube_beside, zero_vel, gripper_closed_joint, zero_joint_vel, F, F, None, None, cfg=cfg
     )
     assert not info_beside["holding"], (
         "run7 regression: a closed gripper positioned BESIDE the cube (not around it) must not "
@@ -1041,7 +1255,7 @@ def _self_test():
     cube_far_axis = tuple(lifted[i] + 0.08 * axis[i] for i in range(3))
     _, info_close_far = compute_reward(
         lifted, Q, cube_far_axis, zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, F, None, gripper_open_joint, cfg,
+        F, F, None, gripper_open_joint, cfg=cfg,
     )
     assert not info_close_far["between_jaws"], "test setup: must be outside the between-jaws zone"
     assert info_close_far["grasp_close"] == 0.0, "closing motion outside the between-jaws zone must earn nothing"
@@ -1058,7 +1272,7 @@ def _self_test():
     assert partially_closed_joint > cfg.gripper_closed_threshold, "test setup: must not count as closed yet"
     _, info_closing = compute_reward(
         lifted, Q, cube_between, zero_vel, partially_closed_joint, zero_joint_vel,
-        F, F, None, gripper_open_joint, cfg,
+        F, F, None, gripper_open_joint, cfg=cfg,
     )
     assert info_closing["between_jaws"], "test setup: must be a valid between-jaws position"
     assert not info_closing["holding"], "test setup: must not yet be closed enough to establish holding"
@@ -1069,7 +1283,7 @@ def _self_test():
     # partially-closed value for the same reason as 16b.
     _, info_still_closed = compute_reward(
         lifted, Q, cube_between, zero_vel, partially_closed_joint, zero_joint_vel,
-        F, F, None, partially_closed_joint, cfg,
+        F, F, None, partially_closed_joint, cfg=cfg,
     )
     assert info_still_closed["grasp_close"] == 0.0, "no change in closedness must earn zero grasp_close shaping"
 
@@ -1078,7 +1292,7 @@ def _self_test():
     # is genuine potential-based delta shaping, not a one-sided bonus.
     _, info_opening = compute_reward(
         lifted, Q, cube_between, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, F, None, gripper_closed_joint, cfg,
+        F, F, None, gripper_closed_joint, cfg=cfg,
     )
     assert info_opening["grasp_close"] < 0.0, "opening while between the jaws must earn negative shaping"
 
@@ -1087,15 +1301,140 @@ def _self_test():
     # already-closed gripper during transport.
     _, info_holding_close = compute_reward(
         lifted, Q, cube_between, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, None, gripper_open_joint, cfg,
+        True, True, None, gripper_open_joint, cfg=cfg,
     )
     assert info_holding_close["holding"], "test setup: must already be holding"
     assert info_holding_close["grasp_close"] == 0.0, "grasp_close must not pay out once already holding"
+
+    # -- Premature-close penalty (2026-09-03) --
+
+    # 17a. Closed gripper FAR from the cube (not between the jaws, not yet
+    # holding) must incur the penalty -- this is exactly the "closes
+    # almost immediately, without waiting" behavior observed in run8's
+    # video, which previously earned neither reward nor penalty.
+    _, info_premature = compute_reward(
+        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_closed_joint, zero_joint_vel,
+        F, F, None, None, cfg=cfg,
+    )
+    assert not info_premature["between_jaws"], "test setup: must be far outside the between-jaws zone"
+    assert not info_premature["holding"], "test setup: must not be holding"
+    assert info_premature["premature_close_penalty"] > 0.0, (
+        "closing far from the cube, not between the jaws, must incur the premature-close penalty"
+    )
+
+    # 17b. Open gripper FAR from the cube -> zero penalty (an open gripper
+    # is never "prematurely closed," regardless of position).
+    _, info_open_far = compute_reward(
+        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, cfg=cfg,
+    )
+    assert info_open_far["premature_close_penalty"] == 0.0, "an OPEN gripper must never incur the premature-close penalty"
+
+    # 17c. Closed (or closing) WHILE genuinely between the jaws -> zero
+    # penalty -- this is exactly what grasp_close_weight rewards instead;
+    # the two are mutually exclusive by construction (gated on
+    # between_jaws being False vs. True respectively), never both nonzero
+    # the same step. Reuses `cube_between`/`partially_closed_joint` from
+    # test 16b so `holding` stays False (isolating the gate on
+    # `between_jaws`, not on `holding`).
+    _, info_between_no_penalty = compute_reward(
+        lifted, Q, cube_between, zero_vel, partially_closed_joint, zero_joint_vel,
+        F, F, None, None, cfg=cfg,
+    )
+    assert info_between_no_penalty["between_jaws"], "test setup: must be a valid between-jaws position"
+    assert not info_between_no_penalty["holding"], "test setup: must not yet be closed enough to establish holding"
+    assert info_between_no_penalty["premature_close_penalty"] == 0.0, (
+        "closing while correctly positioned must never incur the premature-close penalty"
+    )
+
+    # 17d. Once already holding, zero penalty regardless of between_jaws --
+    # gated on `not holding` first, same as grasp_close_weight.
+    _, info_holding_no_penalty = compute_reward(
+        lifted, Q, cube_between, zero_vel, gripper_closed_joint, zero_joint_vel,
+        True, True, None, None, cfg=cfg,
+    )
+    assert info_holding_no_penalty["holding"], "test setup: must already be holding"
+    assert info_holding_no_penalty["premature_close_penalty"] == 0.0, (
+        "premature_close_penalty must never apply once already holding"
+    )
+
+    # -- Lateral-alignment shaping (2026-09-03) --
+    # `gripper_touch_pos`/`cube_lat_far`/`cube_lat_near` share the same
+    # axial offset (0.03m along the approach axis) but differ in lateral
+    # offset -- both well within align_activation_range (0.10m) of each
+    # other, so both scenarios are genuinely "in the activation zone."
+    gripper_touch_pos = pivot
+    cube_lat_far = tuple(pivot[i] + 0.03 * axis[i] + 0.03 * perp_unit[i] for i in range(3))
+    cube_lat_near = tuple(pivot[i] + 0.03 * axis[i] + 0.005 * perp_unit[i] for i in range(3))
+    assert _dist3(gripper_touch_pos, cube_lat_far) <= cfg.align_activation_range, "test setup: must be in the activation zone"
+    assert _dist3(gripper_touch_pos, cube_lat_near) <= cfg.align_activation_range, "test setup: must be in the activation zone"
+    _, lateral_far = _jaw_offsets(gripper_touch_pos, Q, cube_lat_far)
+    _, lateral_near = _jaw_offsets(gripper_touch_pos, Q, cube_lat_near)
+    assert lateral_near < lateral_far, "test setup: must genuinely differ in lateral offset"
+
+    # 18a. Fresh entry into the activation zone (prev_lateral=None
+    # explicitly) -> zero shaping, nothing to compare against yet -- same
+    # no-free-lunch-on-entry property as the phase-transition handling for
+    # reach/place shaping (test 1 above).
+    _, info_align_fresh = compute_reward(
+        gripper_touch_pos, Q, cube_lat_far, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, prev_lateral=None, cfg=cfg,
+    )
+    assert info_align_fresh["lateral_align"] == 0.0, "fresh entry into the alignment zone must earn zero shaping"
+
+    # 18b. Improving (lateral offset decreasing since last step) -> positive shaping.
+    _, info_align_improve = compute_reward(
+        gripper_touch_pos, Q, cube_lat_near, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, prev_lateral=lateral_far, cfg=cfg,
+    )
+    assert info_align_improve["lateral_align"] > 0.0, "reducing lateral offset (better centered) must earn positive shaping"
+
+    # 18c. Worsening (lateral offset increasing) -> negative shaping, the
+    # symmetric flip side of 18b.
+    _, info_align_worsen = compute_reward(
+        gripper_touch_pos, Q, cube_lat_far, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, prev_lateral=lateral_near, cfg=cfg,
+    )
+    assert info_align_worsen["lateral_align"] < 0.0, "increasing lateral offset (worse centered) must earn negative shaping"
+
+    # 18d. Unchanged lateral offset -> zero shaping, same no-free-lunch
+    # property as every other potential-based term in this module.
+    _, info_align_same = compute_reward(
+        gripper_touch_pos, Q, cube_lat_far, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, prev_lateral=lateral_far, cfg=cfg,
+    )
+    assert info_align_same["lateral_align"] == 0.0, "unchanged lateral offset must earn zero shaping (no free lunch)"
+
+    # 18e. Outside align_activation_range -> zero shaping regardless of
+    # prev_lateral, even a suspiciously "perfect" one -- confirms the gate
+    # is genuinely enforced, not just incidentally zero because no prior
+    # value happened to be passed.
+    _, info_align_far_away = compute_reward(
+        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, prev_lateral=0.001, cfg=cfg,
+    )
+    assert info_align_far_away["lateral_align"] == 0.0, (
+        "outside the activation range, alignment shaping must not apply regardless of prev_lateral"
+    )
+
+    # 18f. Once already holding, zero shaping regardless of anything else
+    # -- gated on `not holding` (mirrors dist's own phase switch: once
+    # holding, `dist` means cube-to-target, not gripper-to-cube, so
+    # in_align_zone is automatically False via the `not holding` term
+    # alone, with no separate special-casing needed).
+    _, info_align_holding = compute_reward(
+        lifted, Q, cube_between, zero_vel, gripper_closed_joint, zero_joint_vel,
+        True, True, None, None, prev_lateral=1.0, cfg=cfg,
+    )
+    assert info_align_holding["holding"], "test setup: must already be holding"
+    assert info_align_holding["lateral_align"] == 0.0, "alignment shaping must not apply once already holding"
 
     print("[OK] pickplace_reward self-test passed")
     print(f"  closer_shaping={info_closer['dense']:+.4f} farther_shaping={info_farther['dense']:+.4f}")
     print(f"  grasp_bonus_once={info['holding']} reward_at_target_still={reward_at_target_still:.3f}")
     print(f"  grasp_close_closing={info_closing['grasp_close']:+.4f} grasp_close_opening={info_opening['grasp_close']:+.4f}")
+    print(f"  premature_close_penalty={info_premature['premature_close_penalty']:+.4f}")
+    print(f"  lateral_align_improve={info_align_improve['lateral_align']:+.4f} lateral_align_worsen={info_align_worsen['lateral_align']:+.4f}")
 
 
 if __name__ == "__main__":

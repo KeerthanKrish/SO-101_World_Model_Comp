@@ -117,6 +117,16 @@ parser.add_argument(
     "--checkpoint-dir", type=str, default="/home/keerthan/SO-101-WM/sim/output/tdmpc2_checkpoints",
     help="Where to save agent checkpoints (one per eval checkpoint, plus a final one).",
 )
+parser.add_argument(
+    "--resume-from", type=str, default=None,
+    help="Warm-start from a saved agent checkpoint (TDMPC2.save()'s own format) instead of training from "
+    "scratch. Loads model weights only -- the replay buffer is NOT restored (TDMPC2.save() never saved "
+    "it), so this run still starts with an empty buffer and collects its own fresh experience; only the "
+    "encoder/dynamics/reward/value/policy networks carry over. Pair with a much smaller --seed-episodes "
+    "than a from-scratch run -- the resumed policy already knows how to act, so there's little value in "
+    "a long pure-random warmup, and every step of it is wasted opportunity to build on what's already "
+    "learned.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -428,6 +438,15 @@ def main():
     os.makedirs(args_cli.checkpoint_dir, exist_ok=True)
 
     agent = TDMPC2(cfg)
+    if args_cli.resume_from is not None:
+        # Weights only -- see --resume-from's own help text for why the
+        # buffer isn't (and can't be) restored. Must happen AFTER
+        # TDMPC2(cfg) constructs the network (agent.load() loads INTO the
+        # existing model, matching TDMPC2.save()/.load()'s own save-format
+        # -- see tdmpc2/tdmpc2/tdmpc2.py) and BEFORE the training loop
+        # below starts using the agent at all.
+        agent.load(args_cli.resume_from)
+        print(f"[INFO] Resumed agent weights from {args_cli.resume_from}")
     buffer = Buffer(cfg)
     logger = Logger(cfg)
     print(agent.model)
