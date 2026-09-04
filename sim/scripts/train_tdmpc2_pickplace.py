@@ -111,11 +111,24 @@ parser.add_argument(
     "See build_cfg()'s docstring for why this was raised. Omit to keep tdmpc2's own default.",
 )
 parser.add_argument(
-    "--video-dir", type=str, default="/home/keerthan/SO-101-WM/sim/output/tdmpc2_eval_videos", help="Eval video output dir."
+    "--video-dir", type=str, default="/home/keerthan/SO-101-WM/sim/output/tdmpc2_eval_videos",
+    help="Base eval video directory -- each run writes into its own --run-name subfolder under this, "
+    "never directly into it. See --run-name.",
 )
 parser.add_argument(
     "--checkpoint-dir", type=str, default="/home/keerthan/SO-101-WM/sim/output/tdmpc2_checkpoints",
-    help="Where to save agent checkpoints (one per eval checkpoint, plus a final one).",
+    help="Base checkpoint directory -- same --run-name subfolder convention as --video-dir.",
+)
+parser.add_argument(
+    "--run-name", type=str, default=None,
+    help="Name of the subfolder under --video-dir/--checkpoint-dir this run writes into (e.g. 'run10'). "
+    "Defaults to an auto-generated timestamp (run_YYYYMMDD_HHMMSS) if omitted, which is guaranteed unique "
+    "-- pass an explicit name for something more readable, but only if you're sure it won't collide with "
+    "an existing run's name (nothing checks that for you). Added 2026-09-04 after discovering that eval "
+    "steps 2994/5489/... 45409 etc. recur across many runs sharing the same episode length/eval cadence, "
+    "which had been silently overwriting earlier runs' videos and checkpoints at those exact filenames for "
+    "days -- runs 2, 3, 4, 6, and 7's raw output files were lost this way before it was caught. See "
+    "docs/decisions.md.",
 )
 parser.add_argument(
     "--resume-from", type=str, default=None,
@@ -136,6 +149,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import shutil
+from datetime import datetime
 from time import time
 
 import torch
@@ -434,8 +448,19 @@ def main():
     base_env.scene["scene_camera"].set_world_poses_from_view(
         torch.tensor([[0.6, -0.6, 0.5]], device=base_env.device), torch.tensor([[0.15, 0.0, 0.05]], device=base_env.device)
     )
-    os.makedirs(args_cli.video_dir, exist_ok=True)
-    os.makedirs(args_cli.checkpoint_dir, exist_ok=True)
+    # Every run gets its own subfolder -- never written directly into
+    # --video-dir/--checkpoint-dir. See --run-name's own help text for
+    # why: eval steps recur across runs sharing the same episode length/
+    # eval cadence (most of them do), and writing flat silently overwrote
+    # earlier runs' videos/checkpoints at those exact filenames for days
+    # before it was caught -- runs 2, 3, 4, 6, and 7's raw outputs were
+    # lost this way.
+    run_name = args_cli.run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_video_dir = os.path.join(args_cli.video_dir, run_name)
+    run_checkpoint_dir = os.path.join(args_cli.checkpoint_dir, run_name)
+    print(f"[INFO] run_name={run_name} (video_dir={run_video_dir} checkpoint_dir={run_checkpoint_dir})")
+    os.makedirs(run_video_dir, exist_ok=True)
+    os.makedirs(run_checkpoint_dir, exist_ok=True)
 
     agent = TDMPC2(cfg)
     if args_cli.resume_from is not None:
@@ -465,14 +490,14 @@ def main():
                       f"(len={len(tds)}, reward_sum={sum(td['reward'].item() for td in tds[1:]):.3f})")
 
             if not args_cli.smoke_test and step >= next_eval_at:
-                video_path = os.path.join(args_cli.video_dir, f"eval_step_{step:06d}.mp4")
+                video_path = os.path.join(run_video_dir, f"eval_step_{step:06d}.mp4")
                 eval_reward, eval_success, eval_touched, eval_held, eval_between_jaws = run_eval_episode(
                     env, base_env, agent, cfg, video_path
                 )
                 print(f"[INFO] step {step}: EVAL episode -- reward={eval_reward:+.3f} "
                       f"success={eval_success} touched={eval_touched} between_jaws={eval_between_jaws} "
                       f"held={eval_held} video={video_path}")
-                ckpt_path = os.path.join(args_cli.checkpoint_dir, f"agent_step_{step:06d}.pt")
+                ckpt_path = os.path.join(run_checkpoint_dir, f"agent_step_{step:06d}.pt")
                 agent.save(ckpt_path)
                 print(f"[INFO] step {step}: checkpoint saved to {ckpt_path}")
                 next_eval_at += args_cli.eval_every
@@ -508,7 +533,7 @@ def main():
     elapsed = time() - start
     label = "smoke test" if args_cli.smoke_test else "training run"
     if not args_cli.smoke_test:
-        final_ckpt = os.path.join(args_cli.checkpoint_dir, f"agent_step_{step:06d}_final.pt")
+        final_ckpt = os.path.join(run_checkpoint_dir, f"agent_step_{step:06d}_final.pt")
         agent.save(final_ckpt)
         print(f"[RESULT] Final checkpoint saved to {final_ckpt}")
     print(f"\n[RESULT] === TD-MPC2 {label} summary ===")
