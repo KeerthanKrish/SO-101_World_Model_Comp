@@ -166,6 +166,58 @@ Two different gaps, fixed together (full mechanism and reasoning in
    is minimized by avoiding a state, never maximized by dwelling in it
    (the opposite incentive structure from the absolute-value REWARD that
    caused the original exploit).
+
+## Closing-focused redesign (2026-09-05)
+
+Run9 (the above) and run10 (a since-reverted attempt at an axial-alignment
+term, `axial_align_weight` -- it didn't help and added complexity without
+addressing the real problem, so it was fully reverted rather than kept
+alongside this fix) were both reviewed frame-by-frame across multiple full
+eval episodes. The finding was consistent and stark: the gripper never
+closed even once, in any sampled frame, in any reviewed episode, across
+either run. The arm reaches toward the cube within the first 1-2 seconds
+of a ~25s episode, then FREEZES in a static contact pose for the rest of
+the episode regardless of what happens next (sometimes the cube stays
+wedged near the jaws' pivot, sometimes it gets pushed completely out of
+reach and the arm just keeps reaching at empty space) -- an open-loop
+"dive and freeze" reflex, not a closed-loop behavior that reacts to where
+the cube actually ends up.
+
+Root cause, once `is_between_jaws()`'s actual trigger rate was examined
+against where contact was really happening: the cube kept landing right
+at/beyond the OLD `grasp_reach_min` (-0.01) boundary -- wedged near the
+pivot, not out toward the fingertips -- meaning `is_between_jaws()` was
+almost never true at the policy's actual contact point. That starves
+`grasp_close_weight` of any chance to fire, while `premature_close_weight`
+(gated on `not between_jaws`) fires on nearly every step the gripper has
+any closedness at all, since "not between jaws" is the overwhelmingly
+common case. Reward far more often for NOT closing than for closing is
+exactly a "never close" training signal -- and that's exactly what came
+out the other end.
+
+Three changes, all targeting this one mechanism, none touching the
+reach/lateral-alignment machinery above (which the video review confirmed
+is working -- the arm reaches with clear, directed intent; only the close
+decision itself is broken):
+
+1. `grasp_reach_min` widened from -0.01 to -0.04 -- actually covers the
+   observed contact point, so `is_between_jaws()` (and therefore
+   `grasp_close_weight`) can fire at all under the policy's real behavior,
+   not just under an idealized "well past the pivot" assumption.
+2. `grasp_close_weight` raised from 1.0 to 2.5 -- once reachable, make it
+   an unmistakably dominant signal on the steps it does fire, not merely
+   equal in magnitude to reach/place.
+3. `premature_close_weight` lowered from 0.3 to 0.1 -- still discourages
+   closing nowhere near the cube at all (the original run8 behavior this
+   term targets), just no longer strong enough to outweigh a genuine,
+   now-reachable grasp_close_weight signal.
+
+Deliberately NOT changed: `lateral_align_weight`, `align_activation_range`,
+`align_scale`, `reach_weight`/`reach_scale`, `place_weight`/`place_scale`.
+This is a narrow, hypothesis-driven fix at the one identified mechanism,
+not a broader re-tune -- if closing still doesn't happen after this, that
+argues for a different cause (e.g. insufficient exploration of the
+gripper action dimension specifically) rather than more weight-tweaking.
 """
 
 import os
@@ -272,7 +324,19 @@ class PickPlaceRewardConfig:
     # smaller than touch_threshold (0.08) and grasp_proximity_threshold
     # (0.05), since "within reach along the correct axis" should be a
     # STRICTER bar than either of those, not a looser one.
-    grasp_reach_min: float = -0.01  # small tolerance for the cube being just barely behind the pivot
+    #
+    # grasp_reach_min widened from -0.01 to -0.04 (2026-09-05, run10
+    # closing-focused redesign -- see this module's docstring's "Closing
+    # never happens" section below). Run10's videos showed the arm
+    # consistently wedging the cube in right at/just past the OLD -0.01
+    # boundary (buried near the jaws' own pivot) and then simply freezing
+    # there -- meaning is_between_jaws() was almost never true at the
+    # actual contact point the policy kept producing, so grasp_close_weight
+    # essentially never got a chance to fire. This widens the window to
+    # actually cover that observed contact point, without touching
+    # grasp_reach_max or grasp_lateral_threshold (the axial-near-pivot case
+    # is the one directly evidenced in run10's video, not a lateral one).
+    grasp_reach_min: float = -0.04
     grasp_reach_max: float = 0.05  # meters -- roughly the fingers' own reach past the pivot
     # How far off the approach axis the cube may sit and still count as
     # "centered between the jaws" -- a bit more than the cube's own half-
@@ -309,10 +373,20 @@ class PickPlaceRewardConfig:
     # the gripper's OWN closedness (see _gripper_close_potential()) rather
     # than a spatial distance -- and GATED on is_between_jaws(), so closing
     # only ever pays off while the cube is actually positioned correctly
-    # (see compute_reward()'s docstring). Weight 1.0, same order of
-    # magnitude as reach/place, since this is meant to compete on equal
-    # footing with them, not as an afterthought.
-    grasp_close_weight: float = 1.0
+    # (see compute_reward()'s docstring).
+    #
+    # Raised from 1.0 to 2.5 (2026-09-05, run10 closing-focused redesign,
+    # alongside widening grasp_reach_min -- see this module's docstring).
+    # Across run8/9/10, the gripper NEVER closed even once in any reviewed
+    # eval video -- with is_between_jaws() rarely true at the policy's
+    # actual contact point, this term almost never got to fire at all,
+    # while premature_close_weight below fired constantly (closed gripper,
+    # not between jaws, is the common case). That asymmetry taught "never
+    # close" as the safe default. Now that grasp_reach_min actually covers
+    # the observed contact point, this also needs to be a strong, clearly
+    # dominant signal on the occasions it fires -- 2.5x reach/place's own
+    # weight, not merely equal to it.
+    grasp_close_weight: float = 2.5
 
     # -- Lateral-alignment shaping and premature-close penalty (2026-09-03,
     # after run8) -- see this module's docstring for the full story: run8
@@ -348,9 +422,19 @@ class PickPlaceRewardConfig:
     # targets the "closes almost immediately" behavior observed in run8's
     # video -- previously nothing discouraged this at all, since closing
     # early was simply neutral (no reward, no cost) rather than actively
-    # discouraged. Comparable in scale to touch_bonus (0.3), enough to
-    # matter without destabilizing everything else.
-    premature_close_weight: float = 0.3
+    # discouraged.
+    #
+    # Lowered from 0.3 to 0.1 (2026-09-05, run10 closing-focused redesign
+    # -- see this module's docstring and grasp_close_weight above). At 0.3,
+    # combined with is_between_jaws() rarely being true at the policy's
+    # actual contact point, this penalty fired on nearly every step the
+    # gripper had any closedness at all -- while grasp_close_weight almost
+    # never got to reward anything -- teaching "never close" as the
+    # dominant strategy. Still nonzero (still discourages closing while
+    # nowhere near the cube at all, the original run8 behavior this term
+    # targets), just no longer strong enough to outweigh a genuine, now-
+    # reachable grasp_close_weight signal.
+    premature_close_weight: float = 0.1
 
     # -- One-time milestone bonuses (sparse), each firing exactly once
     # per episode, the step its condition is first met. Layered on top of
@@ -1210,7 +1294,9 @@ def _self_test():
     assert is_between_jaws(pivot, Q, cube_valid, cfg), "directly ahead, within reach, zero lateral offset must pass"
     cube_too_far = tuple(pivot[i] + 0.08 * axis[i] for i in range(3))
     assert not is_between_jaws(pivot, Q, cube_too_far, cfg), "past the fingers' own reach must fail"
-    cube_behind = tuple(pivot[i] - 0.03 * axis[i] for i in range(3))
+    # -0.06, not -0.03 -- must clear the WIDENED grasp_reach_min (-0.04,
+    # 2026-09-05) with room to spare, not just the original -0.01.
+    cube_behind = tuple(pivot[i] - 0.06 * axis[i] for i in range(3))
     assert not is_between_jaws(pivot, Q, cube_behind, cfg), "behind the pivot must fail"
     cube_lateral_bad = tuple(pivot[i] + 0.02 * axis[i] + 0.03 * perp_unit[i] for i in range(3))
     assert not is_between_jaws(pivot, Q, cube_lateral_bad, cfg), (
