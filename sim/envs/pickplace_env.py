@@ -224,10 +224,6 @@ class PickPlaceEnv(DirectRLEnv):
         # entry), which is why NaN here always means "no valid previous
         # value," never "was in the zone but happened to be far off-axis."
         self._prev_lateral = torch.full((self.num_envs,), float("nan"), device=self.device)
-        # Same NaN-sentinel pattern again, for compute_reward()'s
-        # axial-alignment shaping term (added 2026-09-04) -- mirrors
-        # _prev_lateral exactly, same reset rules, same reason.
-        self._prev_axial = torch.full((self.num_envs,), float("nan"), device=self.device)
 
     def _setup_scene(self):
         # Everything (robot, cube, table, ground, light, optional cameras)
@@ -310,7 +306,6 @@ class PickPlaceEnv(DirectRLEnv):
             prev_d = self._prev_dist[i].item()
             prev_j = self._prev_joint_pos[i].item()
             prev_lat = self._prev_lateral[i].item()
-            prev_ax = self._prev_axial[i].item()
             reward, info = compute_reward(
                 gripper_pos_local[i].tolist(),
                 gripper_quat[i].tolist(),
@@ -323,7 +318,6 @@ class PickPlaceEnv(DirectRLEnv):
                 None if math.isnan(prev_d) else prev_d,
                 None if math.isnan(prev_j) else prev_j,
                 prev_lateral=None if math.isnan(prev_lat) else prev_lat,
-                prev_axial=None if math.isnan(prev_ax) else prev_ax,
                 cfg=self._reward_cfg,
             )
             rewards[i] = reward
@@ -333,7 +327,6 @@ class PickPlaceEnv(DirectRLEnv):
             self._prev_dist[i] = info["dist"]
             self._prev_joint_pos[i] = info["joint_pos"]
             self._prev_lateral[i] = float("nan") if info["lateral"] is None else info["lateral"]
-            self._prev_axial[i] = float("nan") if info["axial"] is None else info["axial"]
             placed[i] = info["placed"]
             failed[i] = info["failed"]
             touched[i] = info["touched"]
@@ -397,8 +390,6 @@ class PickPlaceEnv(DirectRLEnv):
         self._prev_joint_pos[env_ids] = float("nan")
         # Same reasoning again, for the lateral-alignment shaping term.
         self._prev_lateral[env_ids] = float("nan")
-        # Same reasoning again, for the axial-alignment shaping term.
-        self._prev_axial[env_ids] = float("nan")
 
         cube_x = sample_uniform(self.cfg.cube_x_range[0], self.cfg.cube_x_range[1], (n,), self.device)
         cube_y = sample_uniform(self.cfg.cube_y_range[0], self.cfg.cube_y_range[1], (n,), self.device)
