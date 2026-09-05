@@ -341,6 +341,33 @@ class PickPlaceRewardConfig:
     # meaningfully below its max right at the threshold boundary, giving
     # a smooth gradient leading up to it rather than a hard cliff.
     align_scale: float = 0.04
+    # Axial-alignment shaping (2026-09-04, after run9) -- the direct
+    # sibling of lateral_align_weight above, added for the same reason:
+    # lateral_align_weight shapes the PERPENDICULAR offset continuously,
+    # but is_between_jaws()'s AXIAL check (grasp_reach_min/max) was still
+    # a binary gate with no gradient -- and run9's video showed exactly
+    # this gap being exploited. The gripper WAS open (confirmed on video,
+    # correcting an earlier misreading of a "closed" shape that was
+    # actually just this camera angle on an open V), but the cube ended
+    # up buried near the jaws' PIVOT -- where the reach-axis gap is
+    # narrowest -- rather than out toward the fingertips, where
+    # grasp_reach_min/max actually define a valid window. The likely
+    # cause: reach_weight (below) rewards driving raw distance-to-cube
+    # all the way toward zero, which pulls the pivot itself toward the
+    # cube rather than stopping at the correct standoff distance -- a
+    # policy that's very good at minimizing raw distance is thereby
+    # nudged toward exactly the wrong axial endpoint once already close.
+    # This term gives a dedicated gradient toward the valid window
+    # itself, active in the same activation range as lateral_align_weight
+    # (they're both fine-grained refinements meant to take over once
+    # already generally close, not to fight the primary reach shaping
+    # from far away).
+    axial_align_weight: float = 0.5
+    # Saturation scale for the axial-violation potential -- see
+    # _axial_offset()'s docstring for what "violation" means here (zero
+    # anywhere INSIDE the valid window, not just at one exact point).
+    # Comparable to align_scale, for a similarly-shaped gradient.
+    axial_align_scale: float = 0.04
     # Penalty (not potential-based -- see compute_reward()'s docstring for
     # why an absolute-value penalty is fine here, unlike the original
     # reward-hacking mechanism) for being closed while NOT correctly
@@ -430,6 +457,29 @@ def _lateral_potential(lateral, cfg: PickPlaceRewardConfig):
     Same shape/role as _potential() above, kept separate since it has its
     own dedicated scale (align_scale, not reach/place_scale)."""
     return 1.0 - _tanh(lateral / cfg.align_scale)
+
+
+def _axial_offset(axial, cfg: PickPlaceRewardConfig):
+    """How far `axial` sits OUTSIDE the valid [grasp_reach_min,
+    grasp_reach_max] window -- zero anywhere INSIDE the window (there's
+    no single "best" axial value to chase, any point between the fingers'
+    own reach counts as equally good), positive and growing the further
+    outside it in EITHER direction (too close to the pivot, i.e. buried
+    in the jaws' throat -- or too far past the fingertips)."""
+    if axial < cfg.grasp_reach_min:
+        return cfg.grasp_reach_min - axial
+    if axial > cfg.grasp_reach_max:
+        return axial - cfg.grasp_reach_max
+    return 0.0
+
+
+def _axial_potential(axial, cfg: PickPlaceRewardConfig):
+    """Bounded (0, 1) potential for the axial-alignment shaping term --
+    1 anywhere INSIDE the valid reach window (via _axial_offset()
+    returning 0 there), ~0 once far outside it in either direction. Same
+    role as _lateral_potential() above, mirrored for the axial
+    component."""
+    return 1.0 - _tanh(_axial_offset(axial, cfg) / cfg.axial_align_scale)
 
 
 def _jaw_offsets(gripper_pos, gripper_quat, cube_pos):
@@ -638,6 +688,7 @@ def compute_reward(
     prev_dist,
     prev_joint_pos,
     prev_lateral=None,
+    prev_axial=None,
     cfg: PickPlaceRewardConfig = PickPlaceRewardConfig(),
 ):
     """Computes one step's scalar reward plus a diagnostics dict.
@@ -751,6 +802,40 @@ def compute_reward(
     `between_jaws` is true; this penalizes only when it's false), so the
     two never fight each other the same step.
 
+    ## Axial-alignment shaping (added 2026-09-04)
+
+    Run9 (this reward, plus lateral-alignment and premature-close above)
+    got the arm reliably straddling the cube with both jaws open and
+    pushing it forward with clear directed intent -- video review of the
+    two closest near-misses (step_032435, step_036427) confirmed the
+    gripper genuinely was open throughout, ruling out an aperture problem.
+    The actual defect: the cube sat buried near the jaws' PIVOT/hinge
+    (where the V-shaped gap between the fingers is narrowest) rather than
+    out near the fingertips (where it's widest and an actual grasp is
+    possible) -- an axial reach-DISTANCE problem, not a lateral or
+    aperture one. Plausible root cause: `reach_weight` rewards driving raw
+    gripper-to-cube distance toward zero, which has no notion of a
+    correct STANDOFF distance -- it keeps paying out for pulling the
+    pivot itself closer to the cube well past the point where the fingers
+    could actually catch it.
+
+    Mirrors lateral_align_weight exactly, just over the axial component of
+    `_jaw_offsets()` instead of the lateral one: potential-based,
+    `axial_align_weight * (Phi_axial(now) - Phi_axial(prev))`, gated on
+    the same `in_align_zone` (not holding, within align_activation_range)
+    used for lateral alignment -- both terms are meant to activate
+    together, since they're pulling the same approach into the same
+    correctly-positioned state. Phi_axial (`_axial_potential()`, built on
+    `_axial_offset()`) is 1 anywhere INSIDE the valid
+    [grasp_reach_min, grasp_reach_max] reach window -- there's no single
+    "best" axial value to chase, any point between the fingers' own reach
+    counts as equally good -- and falls off toward 0 the further outside
+    that window in EITHER direction (too shallow, near the pivot, or too
+    deep, past the fingertips). This directly counteracts reach_weight's
+    tendency to keep pulling inward past the correct stopping point, by
+    penalizing (via zero-then-negative delta) any further approach once
+    already inside the window.
+
     On top of the continuous shaping, three ONE-TIME milestone bonuses
     fire the step their condition is first met this episode: touch_bonus
     (genuine contact range reached), grasp_bonus (a real hold
@@ -807,6 +892,13 @@ def compute_reward(
             (pickplace_env.py, validate_reward_function.py) always pass
             the real persisted value. The caller persists whatever this
             function returns as `info["lateral"]`.
+        prev_axial: the `axial` value THIS function returned in its info
+            dict on the PREVIOUS step, or None if that step wasn't within
+            `align_activation_range` (or this is a fresh episode). Same
+            default-None rationale and same caller contract as
+            prev_lateral, mirrored for the axial-alignment term (added
+            2026-09-04 -- see this function's docstring). The caller
+            persists whatever this function returns as `info["axial"]`.
         cfg: reward configuration/weights.
 
     Returns:
@@ -814,13 +906,14 @@ def compute_reward(
         holding/touched/grasped/placed/failed/between_jaws flags, the
         individual reward components, `dist` (to be passed back as next
         step's `prev_dist`), `joint_pos` (to be passed back as next step's
-        `prev_joint_pos`), and `lateral` (to be passed back as next step's
-        `prev_lateral`).
+        `prev_joint_pos`), `lateral` (to be passed back as next step's
+        `prev_lateral`), and `axial` (to be passed back as next step's
+        `prev_axial`).
     """
     holding = is_holding(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, was_holding, cfg)
     grasped = is_grasped(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, cfg)
     between_jaws = is_between_jaws(gripper_pos, gripper_quat, cube_pos, cfg)
-    _axial, lateral = _jaw_offsets(gripper_pos, gripper_quat, cube_pos)
+    axial, lateral = _jaw_offsets(gripper_pos, gripper_quat, cube_pos)
     touching_now = is_touching(gripper_pos, cube_pos, cfg)
     touched = touching_now or was_touched
     placed = is_placed(cube_pos, cube_lin_vel, cfg)
@@ -885,6 +978,19 @@ def compute_reward(
             _lateral_potential(lateral, cfg) - _lateral_potential(effective_prev_lateral, cfg)
         )
 
+    # Axial-alignment shaping (added 2026-09-04, see this function's
+    # docstring) -- identical delta/gating pattern to lateral-alignment
+    # directly above, reusing the SAME `in_align_zone` gate (both terms
+    # are meant to activate together), just over the axial component
+    # instead of the lateral one.
+    effective_prev_axial = prev_axial if in_align_zone else None
+    if effective_prev_axial is None:
+        axial_shaping = 0.0
+    else:
+        axial_shaping = cfg.axial_align_weight * (
+            _axial_potential(axial, cfg) - _axial_potential(effective_prev_axial, cfg)
+        )
+
     # Premature-close penalty (added 2026-09-03) -- see this function's
     # docstring for why an ABSOLUTE (not delta) penalty is fine here,
     # unlike the original absolute-REWARD hacking mechanism this module
@@ -909,7 +1015,15 @@ def compute_reward(
 
     action_penalty = cfg.action_penalty_weight * sum(v * v for v in joint_vel)
 
-    reward = shaping + close_shaping + align_shaping + milestone_bonus - action_penalty - premature_close_penalty
+    reward = (
+        shaping
+        + close_shaping
+        + align_shaping
+        + axial_shaping
+        + milestone_bonus
+        - action_penalty
+        - premature_close_penalty
+    )
     if placed:
         reward += cfg.success_bonus
 
@@ -924,12 +1038,14 @@ def compute_reward(
         "dense": shaping,
         "grasp_close": close_shaping,
         "lateral_align": align_shaping,
+        "axial_align": axial_shaping,
         "premature_close_penalty": premature_close_penalty,
         "milestone_bonus": milestone_bonus,
         "action_penalty": action_penalty,
         "dist": dist,
         "joint_pos": gripper_joint_pos,
         "lateral": lateral if in_align_zone else None,
+        "axial": axial if in_align_zone else None,
     }
     return reward, info
 
@@ -1429,12 +1545,86 @@ def _self_test():
     assert info_align_holding["holding"], "test setup: must already be holding"
     assert info_align_holding["lateral_align"] == 0.0, "alignment shaping must not apply once already holding"
 
+    # -- Axial-alignment shaping (2026-09-04) --
+    # `axial_far_pos`/`axial_near_pos` share zero lateral offset (purely
+    # along `axis` from `gripper_touch_pos`, isolating the axial term) but
+    # differ in how far BEHIND the valid [grasp_reach_min, grasp_reach_max]
+    # reach window they sit -- i.e. how deeply "buried near the pivot,"
+    # exactly the failure mode from run9's near-miss videos. Both well
+    # within align_activation_range.
+    axial_far_pos = tuple(pivot[i] - 0.03 * axis[i] for i in range(3))
+    axial_near_pos = tuple(pivot[i] - 0.02 * axis[i] for i in range(3))
+    assert _dist3(gripper_touch_pos, axial_far_pos) <= cfg.align_activation_range, "test setup: must be in the activation zone"
+    assert _dist3(gripper_touch_pos, axial_near_pos) <= cfg.align_activation_range, "test setup: must be in the activation zone"
+    axial_far, _ = _jaw_offsets(gripper_touch_pos, Q, axial_far_pos)
+    axial_near, _ = _jaw_offsets(gripper_touch_pos, Q, axial_near_pos)
+    assert axial_far < cfg.grasp_reach_min and axial_near < cfg.grasp_reach_min, (
+        "test setup: both must sit outside the valid reach window (too shallow/buried), "
+        "so the axial potential genuinely differs between them"
+    )
+    assert _axial_offset(axial_near, cfg) < _axial_offset(axial_far, cfg), "test setup: must genuinely differ in axial offset magnitude"
+
+    # 19a. Fresh entry into the activation zone (prev_axial=None
+    # explicitly) -> zero shaping, mirrors 18a exactly for the axial term.
+    _, info_axial_fresh = compute_reward(
+        gripper_touch_pos, Q, axial_far_pos, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, prev_axial=None, cfg=cfg,
+    )
+    assert info_axial_fresh["axial_align"] == 0.0, "fresh entry into the alignment zone must earn zero axial shaping"
+
+    # 19b. Improving (axial offset decreasing, i.e. moving out of the
+    # pivot's throat toward the valid reach window) -> positive shaping.
+    _, info_axial_improve = compute_reward(
+        gripper_touch_pos, Q, axial_near_pos, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, prev_axial=axial_far, cfg=cfg,
+    )
+    assert info_axial_improve["axial_align"] > 0.0, (
+        "reducing axial offset (closer to the valid reach window) must earn positive shaping"
+    )
+
+    # 19c. Worsening (axial offset increasing, i.e. burying deeper toward
+    # the pivot) -> negative shaping, the symmetric flip side of 19b.
+    _, info_axial_worsen = compute_reward(
+        gripper_touch_pos, Q, axial_far_pos, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, prev_axial=axial_near, cfg=cfg,
+    )
+    assert info_axial_worsen["axial_align"] < 0.0, "increasing axial offset (burying deeper) must earn negative shaping"
+
+    # 19d. Unchanged axial offset -> zero shaping, same no-free-lunch
+    # property as every other potential-based term in this module.
+    _, info_axial_same = compute_reward(
+        gripper_touch_pos, Q, axial_far_pos, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, prev_axial=axial_far, cfg=cfg,
+    )
+    assert info_axial_same["axial_align"] == 0.0, "unchanged axial offset must earn zero shaping (no free lunch)"
+
+    # 19e. Outside align_activation_range -> zero shaping regardless of
+    # prev_axial, confirms the gate is genuinely enforced.
+    _, info_axial_far_away = compute_reward(
+        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, prev_axial=0.5, cfg=cfg,
+    )
+    assert info_axial_far_away["axial_align"] == 0.0, (
+        "outside the activation range, axial shaping must not apply regardless of prev_axial"
+    )
+
+    # 19f. Once already holding, zero shaping regardless of anything else
+    # -- mirrors 18f, same `not holding` gate shared with lateral alignment
+    # via in_align_zone.
+    _, info_axial_holding = compute_reward(
+        lifted, Q, cube_between, zero_vel, gripper_closed_joint, zero_joint_vel,
+        True, True, None, None, prev_axial=1.0, cfg=cfg,
+    )
+    assert info_axial_holding["holding"], "test setup: must already be holding"
+    assert info_axial_holding["axial_align"] == 0.0, "axial shaping must not apply once already holding"
+
     print("[OK] pickplace_reward self-test passed")
     print(f"  closer_shaping={info_closer['dense']:+.4f} farther_shaping={info_farther['dense']:+.4f}")
     print(f"  grasp_bonus_once={info['holding']} reward_at_target_still={reward_at_target_still:.3f}")
     print(f"  grasp_close_closing={info_closing['grasp_close']:+.4f} grasp_close_opening={info_opening['grasp_close']:+.4f}")
     print(f"  premature_close_penalty={info_premature['premature_close_penalty']:+.4f}")
     print(f"  lateral_align_improve={info_align_improve['lateral_align']:+.4f} lateral_align_worsen={info_align_worsen['lateral_align']:+.4f}")
+    print(f"  axial_align_improve={info_axial_improve['axial_align']:+.4f} axial_align_worsen={info_axial_worsen['axial_align']:+.4f}")
 
 
 if __name__ == "__main__":
