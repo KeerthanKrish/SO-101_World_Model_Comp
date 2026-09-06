@@ -218,6 +218,47 @@ This is a narrow, hypothesis-driven fix at the one identified mechanism,
 not a broader re-tune -- if closing still doesn't happen after this, that
 argues for a different cause (e.g. insufficient exploration of the
 gripper action dimension specifically) rather than more weight-tweaking.
+
+## Removing premature_close_weight entirely (2026-09-06)
+
+Run11 (the above) got `is_between_jaws()` firing regularly for the first
+time -- real progress. But `held` was still False in every one of its 11
+eval checkpoints. Rather than guess at a third round of weight changes,
+added `--eval-only` to `train_tdmpc2_pickplace.py` (loads a checkpoint,
+runs exactly one deterministic eval episode, writes a per-step CSV of
+gripper joint angle / commanded gripper action / axial+lateral offset /
+between_jaws -- see that flag's own docstring) and replayed run11's best
+checkpoint to get real per-step ground truth instead of guessing from
+video or from the once-per-episode booleans already logged.
+
+That data ruled out the "brief pass-through, no time to close" theory
+outright: between_jaws fired dozens of times across the 500-step episode,
+including windows lasting 10+ consecutive steps -- plenty of time. What
+it showed instead: the gripper barely moves even during those long
+windows (under 0.01 radians of drift across a 15-step window), and the
+one place it DOES dip meaningfully (a ~0.06 radian dip around steps
+368-371, out of the ~1.44 radians needed to reach gripper_closed_threshold)
+is immediately, visibly reversed -- climbing steadily back to ~fully-open
+over the following dozen steps, not settling or continuing to close.
+
+The mechanism this points to: between_jaws itself is unstable (true only
+~15% of that episode, mostly in short bursts), and premature_close_weight
+is gated on `not between_jaws` -- so a policy partway through a slow,
+multi-step close is one small drift away from between_jaws dropping out
+and this penalty resuming on its still-partly-closed gripper. Reopening
+immediately, before that penalty can resume, is the locally safe
+strategy; committing to a full close across a window that might not
+hold long enough is not. This penalty's own ungated cousin problem (the
+original reason it was added at all -- run8 closing carelessly far from
+the cube) is now separately handled by grasp_close_weight's own
+is_between_jaws() gate, which didn't exist yet when premature_close_weight
+was first introduced -- so it no longer needs to carry that job alone.
+
+Set premature_close_weight to 0.0 as the cleanest single-variable test of
+this specific hypothesis, rather than combining it with a hysteresis
+mechanism or a grace period (both considered, both deferred -- if simply
+removing the penalty doesn't produce a real close, that would argue the
+instability theory needs one of those instead, not just less punishment).
 """
 
 import os
@@ -425,16 +466,32 @@ class PickPlaceRewardConfig:
     # discouraged.
     #
     # Lowered from 0.3 to 0.1 (2026-09-05, run10 closing-focused redesign
-    # -- see this module's docstring and grasp_close_weight above). At 0.3,
-    # combined with is_between_jaws() rarely being true at the policy's
-    # actual contact point, this penalty fired on nearly every step the
-    # gripper had any closedness at all -- while grasp_close_weight almost
-    # never got to reward anything -- teaching "never close" as the
-    # dominant strategy. Still nonzero (still discourages closing while
-    # nowhere near the cube at all, the original run8 behavior this term
-    # targets), just no longer strong enough to outweigh a genuine, now-
-    # reachable grasp_close_weight signal.
-    premature_close_weight: float = 0.1
+    # -- see this module's docstring and grasp_close_weight above), then
+    # to 0.0 (2026-09-06, run11 diagnostic -- see this module's docstring's
+    # "Removing premature_close_weight entirely" section). run11 (which
+    # used 0.1) got is_between_jaws() firing regularly -- real, genuine
+    # progress -- but a per-step diagnostic replay (--eval-only) of its
+    # best checkpoint showed the gripper still never closing, even across
+    # between_jaws windows lasting 10+ consecutive steps: it would nudge
+    # a little toward closed, then visibly, deliberately reopen back to
+    # ~fully-open over the following several steps. Root cause: this
+    # penalty is gated on `not between_jaws`, and between_jaws itself
+    # flickers True/False rapidly (true only ~15% of one representative
+    # episode, in mostly short bursts) -- so a policy partway through a
+    # slow, multi-step close is one small drift away from between_jaws
+    # dropping out and this penalty resuming on its now-still-partly-
+    # closed gripper. Reopening immediately is the locally safe strategy;
+    # committing to a full close is not. Set to 0.0 as the cleanest
+    # single-variable test of that specific hypothesis -- the ORIGINAL
+    # run8 behavior this term was built to stop (closing carelessly far
+    # from the cube, regardless of position) is now separately prevented
+    # by grasp_close_weight's own is_between_jaws() gate, which didn't
+    # exist yet when this penalty was first added, so the two concerns
+    # that motivated 0.3 no longer both require this penalty to be
+    # nonzero. The self-test below still exercises the full mechanism
+    # (tests 17a-17d) against a LOCAL cfg with a nonzero weight, so the
+    # gating logic itself stays covered even at a 0.0 production default.
+    premature_close_weight: float = 0.0
 
     # -- One-time milestone bonuses (sparse), each firing exactly once
     # per episode, the step its condition is first met. Layered on top of
@@ -1392,7 +1449,18 @@ def _self_test():
     assert info_holding_close["holding"], "test setup: must already be holding"
     assert info_holding_close["grasp_close"] == 0.0, "grasp_close must not pay out once already holding"
 
-    # -- Premature-close penalty (2026-09-03) --
+    # -- Premature-close penalty (2026-09-03, weight zeroed 2026-09-06) --
+    # premature_close_weight is 0.0 in the production default now (see
+    # PickPlaceRewardConfig's own field docstring and this module's
+    # docstring's "Removing premature_close_weight entirely" section) --
+    # but the MECHANISM (the gating logic below) is still real code that
+    # could be re-enabled by a future run, so it stays covered here via a
+    # LOCAL cfg with a nonzero weight. Testing this against the
+    # production `cfg` (weight 0.0) would make every assertion below
+    # trivially true regardless of whether the gating logic actually
+    # works -- 0.0 * anything is 0.0 whether or not the `not between_jaws`
+    # gate is even checked -- which would silently stop testing anything.
+    premature_test_cfg = PickPlaceRewardConfig(premature_close_weight=0.3)
 
     # 17a. Closed gripper FAR from the cube (not between the jaws, not yet
     # holding) must incur the penalty -- this is exactly the "closes
@@ -1400,7 +1468,7 @@ def _self_test():
     # video, which previously earned neither reward nor penalty.
     _, info_premature = compute_reward(
         (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, F, None, None, cfg=cfg,
+        F, F, None, None, cfg=premature_test_cfg,
     )
     assert not info_premature["between_jaws"], "test setup: must be far outside the between-jaws zone"
     assert not info_premature["holding"], "test setup: must not be holding"
@@ -1412,7 +1480,7 @@ def _self_test():
     # is never "prematurely closed," regardless of position).
     _, info_open_far = compute_reward(
         (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, F, None, None, cfg=cfg,
+        F, F, None, None, cfg=premature_test_cfg,
     )
     assert info_open_far["premature_close_penalty"] == 0.0, "an OPEN gripper must never incur the premature-close penalty"
 
@@ -1425,7 +1493,7 @@ def _self_test():
     # `between_jaws`, not on `holding`).
     _, info_between_no_penalty = compute_reward(
         lifted, Q, cube_between, zero_vel, partially_closed_joint, zero_joint_vel,
-        F, F, None, None, cfg=cfg,
+        F, F, None, None, cfg=premature_test_cfg,
     )
     assert info_between_no_penalty["between_jaws"], "test setup: must be a valid between-jaws position"
     assert not info_between_no_penalty["holding"], "test setup: must not yet be closed enough to establish holding"
@@ -1437,11 +1505,23 @@ def _self_test():
     # gated on `not holding` first, same as grasp_close_weight.
     _, info_holding_no_penalty = compute_reward(
         lifted, Q, cube_between, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, None, None, cfg=cfg,
+        True, True, None, None, cfg=premature_test_cfg,
     )
     assert info_holding_no_penalty["holding"], "test setup: must already be holding"
     assert info_holding_no_penalty["premature_close_penalty"] == 0.0, (
         "premature_close_penalty must never apply once already holding"
+    )
+
+    # 17e. Sanity check that the PRODUCTION default really is 0.0 -- the
+    # single-variable experiment this whole section documents only means
+    # what it's supposed to if this is actually true, not just true of
+    # premature_test_cfg above.
+    _, info_premature_production = compute_reward(
+        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_closed_joint, zero_joint_vel,
+        F, F, None, None, cfg=cfg,
+    )
+    assert info_premature_production["premature_close_penalty"] == 0.0, (
+        "production default premature_close_weight must be 0.0 (2026-09-06 experiment -- see module docstring)"
     )
 
     # -- Lateral-alignment shaping (2026-09-03) --
