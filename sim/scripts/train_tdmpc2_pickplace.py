@@ -184,10 +184,11 @@ from tensordict.tensordict import TensorDict
 # reordering costs nothing.
 sys.path.insert(0, "/home/keerthan/SO-101-WM/sim")
 from envs.pickplace_env import PickPlaceEnv, PickPlaceEnvCfg  # isort:skip
-# _jaw_offsets -- only used by run_eval_episode()'s optional step_log_path
-# diagnostic (2026-09-06), to report the raw axial/lateral offset each
-# step rather than just the binary between_jaws flag already in `info`.
-from envs.pickplace_reward import _jaw_offsets  # isort:skip
+# _jaw_offsets/_dist3 -- only used by run_eval_episode()'s optional
+# step_log_path diagnostic (2026-09-06), to report the raw axial/lateral
+# offset and gripper-cube distance each step rather than just the binary
+# between_jaws/holding flags already in `info`.
+from envs.pickplace_reward import _dist3, _jaw_offsets  # isort:skip
 
 sys.path.insert(0, "/home/keerthan/SO-101-WM/sim/scripts")
 from tdmpc2_pickplace_env import PickPlaceTDMPC2Wrapper  # isort:skip
@@ -409,24 +410,35 @@ def run_eval_episode(env, base_env, agent, cfg, video_path, step_log_path=None):
 
     step_log_path (added 2026-09-06, --eval-only): when given, writes a
     per-step CSV of (step, the raw commanded gripper action, reward,
-    gripper_joint_pos, axial, lateral, between_jaws, holding, touched) to
-    this path. The ever_* booleans above already say WHETHER
-    between_jaws/holding ever fired this episode, but not for how many
-    consecutive steps, nor what the gripper was actually doing (already
-    trending closed but out of time, vs. not moving toward closed at
-    all) during that window -- exactly the distinction needed to tell a
-    genuine TIMING problem (cube only correctly positioned for a handful
-    of steps) apart from the closing incentive itself still being too
-    weak. Deliberately recomputes axial/lateral independently via
-    _jaw_offsets() on the same gripper_pos/gripper_quat/cube_pos values
-    pickplace_env.py's own _get_dones() already reads (grasp_points_local(),
-    cube.data.root_pos_w) rather than modifying pickplace_env.py to expose
-    them -- keeps this diagnostic fully outside the reward/env classes
-    actual training depends on, at the cost of only re-deriving two
-    scalars pickplace_reward.py already computes internally every step
-    anyway. None of this runs (nor is `step_log_path` ever passed) during
-    a real training run's own periodic eval calls -- default None leaves
-    every real call site's behavior byte-for-byte unchanged.
+    gripper_joint_pos, axial, lateral, cube_height, gripper_cube_dist,
+    between_jaws, holding, touched) to this path. The ever_* booleans
+    above already say WHETHER between_jaws/holding ever fired this
+    episode, but not for how many consecutive steps, nor what the
+    gripper was actually doing (already trending closed but out of time,
+    vs. not moving toward closed at all) during that window -- exactly
+    the distinction needed to tell a genuine TIMING problem (cube only
+    correctly positioned for a handful of steps) apart from the closing
+    incentive itself still being too weak. cube_height/gripper_cube_dist
+    (added after a `holding=True` eval result didn't match what direct
+    video review showed -- see docs/decisions.md) additionally let every
+    one of is_holding()'s four establishing conditions (cube_height >
+    lift_threshold, gripper_joint_pos <= gripper_closed_threshold,
+    gripper_cube_dist < grasp_proximity_threshold, between_jaws) be
+    checked independently from the logged CSV, rather than trusting the
+    `holding` boolean at face value -- this project has caught more than
+    one is_holding()/is_between_jaws() false positive before by checking
+    the underlying geometry directly instead of the flag alone. All five
+    of axial/lateral/cube_height/gripper_cube_dist are deliberately
+    recomputed independently via _jaw_offsets()/_dist3() on the same
+    gripper_pos/gripper_quat/cube_pos values pickplace_env.py's own
+    _get_dones() already reads (grasp_points_local(), cube.data.root_pos_w)
+    rather than modifying pickplace_env.py to expose them -- keeps this
+    diagnostic fully outside the reward/env classes actual training
+    depends on, at the cost of only re-deriving values pickplace_reward.py
+    already computes internally every step anyway. None of this runs (nor
+    is `step_log_path` ever passed) during a real training run's own
+    periodic eval calls -- default None leaves every real call site's
+    behavior byte-for-byte unchanged.
     """
     frames_dir = video_path + "_frames"
     os.makedirs(frames_dir, exist_ok=True)
@@ -449,13 +461,30 @@ def run_eval_episode(env, base_env, agent, cfg, video_path, step_log_path=None):
 
         if step_rows is not None:
             gripper_pos, gripper_quat = base_env._grasp_points_local()
+            gripper_pos_l = gripper_pos[0].cpu().tolist()
             cube_pos = (base_env.cube.data.root_pos_w - base_env.scene.env_origins)[0].cpu().tolist()
             gripper_joint_pos = base_env.robot.data.joint_pos[0, base_env._joint_indices[-1]].item()
-            axial, lateral = _jaw_offsets(gripper_pos[0].cpu().tolist(), gripper_quat[0].cpu().tolist(), cube_pos)
+            axial, lateral = _jaw_offsets(gripper_pos_l, gripper_quat[0].cpu().tolist(), cube_pos)
             action_gripper = action.reshape(-1)[-1].item()
+            # cube_height/gripper_cube_dist -- added alongside the
+            # is_holding()/is_grasped() sanity-check this diagnostic is
+            # for (2026-09-06): `between_jaws`/`holding` alone don't say
+            # WHY holding became true -- is_holding() requires FOUR things
+            # together to establish it (cube_height > lift_threshold,
+            # gripper_joint_pos <= gripper_closed_threshold, spherical
+            # gripper-cube distance < grasp_proximity_threshold, AND
+            # between_jaws), so all four need to be independently
+            # verifiable from this log, not just trusted from the
+            # boolean, given this project's own history of more than one
+            # is_holding()/is_grasped() false positive caught only by
+            # directly checking the underlying geometry (see
+            # is_between_jaws()'s and is_holding()'s own docstrings).
+            cube_height = cube_pos[2]
+            gripper_cube_dist = _dist3(gripper_pos_l, cube_pos)
             step_rows.append(
                 f"{t},{action_gripper:+.4f},{reward.item():+.4f},{gripper_joint_pos:+.4f},"
-                f"{axial:+.4f},{lateral:+.4f},{info['between_jaws']},{info['holding']},{info['touched']}"
+                f"{axial:+.4f},{lateral:+.4f},{cube_height:+.4f},{gripper_cube_dist:+.4f},"
+                f"{info['between_jaws']},{info['holding']},{info['touched']}"
             )
 
         base_env.sim.render()
@@ -465,7 +494,10 @@ def run_eval_episode(env, base_env, agent, cfg, video_path, step_log_path=None):
 
     if step_rows is not None:
         with open(step_log_path, "w") as f:
-            f.write("step,action_gripper,reward,gripper_joint_pos,axial,lateral,between_jaws,holding,touched\n")
+            f.write(
+                "step,action_gripper,reward,gripper_joint_pos,axial,lateral,"
+                "cube_height,gripper_cube_dist,between_jaws,holding,touched\n"
+            )
             f.write("\n".join(step_rows) + "\n")
 
     subprocess.run(
