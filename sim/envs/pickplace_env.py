@@ -27,9 +27,9 @@ custom addition.
 
 Reward/termination reuse the already-validated pickplace_reward.py
 functions verbatim, called in a per-environment Python loop rather than
-reimplemented in batched torch. Four pieces of per-env state are
-persisted across steps beyond what Isaac Lab already tracks -- all four
-reset on every env reset, all four required by pickplace_reward.py's own
+reimplemented in batched torch. Six pieces of per-env state are
+persisted across steps beyond what Isaac Lab already tracks -- all six
+reset on every env reset, all six required by pickplace_reward.py's own
 compute_reward() signature:
   - `_was_holding`: is_holding() hysteresis (a real bug, found during a
     full correctness audit: the naive stateless height check it replaces
@@ -63,6 +63,24 @@ compute_reward() signature:
     `_prev_dist` -- NOT reset across a holding phase transition, since the
     joint angle is the same physical quantity regardless of phase (see
     compute_reward()'s own docstring for why).
+  - `_prev_lateral`: the raw lateral offset from the PREVIOUS step, for
+    the lateral-alignment shaping term (added 2026-09-03). Same
+    NaN-sentinel pattern, but reset whenever compute_reward() reports the
+    step wasn't within align_activation_range too, not just on an env
+    reset -- see that parameter's own docstring in pickplace_reward.py.
+  - `_ever_held`: genuinely episode-sticky (added 2026-09-06, same
+    sticky-OR pattern as `_was_touched`) -- feeds `was_ever_held`, which
+    fixes a real bug where grasp_bonus could fire more than once per
+    episode (`_was_holding` alone can't distinguish the first-ever hold
+    from the first step of a new streak after a brief loss and
+    re-establishment) -- see pickplace_reward.py's `grasp_bonus` and
+    `was_ever_held` docstrings.
+  - `_prev_jaws_miss_streak`: same NaN-sentinel pattern as `_prev_dist`,
+    for compute_reward()'s between_jaws hysteresis (also added
+    2026-09-06) -- feeds `prev_jaws_miss_streak`, which gates ONLY
+    grasp_close_weight's shaping, not is_grasped()/is_holding()'s own
+    establishment logic -- see _between_jaws_effective()'s own docstring
+    in pickplace_reward.py.
 
 This is a deliberate simplicity/performance tradeoff: pickplace_reward.py
 was specifically built and empirically validated as a small,
@@ -224,6 +242,21 @@ class PickPlaceEnv(DirectRLEnv):
         # entry), which is why NaN here always means "no valid previous
         # value," never "was in the zone but happened to be far off-axis."
         self._prev_lateral = torch.full((self.num_envs,), float("nan"), device=self.device)
+        # Genuinely episode-sticky (2026-09-06), same pattern as
+        # _was_touched -- NOT the same thing as _was_holding, which only
+        # says "true last step" and so cannot tell the first-ever hold
+        # apart from the first step of a new streak after a brief loss
+        # and re-establishment. Feeds compute_reward()'s `was_ever_held`,
+        # which fixes exactly that gap for grasp_bonus -- see that
+        # parameter's and grasp_bonus's own docstrings in
+        # pickplace_reward.py for the real farming bug this fixes.
+        self._ever_held = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Same NaN-sentinel pattern as _prev_lateral, for
+        # compute_reward()'s between_jaws hysteresis (also added
+        # 2026-09-06) -- feeds `prev_jaws_miss_streak`, gating ONLY
+        # grasp_close_weight's shaping, see _between_jaws_effective()'s
+        # own docstring in pickplace_reward.py.
+        self._prev_jaws_miss_streak = torch.full((self.num_envs,), float("nan"), device=self.device)
 
     def _setup_scene(self):
         # Everything (robot, cube, table, ground, light, optional cameras)
@@ -306,6 +339,7 @@ class PickPlaceEnv(DirectRLEnv):
             prev_d = self._prev_dist[i].item()
             prev_j = self._prev_joint_pos[i].item()
             prev_lat = self._prev_lateral[i].item()
+            prev_streak = self._prev_jaws_miss_streak[i].item()
             reward, info = compute_reward(
                 gripper_pos_local[i].tolist(),
                 gripper_quat[i].tolist(),
@@ -317,7 +351,9 @@ class PickPlaceEnv(DirectRLEnv):
                 bool(self._was_touched[i].item()),
                 None if math.isnan(prev_d) else prev_d,
                 None if math.isnan(prev_j) else prev_j,
+                was_ever_held=bool(self._ever_held[i].item()),
                 prev_lateral=None if math.isnan(prev_lat) else prev_lat,
+                prev_jaws_miss_streak=None if math.isnan(prev_streak) else prev_streak,
                 cfg=self._reward_cfg,
             )
             rewards[i] = reward
@@ -327,6 +363,8 @@ class PickPlaceEnv(DirectRLEnv):
             self._prev_dist[i] = info["dist"]
             self._prev_joint_pos[i] = info["joint_pos"]
             self._prev_lateral[i] = float("nan") if info["lateral"] is None else info["lateral"]
+            self._ever_held[i] = info["ever_held"]
+            self._prev_jaws_miss_streak[i] = info["jaws_miss_streak"]
             placed[i] = info["placed"]
             failed[i] = info["failed"]
             touched[i] = info["touched"]
@@ -375,6 +413,7 @@ class PickPlaceEnv(DirectRLEnv):
         self._joint_pos_target[env_ids] = default_joint_pos[:, self._joint_indices]
         self._was_holding[env_ids] = False
         self._was_touched[env_ids] = False
+        self._ever_held[env_ids] = False
         # NaN, not 0.0 -- 0.0 is a real, meaningful distance (already at
         # the cube/target) and must never be mistaken for "no previous
         # value yet." See module docstring for why this reset is required
@@ -390,6 +429,10 @@ class PickPlaceEnv(DirectRLEnv):
         self._prev_joint_pos[env_ids] = float("nan")
         # Same reasoning again, for the lateral-alignment shaping term.
         self._prev_lateral[env_ids] = float("nan")
+        # Same reasoning again, for the between_jaws hysteresis grace
+        # counter -- a fresh episode must not inherit a miss streak (or
+        # lack thereof) from a completely unrelated previous episode.
+        self._prev_jaws_miss_streak[env_ids] = float("nan")
 
         cube_x = sample_uniform(self.cfg.cube_x_range[0], self.cfg.cube_x_range[1], (n,), self.device)
         cube_y = sample_uniform(self.cfg.cube_y_range[0], self.cfg.cube_y_range[1], (n,), self.device)

@@ -121,17 +121,20 @@ def main():
     min_reach_dist = float("inf")
     max_cube_height = 0.0
     first_grasp_gripper_cube_dist = None
-    # was_holding/was_touched/prev_dist/prev_joint_pos/prev_lateral -- state
-    # pickplace_reward.compute_reward() needs across steps. See that
-    # module's docstring for why each is needed, and pickplace_env.py's
-    # module docstring for why prev_dist/prev_joint_pos/prev_lateral must
+    # was_holding/was_touched/prev_dist/prev_joint_pos/was_ever_held/
+    # prev_lateral/prev_jaws_miss_streak -- state pickplace_reward.
+    # compute_reward() needs across steps. See that module's docstring
+    # for why each is needed, and pickplace_env.py's module docstring for
+    # why prev_dist/prev_joint_pos/prev_lateral/prev_jaws_miss_streak must
     # be reset on a fresh episode -- None here plays the same role as NaN
     # there. All start "empty" at episode start, updated from each step's info.
     was_holding = False
     was_touched = False
     prev_dist = None
     prev_joint_pos = None
+    was_ever_held = False
     prev_lateral = None
+    prev_jaws_miss_streak = None
 
     for step_idx, step in enumerate(episode):
         target = torch.tensor([[step["joint_pos"][j] for j in _JOINT_ORDER]], device=sim.device)
@@ -152,13 +155,16 @@ def main():
         reward, info = compute_reward(
             gripper_pos, ee_quat_w, cube_pos, cube_lin_vel, gripper_joint_pos, joint_vel,
             was_holding, was_touched, prev_dist, prev_joint_pos,
-            prev_lateral=prev_lateral, cfg=cfg,
+            was_ever_held=was_ever_held, prev_lateral=prev_lateral,
+            prev_jaws_miss_streak=prev_jaws_miss_streak, cfg=cfg,
         )
         was_holding = info["holding"]
         was_touched = info["touched"]
         prev_dist = info["dist"]
         prev_joint_pos = info["joint_pos"]
+        was_ever_held = info["ever_held"]
         prev_lateral = info["lateral"]
+        prev_jaws_miss_streak = info["jaws_miss_streak"]
         rewards.append(reward)
 
         max_cube_height = max(max_cube_height, cube_pos[2])

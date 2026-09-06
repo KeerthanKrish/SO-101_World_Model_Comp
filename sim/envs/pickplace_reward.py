@@ -259,6 +259,59 @@ this specific hypothesis, rather than combining it with a hysteresis
 mechanism or a grace period (both considered, both deferred -- if simply
 removing the penalty doesn't produce a real close, that would argue the
 instability theory needs one of those instead, not just less punishment).
+
+## between_jaws hysteresis, a stricter lift_threshold, and a genuinely
+## one-time grasp_bonus (2026-09-06)
+
+Removing premature_close_weight (above) worked -- run12 produced this
+project's first-ever `held=True` eval result. But video review alone
+couldn't confirm whether that was real (the same lesson as the "gripper
+is closing" misread earlier in this project: a fixed external camera plus
+a moving arm can look like almost anything). Extended --eval-only's CSV
+with cube_height and gripper_cube_dist specifically to check every one of
+is_holding()'s four establishing conditions independently, then replayed
+the exact checkpoint that produced it.
+
+Two genuine, distinct findings, addressed together since both surfaced
+from the same replay:
+
+1. `is_between_jaws()` flickers rapidly even during otherwise-good
+   attempts -- true only ~15% of one representative episode, mostly in
+   short bursts, including single-step drop-outs in the middle of a
+   sustained close. Since grasp_close_weight is gated on it being true
+   THIS step, those drop-outs zero out the reward for steps where real
+   progress toward closed was still being made -- a weaker, patchier
+   gradient than a genuine attempt deserves, independent of
+   premature_close_weight (already 0) being a factor at all. Added
+   `between_jaws_grace_steps` (see that field's own docstring) via a new
+   `_between_jaws_effective()` wrapper -- used ONLY to gate
+   grasp_close_weight's shaping, deliberately NOT touching
+   is_between_jaws() itself or is_grasped()/is_holding()'s own
+   establishment logic, which must stay exactly as strict as before (see
+   finding 2 -- loosening the SAME check that gates a genuine hold would
+   directly undermine that fix).
+
+2. The `held=True` result was real by every one of is_holding()'s own
+   checks, but the actual lift was only ~9mm on a 3cm cube (lift_threshold
+   required just 5mm above resting height) -- the cube visibly settling
+   back toward resting height within a few steps, not being carried. It
+   recurred 3 separate times in one episode, each re-firing the full
+   `grasp_bonus`, because that bonus was gated on "holding now but wasn't
+   the previous step" (one-time per continuous streak), not "first time
+   this episode." Together these meant a policy could cheaply farm the
+   milestone bonus by grazing a razor-thin threshold repeatedly, with no
+   additional reward for lifting higher or holding longer than the bare
+   minimum -- arguably reinforcing exactly the wrong thing. Fixed with
+   two complementary changes: `lift_threshold` raised from 0.02 to 0.04
+   (roughly 2.5x the observed accidental jostle -- see that field's own
+   docstring), and `grasp_bonus` regated on a new, genuinely episode-sticky
+   `was_ever_held` parameter (mirrors `touch_bonus`'s own `was_touched`
+   pattern, which never had this bug -- see compute_reward()'s docstring).
+
+Deliberately NOT changed by this round: `grasp_close_weight`,
+`premature_close_weight` (still 0.0), `grasp_reach_min`/`grasp_reach_max`/
+`grasp_lateral_threshold`, all reach/lateral-alignment machinery. This
+targets only the two specific gaps this replay surfaced.
 """
 
 import os
@@ -317,7 +370,27 @@ class PickPlaceRewardConfig:
     # exact simulated state directly (no human jitter to filter out), so a
     # tighter threshold gives an earlier, more precise "grasped" signal
     # without misfiring on noise, since there isn't any.
-    lift_threshold: float = 0.02
+    #
+    # Raised from 0.02 to 0.04 (2026-09-06) -- the "no human jitter"
+    # reasoning above turned out to miss a DIFFERENT kind of noise: the
+    # gripper physically jostling the cube while closing near it. A
+    # per-step diagnostic replay (--eval-only) of run12's first-ever
+    # held=True result found the cube reaching only ~0.024m (roughly 9mm
+    # above its ~0.015m resting height, on a 3cm cube) before settling
+    # back down over the next several steps -- genuinely crossing the OLD
+    # 0.02m bar, but nowhere near a deliberate, visible lift. Worse, this
+    # happened 3 separate times in one episode, each re-firing the full
+    # grasp_bonus (see that field's own docstring for the other half of
+    # this fix). 0.04m requires roughly 2.5x the observed accidental
+    # jostle before counting as a genuine lift, while still being a modest
+    # bar for a policy that IS actually trying (well under `lifted`'s test
+    # fixture height of 0.10m used throughout this module's self-test).
+    # Does not affect the place target itself: is_holding()'s persistence
+    # branch (see that function's docstring) never rechecks height once
+    # holding is established, specifically so a controlled lowering onto
+    # the target -- whose resting height is, by construction, always
+    # BELOW lift_threshold -- doesn't spuriously end holding.
+    lift_threshold: float = 0.04
     # Gripper joint position (radians) at/below which the gripper counts
     # as "closed enough to be gripping." The URDF's gripper joint range is
     # -0.174533 (closed) to 1.74533 (open) -- this sits in the closed half
@@ -386,6 +459,23 @@ class PickPlaceRewardConfig:
     # detection purposes, since direction now does most of the work that
     # radius alone used to.
     grasp_lateral_threshold: float = 0.02
+    # Grace period (added 2026-09-06), in consecutive steps, for
+    # grasp_close_weight's own gate ONLY -- see _between_jaws_effective()
+    # and this module's docstring's hysteresis section. Deliberately does
+    # NOT affect is_between_jaws() itself, nor is_grasped()/is_holding()'s
+    # own establishment logic (both call is_between_jaws() directly,
+    # un-touched by this) -- loosening THOSE would make the exact
+    # farming problem this same round's lift_threshold/grasp_bonus fix
+    # targets easier, not harder, to trigger. A per-step diagnostic
+    # replay of run12's best checkpoint showed is_between_jaws() flickering
+    # False for single steps in the middle of otherwise-sustained close
+    # attempts (true only ~15% of one representative episode, in mostly
+    # short bursts) -- meaning grasp_close_weight's reward itself dropped
+    # out on those steps even while genuine progress toward closed was
+    # being made, weakening the overall gradient during a real attempt.
+    # 2 steps forgives a single- or double-step flicker without forgiving
+    # a genuinely-lost, longer absence.
+    between_jaws_grace_steps: int = 2
     # The URDF's gripper joint range (see gripper_closed_threshold above)
     # -- named separately since gripper_closed_threshold is a chosen
     # CUTOFF ("counts as closed enough"), while these two are the joint's
@@ -505,6 +595,20 @@ class PickPlaceRewardConfig:
     # One-time now, not per-step (was 0.5/step) -- see this module's
     # docstring, item 2: a per-step version created a perverse incentive
     # to keep holding the cube forever instead of finishing the task.
+    #
+    # "One-time" was originally implemented as "not the same step as the
+    # previous one" (gated on `not was_holding`, i.e. holding just NOW
+    # became true) -- which is one-time PER CONTINUOUS HOLDING STREAK, not
+    # one-time per episode. A per-step diagnostic replay (--eval-only) of
+    # run12's best checkpoint showed exactly the gap this leaves: holding
+    # briefly established (a marginal lift, see lift_threshold's own
+    # docstring), lost again a few steps later (the gripper drifting
+    # slightly out of grasp_proximity_threshold), then re-established --
+    # 3 separate times in one episode, each re-firing this full bonus.
+    # Fixed (2026-09-06) by gating on a genuinely episode-sticky
+    # `was_ever_held` instead (mirrors touch_bonus's own `was_touched`
+    # pattern exactly) -- see compute_reward()'s docstring for the
+    # parameter itself.
     grasp_bonus: float = 2.0
     success_bonus: float = 10.0  # one-time; must clearly dominate everything else so success always wins
     # Lowered 5x from 0.01 (2026-09-01): both run4 and run5 (50k steps
@@ -639,6 +743,37 @@ def is_between_jaws(gripper_pos, gripper_quat, cube_pos, cfg: PickPlaceRewardCon
     """
     axial, lateral = _jaw_offsets(gripper_pos, gripper_quat, cube_pos)
     return cfg.grasp_reach_min <= axial <= cfg.grasp_reach_max and lateral <= cfg.grasp_lateral_threshold
+
+
+def _between_jaws_effective(raw_between_jaws: bool, prev_miss_streak, cfg: PickPlaceRewardConfig):
+    """Adds a short grace period on top of the strict, stateless
+    is_between_jaws() check -- see between_jaws_grace_steps's own
+    docstring for why. Used ONLY to gate grasp_close_weight's shaping in
+    compute_reward() -- never passed to is_grasped()/is_holding(), whose
+    own establishment logic calls is_between_jaws() directly and must
+    stay exactly as strict as before (see this module's docstring's
+    hysteresis section for why the two must not share this leniency).
+
+    Args:
+        raw_between_jaws: this step's actual is_between_jaws() result.
+        prev_miss_streak: how many consecutive steps (up to and not
+            including this one) raw_between_jaws has been False since it
+            was last True, or None on a fresh episode / first step after
+            a reset. None is treated as "no grace earned yet" -- NOT as
+            "already earned a full grace window" -- a fresh episode that
+            happens to start outside the window must not get free
+            hysteresis it never earned.
+
+    Returns:
+        (effective_between_jaws, new_miss_streak) -- new_miss_streak is
+        what the caller persists as next step's prev_miss_streak.
+    """
+    if raw_between_jaws:
+        return True, 0
+    if prev_miss_streak is None:
+        return False, cfg.between_jaws_grace_steps + 1
+    miss_streak = prev_miss_streak + 1
+    return miss_streak <= cfg.between_jaws_grace_steps, miss_streak
 
 
 def is_grasped(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, cfg: PickPlaceRewardConfig) -> bool:
@@ -778,7 +913,9 @@ def compute_reward(
     was_touched: bool,
     prev_dist,
     prev_joint_pos,
+    was_ever_held: bool,
     prev_lateral=None,
+    prev_jaws_miss_streak=None,
     cfg: PickPlaceRewardConfig = PickPlaceRewardConfig(),
 ):
     """Computes one step's scalar reward plus a diagnostics dict.
@@ -898,7 +1035,14 @@ def compute_reward(
     established), success_bonus (task completed). None of these are
     per-step -- an earlier per-step version of grasp_bonus created a
     perverse incentive to hold the cube forever instead of finishing (see
-    this module's docstring, item 2).
+    this module's docstring, item 2). "First met THIS EPISODE" is load-
+    bearing for grasp_bonus specifically (touch_bonus/success_bonus were
+    always correct on this point) -- gated on `was_ever_held`, a genuinely
+    episode-sticky flag, NOT `was_holding` (which only says "true last
+    step," and so cannot distinguish the actual first hold from the first
+    step of a new streak after holding was briefly lost and re-
+    established -- see was_ever_held's and grasp_bonus's own docstrings
+    for the real farming bug this fixes, added 2026-09-06).
 
     Args:
         gripper_pos: (x, y, z) world position of the actual grasp point
@@ -938,6 +1082,17 @@ def compute_reward(
             simply stops the term from paying out once holding begins).
             The caller persists whatever this function returns as
             `info["joint_pos"]`.
+        was_ever_held: whether is_holding() has returned True at ANY point
+            so far this episode, up to and not including this step (False
+            on the first step after a reset). The caller persists this
+            the same way as was_touched -- indeed it follows the exact
+            same sticky-OR pattern (see `ever_held` in Returns below),
+            added 2026-09-06 specifically because `was_holding` alone
+            cannot distinguish "the first time ever this episode" from
+            "the first step of a NEW streak after holding was briefly
+            lost and re-established" -- grasp_bonus must fire only on the
+            former (see that field's own docstring for the real bug this
+            fixes).
         prev_lateral: the `lateral` value THIS function returned in its
             info dict on the PREVIOUS step, or None if that step wasn't
             within `align_activation_range` (or this is a fresh episode).
@@ -948,6 +1103,15 @@ def compute_reward(
             (pickplace_env.py, validate_reward_function.py) always pass
             the real persisted value. The caller persists whatever this
             function returns as `info["lateral"]`.
+        prev_jaws_miss_streak: the `jaws_miss_streak` value THIS function
+            returned in its info dict on the PREVIOUS step, or None on a
+            fresh episode / first step after a reset. Defaults to None
+            for the same reason as prev_lateral. Feeds ONLY
+            _between_jaws_effective()'s grace-period gate on
+            grasp_close_weight -- see that function's and
+            between_jaws_grace_steps's own docstrings. The caller
+            persists whatever this function returns as
+            `info["jaws_miss_streak"]`.
         cfg: reward configuration/weights.
 
     Returns:
@@ -955,8 +1119,10 @@ def compute_reward(
         holding/touched/grasped/placed/failed/between_jaws flags, the
         individual reward components, `dist` (to be passed back as next
         step's `prev_dist`), `joint_pos` (to be passed back as next step's
-        `prev_joint_pos`), and `lateral` (to be passed back as next step's
-        `prev_lateral`).
+        `prev_joint_pos`), `lateral` (to be passed back as next step's
+        `prev_lateral`), `ever_held` (to be passed back as next step's
+        `was_ever_held`), and `jaws_miss_streak` (to be passed back as
+        next step's `prev_jaws_miss_streak`).
     """
     holding = is_holding(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, was_holding, cfg)
     grasped = is_grasped(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, cfg)
@@ -990,14 +1156,17 @@ def compute_reward(
 
     # Gripper-closing shaping -- see this function's docstring. Gated on
     # `not holding` (only relevant pre-grasp; once holding, the gripper
-    # should just stay closed, nothing more to reward here) AND
-    # `between_jaws` THIS step (closing only pays off while the cube is
-    # actually positioned to be caught -- see is_between_jaws()). No
-    # phase_transition-style reset needed here: joint_pos is the same
+    # should just stay closed, nothing more to reward here) AND an
+    # HYSTERESIS-ADJUSTED between_jaws (added 2026-09-06 -- see
+    # _between_jaws_effective()'s own docstring for why this is a
+    # SEPARATE value from the strict `between_jaws` used everywhere else
+    # in this function/info dict, never fed to is_grasped()/is_holding()).
+    # No phase_transition-style reset needed here: joint_pos is the same
     # physical quantity whether or not holding was just established, so a
     # delta across that boundary is still well-defined -- the `not
     # holding` gate alone is enough to stop payouts once transport begins.
-    if not holding and between_jaws and prev_joint_pos is not None:
+    between_jaws_for_closing, jaws_miss_streak = _between_jaws_effective(between_jaws, prev_jaws_miss_streak, cfg)
+    if not holding and between_jaws_for_closing and prev_joint_pos is not None:
         close_shaping = cfg.grasp_close_weight * (
             _gripper_close_potential(gripper_joint_pos, cfg) - _gripper_close_potential(prev_joint_pos, cfg)
         )
@@ -1026,26 +1195,41 @@ def compute_reward(
             _lateral_potential(lateral, cfg) - _lateral_potential(effective_prev_lateral, cfg)
         )
 
-    # Premature-close penalty (added 2026-09-03) -- see this function's
+    # Premature-close penalty (added 2026-09-03, weight currently 0.0 --
+    # see premature_close_weight's own docstring) -- see this function's
     # docstring for why an ABSOLUTE (not delta) penalty is fine here,
     # unlike the original absolute-REWARD hacking mechanism this module
     # otherwise avoids: this only ever subtracts, so there's nothing to
     # "farm" by holding a state -- a policy minimizes this by simply not
     # closing early, not by exploiting it. Gated on `not holding` (once
     # actually holding, the gripper should obviously stay closed) AND
-    # `not between_jaws` (closing WHILE correctly positioned is exactly
-    # what grasp_close_weight already rewards -- this penalty and that
-    # shaping are mutually exclusive by construction, never both nonzero
-    # the same step).
-    if not holding and not between_jaws:
+    # `not between_jaws_for_closing` (the SAME hysteresis-adjusted value
+    # grasp_close_weight uses, not the strict `between_jaws` -- added
+    # 2026-09-06 alongside the hysteresis fix itself: using the strict
+    # value here would let this penalty fire on a grace-period step at
+    # the exact same time grasp_close_weight is rewarding it, directly
+    # undermining the point of the grace period the moment this weight is
+    # ever nonzero again. Mutually exclusive with grasp_close_weight by
+    # construction, never both nonzero the same step, regardless of which
+    # between_jaws value -- strict or hysteresis-adjusted -- is in play
+    # that step).
+    if not holding and not between_jaws_for_closing:
         premature_close_penalty = cfg.premature_close_weight * _gripper_close_potential(gripper_joint_pos, cfg)
     else:
         premature_close_penalty = 0.0
 
+    # ever_held: same sticky-OR pattern as `touched` above, added
+    # 2026-09-06 specifically so grasp_bonus (below) can tell "first time
+    # ever this episode" apart from "first step of a new streak after a
+    # brief loss and re-establishment" -- `was_holding` alone cannot make
+    # that distinction (see was_ever_held's own docstring for the real
+    # farming bug this fixes).
+    ever_held = holding or was_ever_held
+
     milestone_bonus = 0.0
     if touching_now and not was_touched:
         milestone_bonus += cfg.touch_bonus
-    if holding and not was_holding:
+    if holding and not was_ever_held:
         milestone_bonus += cfg.grasp_bonus
 
     action_penalty = cfg.action_penalty_weight * sum(v * v for v in joint_vel)
@@ -1071,6 +1255,8 @@ def compute_reward(
         "dist": dist,
         "joint_pos": gripper_joint_pos,
         "lateral": lateral if in_align_zone else None,
+        "ever_held": ever_held,
+        "jaws_miss_streak": jaws_miss_streak,
     }
     return reward, info
 
@@ -1103,10 +1289,11 @@ def _self_test():
     # jaw_approach_axis_world() direction.
     Q = (1.0, 0.0, 0.0, 0.0)
     # Every call below passes `cfg=cfg` as a KEYWORD, never positionally,
-    # deliberately -- compute_reward() has two optional trailing params
-    # (`prev_lateral`, then `cfg`), and passing cfg positionally would
-    # silently bind it to `prev_lateral` instead the moment any earlier
-    # positional argument shifted (exactly what happened when
+    # deliberately -- compute_reward() has three optional trailing params
+    # (`prev_lateral`, `prev_jaws_miss_streak`, then `cfg`), and passing
+    # cfg positionally would silently bind it to one of the others
+    # instead the moment any earlier positional argument shifted (exactly
+    # what happened when
     # `prev_lateral` was first added -- caught before it ever shipped).
 
     # 1. With no previous distance (fresh call), shaping is always zero --
@@ -1115,13 +1302,15 @@ def _self_test():
     #    ABSOLUTE reward's dependence on distance -- meaningless now that
     #    reward depends on the CHANGE in distance, not its current value.
     far_fresh, info_far_fresh = compute_reward(
-        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg=cfg
+        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
     )
     # Deliberately just outside touch_threshold (dist ~0.10m > 0.08m), so
     # this isolates the shaping-only property without also tripping
     # touch_bonus -- that's covered separately by test 12 below.
     near_fresh, info_near_fresh = compute_reward(
-        (0.18, 0.0, 0.015), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg=cfg
+        (0.18, 0.0, 0.015), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
     )
     assert not info_near_fresh["touched"], "test setup error: this point must be outside touch range"
     assert info_far_fresh["dense"] == 0.0 and info_near_fresh["dense"] == 0.0, (info_far_fresh, info_near_fresh)
@@ -1134,12 +1323,14 @@ def _self_test():
     #    decent position) impossible now -- only CHANGING distance pays.
     d = _dist3((0.1, 0.1, 0.1), cube_at_start)
     _, info_still_far = compute_reward(
-        (0.1, 0.1, 0.1), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, d, None, cfg=cfg
+        (0.1, 0.1, 0.1), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, d, None, was_ever_held=F, cfg=cfg,
     )
     assert info_still_far["dense"] == 0.0, "holding still at a FAR distance must earn zero shaping reward"
     d_close = _dist3(cube_at_start, cube_at_start)
     _, info_still_close = compute_reward(
-        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, d_close, None, cfg=cfg
+        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, d_close, None, was_ever_held=F, cfg=cfg,
     )
     assert info_still_close["dense"] == 0.0, "holding still EVEN AT THE CUBE must earn zero shaping reward"
 
@@ -1147,12 +1338,14 @@ def _self_test():
     #    positive shaping; moving away must earn negative shaping.
     prev_d = _dist3((0.0, 0.0, 0.3), cube_at_start)
     _, info_closer = compute_reward(
-        (0.27, 0.0, 0.02), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, prev_d, None, cfg=cfg
+        (0.27, 0.0, 0.02), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, prev_d, None, was_ever_held=F, cfg=cfg,
     )
     assert info_closer["dense"] > 0.0, "moving closer since last step must earn positive shaping"
     prev_d2 = _dist3((0.27, 0.0, 0.02), cube_at_start)
     _, info_farther = compute_reward(
-        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, prev_d2, None, cfg=cfg
+        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, prev_d2, None, was_ever_held=F, cfg=cfg,
     )
     assert info_farther["dense"] < 0.0, "moving farther since last step must earn negative shaping"
 
@@ -1161,7 +1354,8 @@ def _self_test():
     #    regardless of joint angle, but this also checks the joint gate
     #    directly: closed-but-not-lifted should also not count as holding).
     _, info = compute_reward(
-        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg=cfg
+        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
     )
     assert not info["holding"], info
     lifted_but_open = (0.28, 0.0, 0.10)
@@ -1169,7 +1363,8 @@ def _self_test():
     # and cube coincide (dist=0, within touch_threshold), so this is also
     # the natural point to establish touched=True before grasping.
     _, info_touch_step = compute_reward(
-        lifted_but_open, Q, lifted_but_open, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg=cfg
+        lifted_but_open, Q, lifted_but_open, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
     )
     assert not info_touch_step["holding"], "lifted with an open gripper should not count as holding"
     assert info_touch_step["touched"] and info_touch_step["milestone_bonus"] == cfg.touch_bonus, info_touch_step
@@ -1183,7 +1378,7 @@ def _self_test():
     lifted = (0.28, 0.0, 0.10)
     _, info = compute_reward(
         lifted, Q, lifted, zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, info_touch_step["touched"], info_touch_step["dist"], None, cfg=cfg,
+        F, info_touch_step["touched"], info_touch_step["dist"], None, was_ever_held=F, cfg=cfg,
     )
     assert info["holding"] and info["phase"] == "transport", info
     assert info["milestone_bonus"] == cfg.grasp_bonus, "first step of holding must fire grasp_bonus exactly, not touch_bonus again"
@@ -1196,12 +1391,35 @@ def _self_test():
     #     here), removing any reason to delay finishing.
     _, info_still_holding = compute_reward(
         lifted, Q, lifted, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, info["touched"], info["dist"], None, cfg=cfg,
+        True, info["touched"], info["dist"], None, was_ever_held=info["ever_held"], cfg=cfg,
     )
     assert info_still_holding["holding"] and info_still_holding["milestone_bonus"] == 0.0, (
         "grasp_bonus must fire only once, not every step holding continues"
     )
     assert info_still_holding["dense"] == 0.0, "holding still (no progress toward target) must earn zero shaping"
+
+    # 5c. THE regression test for the run12 grasp_bonus farming bug
+    # (2026-09-06 -- see grasp_bonus's and was_ever_held's own
+    # docstrings): grasp_bonus must NOT fire again when holding is LOST
+    # (gripper opens) and then RE-established later the same episode --
+    # only the very first establishment ever counts. Reuses `info` (test
+    # 5's established hold) as the starting point.
+    _, info_lost = compute_reward(
+        lifted, Q, lifted, zero_vel, gripper_open_joint, zero_joint_vel,
+        True, info["touched"], info["dist"], None, was_ever_held=info["ever_held"], cfg=cfg,
+    )
+    assert not info_lost["holding"], "test setup: opening the gripper must end holding"
+    assert info_lost["ever_held"], "ever_held must remain sticky-True even after holding is lost"
+    _, info_regrasped = compute_reward(
+        lifted, Q, lifted, zero_vel, gripper_closed_joint, zero_joint_vel,
+        info_lost["holding"], info_lost["touched"], info_lost["dist"], None,
+        was_ever_held=info_lost["ever_held"], cfg=cfg,
+    )
+    assert info_regrasped["holding"], "test setup: re-closing at the same position must re-establish holding"
+    assert info_regrasped["milestone_bonus"] == 0.0, (
+        "grasp_bonus must NOT fire again on a re-established hold later the same episode -- "
+        "only the first-ever establishment counts (the run12 farming bug this fixes)"
+    )
 
     # 6. Regression test for a real bug caught during validation against
     # recorded teleop data: a cube barely above rest height (e.g. still
@@ -1212,25 +1430,48 @@ def _self_test():
     gripper_far_away = (-0.1, 0.3, 0.15)
     _, info = compute_reward(
         gripper_far_away, Q, cube_barely_elevated, zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, F, None, None, cfg=cfg,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
     )
     assert not info["holding"], "closed gripper far from a barely-elevated cube must not count as holding"
 
+    # 6b. THE regression test for the run12 lift_threshold farming bug
+    # (2026-09-06 -- see lift_threshold's own docstring): a cube grazed up
+    # to roughly the real observed accidental-jostle height (~9mm above
+    # its ~0.015m resting height) by a gripper that IS genuinely closed
+    # and directly on top of it (proximity and between_jaws both
+    # satisfied) must still NOT count as a genuine hold -- only
+    # `lift_threshold`'s stricter bar does. Directly encodes the real
+    # per-step diagnostic finding, not a hypothetical.
+    graze_height = 0.024  # matches the real observed peak from run12's diagnostic replay
+    assert cfg.table_z + 0.015 < graze_height < cfg.lift_threshold, (
+        "test setup: must be a real graze above resting height, but still below the (now-raised) lift_threshold"
+    )
+    cube_grazed = (0.28, 0.0, graze_height)
+    _, info_grazed = compute_reward(
+        cube_grazed, Q, cube_grazed, zero_vel, gripper_closed_joint, zero_joint_vel,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
+    )
+    assert not info_grazed["holding"], (
+        "a millimeter-scale accidental graze above resting height must not establish holding, "
+        "even with the gripper genuinely closed and directly on the cube"
+    )
+
     # 7. Regression test for a second real bug -- caught not by replay
     # validation but by manually tracing the (pre-redesign) self-test's
-    # own numbers. lift_threshold (0.02m) sits ABOVE the place target's
+    # own numbers. lift_threshold (0.04m) sits ABOVE the place target's
     # resting height (0.015m) -- necessarily true, since a successful
     # place ends with the cube back down near table height. Confirm
     # holding + transport phase PERSIST when an already-held cube is
     # lowered onto the target, despite the height drop.
     _, info_step1 = compute_reward(
         (0.28, 0.0, 0.10), Q, (0.28, 0.0, 0.10), zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, F, None, None, cfg=cfg,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
     )
     assert info_step1["holding"], "step 1 should establish a genuine hold while elevated"
     _, info_step2 = compute_reward(
         cfg.target_pos, Q, cfg.target_pos, zero_vel, gripper_closed_joint, zero_joint_vel,
-        info_step1["holding"], info_step1["touched"], info_step1["dist"], None, cfg=cfg,
+        info_step1["holding"], info_step1["touched"], info_step1["dist"], None,
+        was_ever_held=info_step1["ever_held"], cfg=cfg,
     )
     assert info_step2["holding"] and info_step2["phase"] == "transport", (
         "still-closed gripper lowering an already-held cube onto the target must stay in the "
@@ -1239,7 +1480,7 @@ def _self_test():
     # Confirm the OLD (fixed) behavior really was broken -- the strict,
     # stateless is_grasped() check (by design, see its own docstring) still
     # returns False at the exact target height, since 0.015m is not above
-    # lift_threshold (0.02m). Expected and correct for is_grasped()
+    # lift_threshold (0.04m). Expected and correct for is_grasped()
     # specifically -- it's exactly why compute_reward() must not use it
     # for the phase switch.
     assert not is_grasped(cfg.target_pos, Q, cfg.target_pos, gripper_closed_joint, cfg)
@@ -1248,7 +1489,7 @@ def _self_test():
     # with was_holding=True carried in from the previous step.
     _, info_released = compute_reward(
         cfg.target_pos, Q, cfg.target_pos, zero_vel, gripper_open_joint, zero_joint_vel,
-        True, True, 0.0, None, cfg=cfg,
+        True, True, 0.0, None, was_ever_held=True, cfg=cfg,
     )
     assert not info_released["holding"], "an opened gripper must not count as holding regardless of was_holding"
 
@@ -1271,11 +1512,11 @@ def _self_test():
     assert abs(_dist3(horizontal_step_pos, cfg.target_pos) - d1) < 1e-9
     _, info_vertical = compute_reward(
         vertical_step_pos, Q, vertical_step_pos, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, start_dist, None, cfg=cfg,
+        True, True, start_dist, None, was_ever_held=True, cfg=cfg,
     )
     _, info_horizontal = compute_reward(
         horizontal_step_pos, Q, horizontal_step_pos, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, start_dist, None, cfg=cfg,
+        True, True, start_dist, None, was_ever_held=True, cfg=cfg,
     )
     assert abs(info_vertical["dense"] - info_horizontal["dense"]) < 1e-9, (
         info_vertical["dense"], info_horizontal["dense"],
@@ -1284,23 +1525,25 @@ def _self_test():
     # 10. Success bonus only fires when actually placed (at rest, at the target).
     reward_at_target_still, info = compute_reward(
         cfg.target_pos, Q, cfg.target_pos, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, 0.05, None, cfg=cfg,
+        True, True, 0.05, None, was_ever_held=True, cfg=cfg,
     )
     assert info["placed"], info
     fast_vel = (1.0, 0.0, 0.0)  # swinging through, not resting
     reward_at_target_moving, info = compute_reward(
         cfg.target_pos, Q, cfg.target_pos, fast_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, 0.05, None, cfg=cfg,
+        True, True, 0.05, None, was_ever_held=True, cfg=cfg,
     )
     assert not info["placed"], "fast-moving cube passing through the target should not count as placed"
     assert reward_at_target_still > reward_at_target_moving + cfg.success_bonus - 0.1
 
     # 11. Action penalty must reduce reward, all else equal.
     still = compute_reward(
-        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, 0.0, None, cfg=cfg
+        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, 0.0, None, was_ever_held=F, cfg=cfg,
     )[0]
     moving = compute_reward(
-        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, (5.0,) * 6, F, F, 0.0, None, cfg=cfg
+        cube_at_start, Q, cube_at_start, zero_vel, gripper_open_joint, (5.0,) * 6,
+        F, F, 0.0, None, was_ever_held=F, cfg=cfg,
     )[0]
     assert moving < still, (moving, still)
 
@@ -1309,12 +1552,13 @@ def _self_test():
     near_cube = (0.29, 0.0, 0.02)  # within touch_threshold of cube_at_start but not holding (gripper open)
     assert _dist3(near_cube, cube_at_start) < cfg.touch_threshold
     _, info_first_touch = compute_reward(
-        near_cube, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel, F, F, None, None, cfg=cfg
+        near_cube, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
     )
     assert info_first_touch["touched"] and info_first_touch["milestone_bonus"] == cfg.touch_bonus, info_first_touch
     _, info_second_touch = compute_reward(
         near_cube, Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, info_first_touch["touched"], info_first_touch["dist"], None, cfg=cfg,
+        F, info_first_touch["touched"], info_first_touch["dist"], None, was_ever_held=F, cfg=cfg,
     )
     assert info_second_touch["milestone_bonus"] == 0.0, "touch_bonus must fire only once, not every step touching"
 
@@ -1377,7 +1621,8 @@ def _self_test():
     assert cube_beside[2] - cfg.table_z > cfg.lift_threshold, "test setup: must satisfy the height check too"
     assert not is_between_jaws(lifted, Q, cube_beside, cfg), "test setup: must fail the new geometric check"
     _, info_beside = compute_reward(
-        lifted, Q, cube_beside, zero_vel, gripper_closed_joint, zero_joint_vel, F, F, None, None, cfg=cfg
+        lifted, Q, cube_beside, zero_vel, gripper_closed_joint, zero_joint_vel,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
     )
     assert not info_beside["holding"], (
         "run7 regression: a closed gripper positioned BESIDE the cube (not around it) must not "
@@ -1398,7 +1643,7 @@ def _self_test():
     cube_far_axis = tuple(lifted[i] + 0.08 * axis[i] for i in range(3))
     _, info_close_far = compute_reward(
         lifted, Q, cube_far_axis, zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, F, None, gripper_open_joint, cfg=cfg,
+        F, F, None, gripper_open_joint, was_ever_held=F, cfg=cfg,
     )
     assert not info_close_far["between_jaws"], "test setup: must be outside the between-jaws zone"
     assert info_close_far["grasp_close"] == 0.0, "closing motion outside the between-jaws zone must earn nothing"
@@ -1415,7 +1660,7 @@ def _self_test():
     assert partially_closed_joint > cfg.gripper_closed_threshold, "test setup: must not count as closed yet"
     _, info_closing = compute_reward(
         lifted, Q, cube_between, zero_vel, partially_closed_joint, zero_joint_vel,
-        F, F, None, gripper_open_joint, cfg=cfg,
+        F, F, None, gripper_open_joint, was_ever_held=F, cfg=cfg,
     )
     assert info_closing["between_jaws"], "test setup: must be a valid between-jaws position"
     assert not info_closing["holding"], "test setup: must not yet be closed enough to establish holding"
@@ -1426,7 +1671,7 @@ def _self_test():
     # partially-closed value for the same reason as 16b.
     _, info_still_closed = compute_reward(
         lifted, Q, cube_between, zero_vel, partially_closed_joint, zero_joint_vel,
-        F, F, None, partially_closed_joint, cfg=cfg,
+        F, F, None, partially_closed_joint, was_ever_held=F, cfg=cfg,
     )
     assert info_still_closed["grasp_close"] == 0.0, "no change in closedness must earn zero grasp_close shaping"
 
@@ -1435,7 +1680,7 @@ def _self_test():
     # is genuine potential-based delta shaping, not a one-sided bonus.
     _, info_opening = compute_reward(
         lifted, Q, cube_between, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, F, None, gripper_closed_joint, cfg=cfg,
+        F, F, None, gripper_closed_joint, was_ever_held=F, cfg=cfg,
     )
     assert info_opening["grasp_close"] < 0.0, "opening while between the jaws must earn negative shaping"
 
@@ -1444,7 +1689,7 @@ def _self_test():
     # already-closed gripper during transport.
     _, info_holding_close = compute_reward(
         lifted, Q, cube_between, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, None, gripper_open_joint, cfg=cfg,
+        True, True, None, gripper_open_joint, was_ever_held=True, cfg=cfg,
     )
     assert info_holding_close["holding"], "test setup: must already be holding"
     assert info_holding_close["grasp_close"] == 0.0, "grasp_close must not pay out once already holding"
@@ -1468,7 +1713,7 @@ def _self_test():
     # video, which previously earned neither reward nor penalty.
     _, info_premature = compute_reward(
         (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, F, None, None, cfg=premature_test_cfg,
+        F, F, None, None, was_ever_held=F, cfg=premature_test_cfg,
     )
     assert not info_premature["between_jaws"], "test setup: must be far outside the between-jaws zone"
     assert not info_premature["holding"], "test setup: must not be holding"
@@ -1480,7 +1725,7 @@ def _self_test():
     # is never "prematurely closed," regardless of position).
     _, info_open_far = compute_reward(
         (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, F, None, None, cfg=premature_test_cfg,
+        F, F, None, None, was_ever_held=F, cfg=premature_test_cfg,
     )
     assert info_open_far["premature_close_penalty"] == 0.0, "an OPEN gripper must never incur the premature-close penalty"
 
@@ -1493,7 +1738,7 @@ def _self_test():
     # `between_jaws`, not on `holding`).
     _, info_between_no_penalty = compute_reward(
         lifted, Q, cube_between, zero_vel, partially_closed_joint, zero_joint_vel,
-        F, F, None, None, cfg=premature_test_cfg,
+        F, F, None, None, was_ever_held=F, cfg=premature_test_cfg,
     )
     assert info_between_no_penalty["between_jaws"], "test setup: must be a valid between-jaws position"
     assert not info_between_no_penalty["holding"], "test setup: must not yet be closed enough to establish holding"
@@ -1505,7 +1750,7 @@ def _self_test():
     # gated on `not holding` first, same as grasp_close_weight.
     _, info_holding_no_penalty = compute_reward(
         lifted, Q, cube_between, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, None, None, cfg=premature_test_cfg,
+        True, True, None, None, was_ever_held=True, cfg=premature_test_cfg,
     )
     assert info_holding_no_penalty["holding"], "test setup: must already be holding"
     assert info_holding_no_penalty["premature_close_penalty"] == 0.0, (
@@ -1518,7 +1763,7 @@ def _self_test():
     # premature_test_cfg above.
     _, info_premature_production = compute_reward(
         (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_closed_joint, zero_joint_vel,
-        F, F, None, None, cfg=cfg,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
     )
     assert info_premature_production["premature_close_penalty"] == 0.0, (
         "production default premature_close_weight must be 0.0 (2026-09-06 experiment -- see module docstring)"
@@ -1544,14 +1789,14 @@ def _self_test():
     # reach/place shaping (test 1 above).
     _, info_align_fresh = compute_reward(
         gripper_touch_pos, Q, cube_lat_far, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, F, None, None, prev_lateral=None, cfg=cfg,
+        F, F, None, None, was_ever_held=F, prev_lateral=None, cfg=cfg,
     )
     assert info_align_fresh["lateral_align"] == 0.0, "fresh entry into the alignment zone must earn zero shaping"
 
     # 18b. Improving (lateral offset decreasing since last step) -> positive shaping.
     _, info_align_improve = compute_reward(
         gripper_touch_pos, Q, cube_lat_near, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, F, None, None, prev_lateral=lateral_far, cfg=cfg,
+        F, F, None, None, was_ever_held=F, prev_lateral=lateral_far, cfg=cfg,
     )
     assert info_align_improve["lateral_align"] > 0.0, "reducing lateral offset (better centered) must earn positive shaping"
 
@@ -1559,7 +1804,7 @@ def _self_test():
     # symmetric flip side of 18b.
     _, info_align_worsen = compute_reward(
         gripper_touch_pos, Q, cube_lat_far, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, F, None, None, prev_lateral=lateral_near, cfg=cfg,
+        F, F, None, None, was_ever_held=F, prev_lateral=lateral_near, cfg=cfg,
     )
     assert info_align_worsen["lateral_align"] < 0.0, "increasing lateral offset (worse centered) must earn negative shaping"
 
@@ -1567,7 +1812,7 @@ def _self_test():
     # property as every other potential-based term in this module.
     _, info_align_same = compute_reward(
         gripper_touch_pos, Q, cube_lat_far, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, F, None, None, prev_lateral=lateral_far, cfg=cfg,
+        F, F, None, None, was_ever_held=F, prev_lateral=lateral_far, cfg=cfg,
     )
     assert info_align_same["lateral_align"] == 0.0, "unchanged lateral offset must earn zero shaping (no free lunch)"
 
@@ -1577,7 +1822,7 @@ def _self_test():
     # value happened to be passed.
     _, info_align_far_away = compute_reward(
         (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
-        F, F, None, None, prev_lateral=0.001, cfg=cfg,
+        F, F, None, None, was_ever_held=F, prev_lateral=0.001, cfg=cfg,
     )
     assert info_align_far_away["lateral_align"] == 0.0, (
         "outside the activation range, alignment shaping must not apply regardless of prev_lateral"
@@ -1590,10 +1835,95 @@ def _self_test():
     # alone, with no separate special-casing needed).
     _, info_align_holding = compute_reward(
         lifted, Q, cube_between, zero_vel, gripper_closed_joint, zero_joint_vel,
-        True, True, None, None, prev_lateral=1.0, cfg=cfg,
+        True, True, None, None, was_ever_held=True, prev_lateral=1.0, cfg=cfg,
     )
     assert info_align_holding["holding"], "test setup: must already be holding"
     assert info_align_holding["lateral_align"] == 0.0, "alignment shaping must not apply once already holding"
+
+    # -- between_jaws hysteresis (2026-09-06) --
+    # Direct unit tests of _between_jaws_effective() itself first (cheap,
+    # precise), then an end-to-end sequence through compute_reward()
+    # confirming grasp_close_weight's shaping actually benefits from it.
+
+    # 19a. Raw True always resets the streak to 0 and is effective,
+    # regardless of any prior miss streak.
+    assert _between_jaws_effective(True, 5, cfg) == (True, 0)
+    assert _between_jaws_effective(True, None, cfg) == (True, 0)
+
+    # 19b. Raw False on a fresh episode (prev_miss_streak=None) must NOT
+    # get free grace -- no history means no earned hysteresis yet.
+    eff_fresh, streak_fresh = _between_jaws_effective(False, None, cfg)
+    assert not eff_fresh and streak_fresh > cfg.between_jaws_grace_steps, (
+        "a fresh episode starting outside the window must not get unearned grace"
+    )
+
+    # 19c. Consecutive misses starting from a genuine hit stay effective
+    # up to and including exactly between_jaws_grace_steps misses -- the
+    # boundary case matters, not just "somewhere in the middle."
+    eff1, streak1 = _between_jaws_effective(False, 0, cfg)  # 1st consecutive miss after a hit
+    assert eff1 and streak1 == 1, "a single miss right after a hit must still be within the grace window"
+    eff2, streak2 = _between_jaws_effective(False, streak1, cfg)  # 2nd consecutive miss
+    assert eff2 and streak2 == cfg.between_jaws_grace_steps, (
+        "exactly between_jaws_grace_steps consecutive misses must still be within the grace window"
+    )
+
+    # 19d. One miss beyond the grace window must stop being effective --
+    # confirms the window genuinely ends, not just an off-by-one guess.
+    eff3, streak3 = _between_jaws_effective(False, streak2, cfg)  # 3rd consecutive miss
+    assert not eff3 and streak3 == cfg.between_jaws_grace_steps + 1, (
+        "a miss streak beyond the grace window must no longer be treated as effectively between the jaws"
+    )
+
+    # 19e-h. End-to-end through compute_reward(): grasp_close_weight must
+    # keep paying out through up to between_jaws_grace_steps consecutive
+    # flickers away from the strict window, not just when raw
+    # is_between_jaws() happens to be true that exact step -- then stop
+    # once the flicker genuinely outlasts the grace period. Joint values
+    # stay strictly above gripper_closed_threshold throughout (same
+    # reasoning as test 16b) so `holding` never establishes and confounds
+    # the close_shaping-only property being tested here. Reuses
+    # `cube_between` (a genuine hit) and `cube_far_axis` (a genuine miss,
+    # from test 16a) so no new geometry fixtures are needed.
+    j0, j1, j2, j3, j4 = 1.0, 0.8, 0.6, 0.4, 0.35
+    for j in (j0, j1, j2, j3, j4):
+        assert j > cfg.gripper_closed_threshold, "test setup: must never count as closed enough to hold"
+
+    _, info_hz_hit = compute_reward(
+        lifted, Q, cube_between, zero_vel, j1, zero_joint_vel,
+        F, F, None, j0, was_ever_held=F, cfg=cfg,
+    )
+    assert info_hz_hit["between_jaws"], "test setup: must be a genuine hit"
+    assert info_hz_hit["jaws_miss_streak"] == 0
+    assert info_hz_hit["grasp_close"] > 0.0, "closing while genuinely between the jaws must be rewarded"
+
+    _, info_hz_miss1 = compute_reward(
+        lifted, Q, cube_far_axis, zero_vel, j2, zero_joint_vel,
+        F, F, None, j1, was_ever_held=F, prev_jaws_miss_streak=info_hz_hit["jaws_miss_streak"], cfg=cfg,
+    )
+    assert not info_hz_miss1["between_jaws"], "test setup: must be a genuine miss (raw check)"
+    assert info_hz_miss1["jaws_miss_streak"] == 1
+    assert info_hz_miss1["grasp_close"] > 0.0, (
+        "closing must still be rewarded on the 1st consecutive miss -- within the grace window"
+    )
+
+    _, info_hz_miss2 = compute_reward(
+        lifted, Q, cube_far_axis, zero_vel, j3, zero_joint_vel,
+        F, F, None, j2, was_ever_held=F, prev_jaws_miss_streak=info_hz_miss1["jaws_miss_streak"], cfg=cfg,
+    )
+    assert info_hz_miss2["jaws_miss_streak"] == cfg.between_jaws_grace_steps
+    assert info_hz_miss2["grasp_close"] > 0.0, (
+        "closing must still be rewarded on exactly the between_jaws_grace_steps-th consecutive miss"
+    )
+
+    _, info_hz_miss3 = compute_reward(
+        lifted, Q, cube_far_axis, zero_vel, j4, zero_joint_vel,
+        F, F, None, j3, was_ever_held=F, prev_jaws_miss_streak=info_hz_miss2["jaws_miss_streak"], cfg=cfg,
+    )
+    assert info_hz_miss3["jaws_miss_streak"] == cfg.between_jaws_grace_steps + 1
+    assert info_hz_miss3["grasp_close"] == 0.0, (
+        "closing must earn nothing once the miss streak genuinely outlasts the grace window, "
+        "even though the joint is still moving toward closed"
+    )
 
     print("[OK] pickplace_reward self-test passed")
     print(f"  closer_shaping={info_closer['dense']:+.4f} farther_shaping={info_farther['dense']:+.4f}")
