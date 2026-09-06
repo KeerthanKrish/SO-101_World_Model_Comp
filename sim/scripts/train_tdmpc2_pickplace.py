@@ -140,6 +140,20 @@ parser.add_argument(
     "a long pure-random warmup, and every step of it is wasted opportunity to build on what's already "
     "learned.",
 )
+parser.add_argument(
+    "--eval-only", action="store_true",
+    help="Skip training entirely. Requires --resume-from. Loads that checkpoint, runs exactly "
+    "ONE eval episode (agent.act(eval_mode=True), same as a normal training-time eval), and "
+    "writes both the usual eval video AND a per-step diagnostic CSV (step, the raw commanded "
+    "gripper action, reward, gripper_joint_pos, axial/lateral offset, between_jaws/holding/"
+    "touched) to <run_video_dir>/eval_only_<checkpoint-name>_steps.csv, then exits -- no buffer, "
+    "no logger, no training loop constructed at all. Added 2026-09-06 specifically to answer one "
+    "question run11's own eval logs couldn't: is_holding() never fired even in the episodes where "
+    "between_jaws briefly did -- this checks whether that's a genuine TIMING problem (the cube "
+    "only in the correctly-positioned zone for a handful of steps, not enough time to close) "
+    "versus the gripper simply never trending toward closed even while it had time to. See "
+    "docs/decisions.md.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -170,6 +184,10 @@ from tensordict.tensordict import TensorDict
 # reordering costs nothing.
 sys.path.insert(0, "/home/keerthan/SO-101-WM/sim")
 from envs.pickplace_env import PickPlaceEnv, PickPlaceEnvCfg  # isort:skip
+# _jaw_offsets -- only used by run_eval_episode()'s optional step_log_path
+# diagnostic (2026-09-06), to report the raw axial/lateral offset each
+# step rather than just the binary between_jaws flag already in `info`.
+from envs.pickplace_reward import _jaw_offsets  # isort:skip
 
 sys.path.insert(0, "/home/keerthan/SO-101-WM/sim/scripts")
 from tdmpc2_pickplace_env import PickPlaceTDMPC2Wrapper  # isort:skip
@@ -362,7 +380,7 @@ def to_td(obs, action=None, reward=None, terminated=None, action_dim=6):
     )
 
 
-def run_eval_episode(env, base_env, agent, cfg, video_path):
+def run_eval_episode(env, base_env, agent, cfg, video_path, step_log_path=None):
     """Runs ONE episode with the CURRENT policy (eval_mode=True -- no
     exploration noise), using the SAME env instance training already
     uses (a second Isaac Sim SimulationContext isn't possible in this
@@ -388,6 +406,27 @@ def run_eval_episode(env, base_env, agent, cfg, video_path):
     the run7 false positive that motivated adding this check in the first
     place was exactly a case where naive proximity alone couldn't tell
     these apart.
+
+    step_log_path (added 2026-09-06, --eval-only): when given, writes a
+    per-step CSV of (step, the raw commanded gripper action, reward,
+    gripper_joint_pos, axial, lateral, between_jaws, holding, touched) to
+    this path. The ever_* booleans above already say WHETHER
+    between_jaws/holding ever fired this episode, but not for how many
+    consecutive steps, nor what the gripper was actually doing (already
+    trending closed but out of time, vs. not moving toward closed at
+    all) during that window -- exactly the distinction needed to tell a
+    genuine TIMING problem (cube only correctly positioned for a handful
+    of steps) apart from the closing incentive itself still being too
+    weak. Deliberately recomputes axial/lateral independently via
+    _jaw_offsets() on the same gripper_pos/gripper_quat/cube_pos values
+    pickplace_env.py's own _get_dones() already reads (grasp_points_local(),
+    cube.data.root_pos_w) rather than modifying pickplace_env.py to expose
+    them -- keeps this diagnostic fully outside the reward/env classes
+    actual training depends on, at the cost of only re-deriving two
+    scalars pickplace_reward.py already computes internally every step
+    anyway. None of this runs (nor is `step_log_path` ever passed) during
+    a real training run's own periodic eval calls -- default None leaves
+    every real call site's behavior byte-for-byte unchanged.
     """
     frames_dir = video_path + "_frames"
     os.makedirs(frames_dir, exist_ok=True)
@@ -397,6 +436,7 @@ def run_eval_episode(env, base_env, agent, cfg, video_path):
     info = {"success": False, "touched": False, "holding": False, "between_jaws": False}
     ep_reward, t, done = 0.0, 0, False
     ever_touched, ever_held, ever_between_jaws = False, False, False
+    step_rows = [] if step_log_path is not None else None
 
     while not done:
         obs_for_act = TensorDict(obs, batch_size=(), device="cpu") if isinstance(obs, dict) else obs
@@ -407,10 +447,26 @@ def run_eval_episode(env, base_env, agent, cfg, video_path):
         ever_held = ever_held or info["holding"]
         ever_between_jaws = ever_between_jaws or info["between_jaws"]
 
+        if step_rows is not None:
+            gripper_pos, gripper_quat = base_env._grasp_points_local()
+            cube_pos = (base_env.cube.data.root_pos_w - base_env.scene.env_origins)[0].cpu().tolist()
+            gripper_joint_pos = base_env.robot.data.joint_pos[0, base_env._joint_indices[-1]].item()
+            axial, lateral = _jaw_offsets(gripper_pos[0].cpu().tolist(), gripper_quat[0].cpu().tolist(), cube_pos)
+            action_gripper = action.reshape(-1)[-1].item()
+            step_rows.append(
+                f"{t},{action_gripper:+.4f},{reward.item():+.4f},{gripper_joint_pos:+.4f},"
+                f"{axial:+.4f},{lateral:+.4f},{info['between_jaws']},{info['holding']},{info['touched']}"
+            )
+
         base_env.sim.render()
         rgb = scene_cam.data.output["rgb"][0, ..., :3].cpu().numpy()
         Image.fromarray(rgb).save(os.path.join(frames_dir, f"frame_{t:05d}.png"))
         t += 1
+
+    if step_rows is not None:
+        with open(step_log_path, "w") as f:
+            f.write("step,action_gripper,reward,gripper_joint_pos,axial,lateral,between_jaws,holding,touched\n")
+            f.write("\n".join(step_rows) + "\n")
 
     subprocess.run(
         [
@@ -472,6 +528,30 @@ def main():
         # below starts using the agent at all.
         agent.load(args_cli.resume_from)
         print(f"[INFO] Resumed agent weights from {args_cli.resume_from}")
+
+    if args_cli.eval_only:
+        # No buffer/logger/training loop at all -- see --eval-only's own
+        # help text. Requires --resume-from since there's nothing
+        # meaningful to evaluate about a freshly/randomly initialized
+        # agent for this diagnostic's purpose.
+        if args_cli.resume_from is None:
+            raise ValueError("--eval-only requires --resume-from (nothing meaningful to evaluate otherwise).")
+        ckpt_name = os.path.splitext(os.path.basename(args_cli.resume_from))[0]
+        video_path = os.path.join(run_video_dir, f"eval_only_{ckpt_name}.mp4")
+        step_log_path = os.path.join(run_video_dir, f"eval_only_{ckpt_name}_steps.csv")
+        eval_reward, eval_success, eval_touched, eval_held, eval_between_jaws = run_eval_episode(
+            env, base_env, agent, cfg, video_path, step_log_path=step_log_path
+        )
+        print(f"[INFO] eval-only episode -- reward={eval_reward:+.3f} success={eval_success} "
+              f"touched={eval_touched} between_jaws={eval_between_jaws} held={eval_held}")
+        print(f"[INFO] video={video_path}")
+        print(f"[INFO] steps_csv={step_log_path}")
+        # NOT simulation_app.close() here -- the `if __name__ ==
+        # "__main__":` block at the bottom of this file already does
+        # that exactly once after main() returns, on every code path.
+        # Calling it a second time here would be redundant at best.
+        return
+
     buffer = Buffer(cfg)
     logger = Logger(cfg)
     print(agent.model)
