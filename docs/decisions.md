@@ -523,3 +523,243 @@ run, since nothing currently checks that an explicitly-passed name
 doesn't collide with an existing one (the auto-generated timestamp
 default always will avoid this; only a manually-chosen `--run-name`
 could still collide).
+
+---
+
+**Decision**: Add `axial_align_weight` (continuous potential-based
+shaping over the axial/depth component of `_jaw_offsets()`), then fully
+revert it one round later after it failed to help.
+
+**Why**: The user watched run9's videos and flagged two near-miss
+episodes -- the gripper pushing the cube along with clear directed
+intent, close enough that closing at the right moment "would've basically
+picked it up." My first read of the frames was wrong: I initially
+concluded the gripper was CLOSED during these pushes and began
+implementing gripper-aperture pre-shaping. The user corrected this
+directly ("no hang on, the gripper is open when its pushing it") --
+re-examining the same frames with that correction showed the gripper
+genuinely open, but the cube buried near the jaws' pivot/hinge (where the
+open gap is narrowest) rather than out near the fingertips (where it's
+widest). Hypothesized root cause: `reach_weight` rewards driving raw
+gripper-to-cube distance toward zero, with no notion of a correct
+standoff distance, so it keeps paying out for pulling the pivot itself
+past the point where the fingers could actually catch the cube.
+`axial_align_weight` mirrored `lateral_align_weight` exactly (same
+potential-based delta, same `align_activation_range` gate) but over the
+axial component instead of the lateral one, rewarding any position inside
+the valid `[grasp_reach_min, grasp_reach_max]` window and penalizing
+drifting further outside it in either direction.
+
+Run10 (100,000 steps, warm-started from run9, the longest single run to
+date) showed no improvement once actually reviewed frame-by-frame: full
+open-loop "reach once and freeze" behavior across every sampled episode
+-- the arm made contact within 1-2 seconds, then held a static pose for
+the remainder of a 25-second episode regardless of what happened next
+(the cube sometimes stayed wedged near the pivot, sometimes got pushed
+completely out of reach with the arm never re-engaging), and the gripper
+never closed even once, in any sampled frame, across three full episodes
+inspected in detail. Since axial_align_weight only concerns *position*,
+not the actual close decision, and the video showed the real remaining
+gap was the gripper never attempting to close at all, keeping the term
+would only have added complexity without addressing the actual problem.
+Reverted cleanly via `git revert` (not deleted-in-place), preserving the
+implementation and its self-test coverage in history in case the axial
+positioning question becomes relevant again later.
+
+**How to apply**: The corrected diagnosis technique -- re-examining
+earlier frames with fresh eyes after a direct user correction, rather
+than defending the first read -- is the reusable lesson here, not the
+specific reward term. See docs/progress.md for the full narrative
+including the misdiagnosis and correction, and the entry below for what
+actually turned out to matter (the closing incentive itself).
+
+---
+
+**Decision**: Widen `grasp_reach_min` (-0.01 -> -0.04), raise
+`grasp_close_weight` (1.0 -> 2.5), lower `premature_close_weight`
+(0.3 -> 0.1) -- a "closing-focused" redesign replacing the reverted
+axial-alignment attempt above.
+
+**Why**: With axial_align_weight reverted, the real question became "why
+does the gripper never close at all, across runs 8, 9, and 10." Checking
+`is_between_jaws()`'s actual trigger rate against where contact was
+really happening (the cube consistently landing right at/beyond the OLD
+`grasp_reach_min` boundary, wedged near the pivot, not out toward the
+fingertips) showed it was almost never true at the policy's real contact
+point -- starving `grasp_close_weight` of any chance to fire, while
+`premature_close_weight` (gated on `not between_jaws`) fired on nearly
+every step the gripper had any closedness at all, since "not between
+jaws" was the overwhelmingly common case. Reward far more often for NOT
+closing than for closing is exactly a "never close" training signal.
+
+Three narrow changes targeting only this mechanism, deliberately leaving
+the reach/lateral-alignment machinery untouched (video review confirmed
+that part already works): widen the window so it actually covers the
+observed contact point, raise the closing reward so it's a dominant
+signal once reachable, lower the penalty so it no longer drowns that
+signal out.
+
+**How to apply**: Verified via an updated self-test (one boundary-
+dependent fixture needed adjusting once the window widened) and a full
+production-pipeline smoke test. Launched run11 (60,000 steps,
+warm-started from run9's checkpoint specifically -- NOT run10's, since
+run10's extra 100,000 steps were spent reinforcing the counterproductive
+"freeze" habit under the old incentive structure, and building on top of
+a more deeply entrenched bad habit seemed worse than restarting from the
+less-contaminated run9 checkpoint). Run11's frame-by-frame video review
+showed real improvement in the arm's dynamism (more exploratory,
+re-approaching behavior rather than "dive and freeze") but the objective
+per-episode logging (`between_jaws`/`held`, already emitted by
+`run_eval_episode()`) was the actual source of truth -- see the next two
+entries for why trusting that logging over a video read mattered here.
+
+---
+
+**Decision**: Zero out `premature_close_weight` entirely (0.1 -> 0.0) as
+a single-variable experiment, rather than combining it with a grace
+period.
+
+**Why**: The user watched run11's `eval_step_050399.mp4`/
+`eval_step_055389.mp4` and disputed my claim (based on reading extracted
+still frames) that the gripper was visibly closing -- correctly. Rather
+than re-litigate the same frame-reading approach, pulled the objective,
+ground-truth `touched`/`between_jaws`/`held` booleans `run_eval_episode()`
+already logs once per eval episode straight from the training log:
+`held` was `False` in every one of run11's 11 eval checkpoints, while
+`between_jaws` had flipped `True` in 4 of them -- something that
+essentially never happened in runs 9/10. So positioning had genuinely
+improved; closing specifically had not.
+
+To find out why, added `--eval-only` (see the next entry) and replayed
+run11's best checkpoint with new per-step logging (gripper joint angle,
+commanded gripper action, axial/lateral offset, `between_jaws`). That
+data ruled out "brief pass-through, no time to close": `between_jaws`
+fired dozens of times across one 500-step episode, including windows
+lasting 10+ consecutive steps. The gripper still barely moved even
+during those long windows, and the one place it dipped meaningfully
+(~0.06 radians toward closed) reversed within a few steps, climbing
+back to ~fully-open rather than continuing to close or settling.
+Mechanism: `premature_close_weight` is gated on `not between_jaws`, and
+`between_jaws` itself is unstable (true only ~15% of that episode,
+mostly in short bursts) -- so a policy partway through a slow,
+multi-step close is one small drift away from the penalty resuming on
+its still-partly-closed gripper. Reopening immediately, before the
+penalty can resume, is the locally safe strategy. The original reason
+this penalty existed (run8 closing carelessly far from the cube,
+regardless of position) is now separately handled by
+`grasp_close_weight`'s own `is_between_jaws()` gate, which did not exist
+yet when this penalty was first introduced.
+
+Considered combining the fix with a grace period (only charge the
+penalty after several consecutive out-of-window steps) or giving
+`between_jaws` itself hysteresis, but deliberately zeroed the weight
+outright first as the cleanest single-variable test of the underlying
+hypothesis -- if removing the penalty alone did not produce a real
+close, that would argue the instability theory needed one of those
+instead, not just less punishment.
+
+**How to apply**: Verified via self-test (the mechanism itself stays
+covered through a local nonzero-weight config, `premature_test_cfg`,
+even though the production default is 0.0) and a production smoke test.
+Launched run12 (60,000 steps, warm-started from run11's final
+checkpoint). Result: run12 produced this project's first-ever `held=True`
+eval result (step 40419) -- see the entries below for how that claim was
+verified rather than taken at face value, and what it actually turned
+out to mean.
+
+---
+
+**Decision**: Added `--eval-only` to `train_tdmpc2_pickplace.py` -- loads
+a checkpoint via `--resume-from`, runs exactly one deterministic eval
+episode, and writes a per-step diagnostic CSV alongside the usual eval
+video, then exits (no buffer/logger/training loop constructed at all).
+
+**Why**: `run_eval_episode()`'s existing once-per-episode
+`touched`/`between_jaws`/`held` booleans could say WHETHER something
+fired during an episode, but not for how many consecutive steps, nor
+what the gripper was actually doing during that window -- not enough to
+tell a genuine timing problem (the cube only correctly positioned for a
+handful of steps) apart from the closing incentive itself still being
+too weak, and not enough to independently verify a `held=True` result
+against is_holding()'s own four establishing conditions rather than
+trusting the flag at face value. Deliberately reads gripper/cube state
+directly from the env/robot (`_grasp_points_local()`, `cube.data.root_pos_w`)
+and calls `pickplace_reward.py`'s own pure helpers (`_jaw_offsets`,
+`_dist3`) rather than modifying `pickplace_env.py` to expose new fields
+-- keeps the diagnostic fully outside the classes actual training
+depends on. `step_log_path` defaults to `None` everywhere in
+`run_eval_episode()`, so this changes nothing about a real training
+run's own periodic eval calls.
+
+Extended once more (2026-09-06) with `cube_height`/`gripper_cube_dist`
+specifically to audit run12's `held=True` result against all four of
+`is_holding()`'s own conditions independently -- see the entry below for
+what that audit found.
+
+**How to apply**: `./isaaclab.sh -p sim/scripts/train_tdmpc2_pickplace.py
+--headless --enable_cameras --eval-only --resume-from <checkpoint.pt>
+--cube-pos 0.25 0.0 --min-std 0.5 --run-name <diagnostic-run-name>`.
+Always give it its own `--run-name` (e.g. `run12_diag`) distinct from
+the run being diagnosed, so the diagnostic video/CSV never lands in the
+same folder as that run's real output.
+
+---
+
+**Decision**: Add `between_jaws_grace_steps` hysteresis (via a new
+`_between_jaws_effective()` helper, gating ONLY `grasp_close_weight`/
+`premature_close_penalty`), raise `lift_threshold` (0.02 -> 0.04), and
+regate `grasp_bonus` on a genuinely episode-sticky `was_ever_held`
+instead of `was_holding`.
+
+**Why**: run12's `held=True` result (step 40419) needed verifying, not
+just accepting -- the same lesson as the video-misread entries above,
+applied to a claim built on logged data this time rather than my own
+eyes. Extended `--eval-only`'s CSV with `cube_height`/`gripper_cube_dist`
+and replayed the exact checkpoint. Finding: all four of `is_holding()`'s
+establishing conditions genuinely fired -- not a geometric false
+positive like the run7 bug -- but the actual lift was only ~9mm on a 3cm
+cube (`lift_threshold` required just 5mm above resting height), visibly
+settling back toward resting height within a few steps rather than being
+carried. It recurred 3 separate times in the one episode, each re-firing
+the full `grasp_bonus`, because that bonus was gated on "holding now but
+wasn't the previous step" (one-time per continuous streak), not "first
+time this episode" -- a policy could cheaply farm the milestone by
+grazing a razor-thin threshold repeatedly, with no additional reward for
+lifting higher or holding longer.
+
+Separately, the same replay showed `is_between_jaws()` flickering False
+for single steps in the middle of otherwise-sustained close attempts
+(true only ~15% of the episode, mostly short bursts) -- since
+`grasp_close_weight` is gated on it being true THIS step, those
+drop-outs zeroed the reward for steps where real progress toward closed
+was still being made, independent of `premature_close_weight` (already
+0.0) being a factor at all.
+
+Three changes, addressed together since all three surfaced from the same
+replay: `between_jaws_grace_steps` (default 2) forgives up to 2
+consecutive flicker-outs for the closing/premature-penalty gate
+specifically -- deliberately NOT touching `is_between_jaws()` itself or
+`is_grasped()`/`is_holding()`'s own establishment logic, which must stay
+exactly as strict as before (loosening the same check that gates a
+genuine hold would directly undermine the very next fix). `lift_threshold`
+raised to 0.04 (roughly 2.5x the observed accidental jostle). `grasp_bonus`
+regated on `was_ever_held`, a new parameter mirroring `touch_bonus`'s own
+`was_touched` pattern exactly, which never had this bug.
+
+**How to apply**: `was_ever_held` was added as a required (no default)
+parameter to `compute_reward()`, deliberately -- a silently-wrong default
+would let a caller forget to thread the real persisted value through
+without any error, exactly the kind of mistake this project's own
+`cfg=cfg`-positional bug (see the lateral-alignment entry above) already
+demonstrated is easy to make. Required updating and auditing all ~46
+`compute_reward()` call sites in the self-test (verified programmatically
+that none were missed) plus both real call sites (`pickplace_env.py`,
+`validate_reward_function.py`). Verified via 12 new self-test cases
+(direct unit tests of `_between_jaws_effective`, an end-to-end hysteresis
+sequence through `compute_reward()`, and real regression tests for both
+the lift and grasp_bonus farming bugs using the actual observed numbers),
+a full local + remote self-test pass, and a production smoke test.
+Launched run13, warm-started from run12's final checkpoint, as a
+relatively cheap verification that these specific fixes work as intended
+before committing to the much larger investment of a full, from-scratch
+clean retrain against the finalized reward design.

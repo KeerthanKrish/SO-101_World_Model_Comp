@@ -1022,3 +1022,248 @@ nearby one" (this entry) -- each step motivated by a specific, directly-
 observed failure mode, not by speculation. Whether the two newest terms
 actually close the remaining gap is run9's open question. Diffusion
 policy side remains fully dormant, deferred since 2026-08-31.
+
+### 2026-09-04 -- Migrated to a new Mac (again); run9 results reviewed, an
+axial-alignment fix proposed, initially misdiagnosed, then corrected
+
+Confirmed context/state was fully preserved across the Mac migration
+(docs/ and code sync via `git pull`, `sim/output/` untracked and synced
+only on request via `scp` -- see docs/preferences.md). Set up Tailscale/
+LAN connectivity and passwordless SSH from the new machine.
+
+Run9 finished: 40,000 steps, warm-started from run8. The user reviewed
+`eval_step_036427.mp4` and `eval_step_032435.mp4` directly and reported
+real, specific progress -- the arm touching the cube with the stationary
+part of the gripper and pushing it along, close enough that closing the
+gripper at the right moment "would've basically picked it up." Asked to
+look into making that happen.
+
+First pass at this was wrong. Reading the extracted frames, I concluded
+the gripper was CLOSED during these pushes and began implementing
+gripper-aperture pre-shaping (a `pre_shape_weight` config field) before
+the user corrected me directly: "no hang on, the gripper is open when
+its pushing it. i just want to make sure you understood that." Fully
+reverted the incomplete `pre_shape_weight` edit and re-examined the same
+frames with that correction in mind -- the gripper genuinely was open
+(a clear V-shape, visible gap between both prongs), but the cube sat
+buried near the jaws' pivot/hinge, where that gap is narrowest, rather
+than out near the fingertips, where it's widest. An axial reach-distance
+problem, not an aperture one. Plausible mechanism: `reach_weight` rewards
+driving raw gripper-to-cube distance toward zero, with no notion of a
+correct standoff distance, so it keeps paying out for pulling the pivot
+itself past the point where the fingers could actually catch the cube.
+
+Implemented `axial_align_weight` (mirroring `lateral_align_weight`
+exactly, over the axial component of `_jaw_offsets()` instead of the
+lateral one) after confirming the diagnosis with the user, who asked
+directly whether this would also address the gripper-closing timing --
+answered honestly that it wouldn't on its own (a separate, existing
+mechanism, `grasp_close_weight`, already exists for that), and that
+warm-starting again from run9 with a longer step budget (~60,000 vs.
+run9's 40,000) made sense specifically because this fix needs to
+counteract an already-reinforced "drive distance to zero" habit, not
+build on neutral ground. Launched run10: 60,000 steps, warm-started from
+run9.
+
+**Note for later readers**: this session also discovered and fixed the
+eval-video/checkpoint filename-collision data-loss bug documented above,
+and reorganized all surviving run output into per-run folders -- see the
+data-loss entry above and docs/decisions.md for the `--run-name` fix.
+
+### 2026-09-05 -- Run10 completed but never actually closes; reward
+redesigned around the closing incentive itself, not positioning
+
+Run10 finished: 100,000 steps (the longest single run yet), no crash.
+Frame-by-frame review of three full eval episodes (steps 85329, 90319,
+95309) told a different story than hoped: the arm reaches and makes
+contact within 1-2 seconds of a 25-second episode, then holds a
+completely static pose for the rest of it, regardless of what happens
+next. In two episodes the cube stayed wedged near the pivot the whole
+time (the exact problem `axial_align_weight` was meant to fix); in the
+third, the initial contact pushed the cube completely out of reach
+within the first few seconds, and the arm just kept reaching at empty
+space for the remaining ~20 seconds, never re-engaging. Across all three
+episodes, traced frame-by-frame, **the gripper never closed even once**.
+
+Since `axial_align_weight` only concerns position, not the actual close
+decision, and the real remaining gap was clearly "never attempts to
+close at all," kept the axial term implemented (self-tested, working as
+designed) but reverted it via `git revert` rather than build further on
+top of a fix that was not the actual bottleneck -- preserves the
+implementation and its tests in history without carrying dead weight
+forward.
+
+Redesigned around the closing mechanism directly: checked
+`is_between_jaws()`'s actual trigger rate against where contact was
+really happening (almost never true at the policy's real contact point,
+given the cube's tendency to land right at/beyond the old
+`grasp_reach_min` boundary) and found the likely cause of "never closes"
+-- `grasp_close_weight` (rewards closing) almost never got to fire, while
+`premature_close_weight` (penalizes closing) fired on nearly every step
+the gripper had any closedness at all, since "not between jaws" was the
+overwhelmingly common case at the real contact point. Three narrow
+changes: widened `grasp_reach_min` (-0.01 -> -0.04) so the window
+actually covers where contact happens, raised `grasp_close_weight`
+(1.0 -> 2.5) so it dominates once reachable, lowered
+`premature_close_weight` (0.3 -> 0.1) so it no longer drowns that signal
+out. See docs/reward_function.md and docs/decisions.md for the full
+mechanism.
+
+Verified via an updated self-test (one fixture needed adjusting once the
+window widened -- a test asserting "behind the pivot must fail" using an
+offset that cleared the OLD boundary but not the new one, caught before
+it could silently pass for the wrong reason) and a production smoke
+test. Launched run11: 60,000 steps, warm-started from **run9's**
+checkpoint specifically, not run10's -- run10's extra 100,000 steps were
+spent reinforcing the counterproductive "freeze" habit under the old
+incentive structure, and building on top of a more deeply entrenched bad
+habit seemed like a worse starting point than the less-contaminated
+run9 checkpoint.
+
+### 2026-09-05/06 -- Run11 results: a video-read corrected by objective
+logging, premature_close_weight zeroed, run12 launched
+
+Run11 finished: 60,000 steps, no crash. Frame-by-frame review of the
+early checkpoint (step 5489) showed a much more dynamic, exploratory
+policy than run10's frozen reflex -- sweeping through many different
+poses and re-approaching repeatedly rather than diving once and
+freezing, consistent with the network still adapting to the changed
+reward landscape. Later checkpoints (045409, 050399, 055389) appeared,
+from extracted still frames, to show the gripper aperture visibly
+narrowing during the approach -- read (wrongly, as it turned out) as
+genuine closing.
+
+The user watched the actual videos and disputed this directly: "i dont
+think i ever saw the gripper close in either of those." Rather than
+re-argue from more still frames (the same fragile approach that had
+already gone wrong once this project, with the aperture/axial
+misdiagnosis above), pulled the objective, ground-truth
+`touched`/`between_jaws`/`held` booleans `run_eval_episode()` already
+logs once per eval episode, straight from the training log. Verdict:
+`held` was `False` in every single one of run11's 11 eval checkpoints.
+`between_jaws` HAD flipped `True` in 4 of them (steps 20459, 35429,
+50399, 55389) -- something that essentially never happened in runs 9/10
+-- so the widened geometric window was genuinely helping positioning,
+but closing specifically still was not happening. What I had read as
+"narrowing aperture" in the stills was almost certainly a foreshortening
+illusion from the fixed external `scene_camera` combined with the arm's
+own rotation, exactly the kind of thing full video motion catches and
+sparse stills do not.
+
+The user also asked directly whether the eval video was what the policy
+itself sees. Checked the actual code to answer precisely rather than
+guess: `scene_camera` is a fixed, third-person diagnostic viewpoint,
+explicitly documented in `run_eval_episode()`'s own docstring as "a
+visual check on what the policy actually does, not [what the policy
+sees]." The real policy inputs are `wrist_camera` (mounted on the
+gripper) and `top_camera` (fixed top-down) -- neither of us had ever been
+looking at what the policy actually observes, only a human-reference
+view.
+
+To find out why `between_jaws` firing was not converting into a genuine
+close, added `--eval-only` to `train_tdmpc2_pickplace.py` (see
+docs/decisions.md) and replayed run11's best checkpoint (step 55389)
+with new per-step logging (gripper joint angle, commanded gripper
+action, axial/lateral offset, `between_jaws`). This ruled out "brief
+pass-through, no time to close" outright: `between_jaws` fired dozens of
+times across the 500-step episode, including a 15-consecutive-step
+window, plenty of time. The gripper barely moved even during that long
+window (under 0.01 radians of drift), and the one place it dipped
+meaningfully (steps 368-371, ~0.06 radians toward closed, out of the
+~1.44 radians needed to reach `gripper_closed_threshold`) reversed within
+a few steps, climbing steadily back to ~fully-open rather than
+continuing or settling. Root cause: `premature_close_weight` is gated on
+`not between_jaws`, and `between_jaws` itself is unstable (true only
+~15% of the episode, mostly short bursts) -- so a policy partway through
+a slow, multi-step close is one small drift away from the penalty
+resuming on its still-partly-closed gripper. Reopening immediately is
+the locally safe strategy; committing to a full close across a window
+that might not hold is not.
+
+Set `premature_close_weight` to 0.0 -- the original reason it existed
+(run8 closing carelessly far from the cube, regardless of position) is
+now separately handled by `grasp_close_weight`'s own `is_between_jaws()`
+gate, which did not exist yet when this penalty was first added.
+Considered a grace period or `between_jaws` hysteresis instead, but
+deliberately chose the cleanest single-variable test first. Verified via
+self-test (the mechanism itself stays covered through a local
+nonzero-weight config even at a 0.0 production default) and a production
+smoke test. Launched run12: 60,000 steps, warm-started from run11's
+final checkpoint.
+
+### 2026-09-06 -- Run12 produces a real held=True, verified to be a
+marginal graze rather than a genuine lift, three fixes, run13 launched
+
+Run12 finished: 60,000 steps, no crash. **`held=True` fired for the
+first time in this project's history**, at step 40419's eval episode.
+Pulled all 11 eval videos and reviewed them; asked the user to look at
+`eval_step_040419.mp4` specifically, reporting (again, from still-frame
+reading) that the aperture appeared to close and stay closed for the
+rest of the episode.
+
+The user again disputed this from the actual video: "it never held it
+in that video? im not sure where you got that it is working from?" --
+and separately asked directly whether the camera being watched was the
+policy's own view (answered from the code in the entry above: no, it
+never has been). This time, rather than defend a video read at all,
+extended `--eval-only`'s CSV with `cube_height` and `gripper_cube_dist`
+specifically so every one of `is_holding()`'s four establishing
+conditions (height above `lift_threshold`, joint closed enough,
+proximity, `between_jaws`) could be checked independently against the
+exact checkpoint that produced the result, rather than trusting either
+the video or the logged flag at face value.
+
+Finding: the `held=True` result was real by every one of `is_holding()`'s
+own checks -- not a geometric false positive like the run7 bug -- but
+the actual lift was only ~9mm on a 3cm cube (`lift_threshold` required
+just 5mm above resting height), the cube visibly settling back toward
+resting height over the following several steps rather than being
+carried. It recurred 3 separate times in the one episode (steps ~95-106,
+~116, ~140-141), each re-firing the full `grasp_bonus`, because that
+bonus was gated on "holding now but wasn't the previous step"
+(one-time per continuous streak), not "first time this episode" -- a
+policy could cheaply farm the milestone bonus by grazing a razor-thin
+threshold repeatedly, collecting the reward spike (+~2.0 each time, by
+far the largest reward events in the episode) without ever achieving a
+deliberate, sustained pick-up.
+
+The same per-step data also showed `is_between_jaws()` flickering False
+for single steps in the middle of otherwise-sustained close attempts --
+independent of `premature_close_weight` (already 0.0) being a factor,
+this still weakened `grasp_close_weight`'s own gradient during a real
+attempt, since the reward zeroed out on those flicker steps even while
+genuine progress toward closed was being made.
+
+Implemented three changes together, all surfacing from this one replay:
+`between_jaws_grace_steps` (default 2, via a new
+`_between_jaws_effective()` helper) forgives up to 2 consecutive
+flicker-outs for `grasp_close_weight`/`premature_close_penalty`'s gate
+specifically -- deliberately NOT touching `is_between_jaws()` itself or
+`is_grasped()`/`is_holding()`'s own establishment logic, which needed to
+stay exactly as strict as before given the very next fix depends on it.
+`lift_threshold` raised 0.02 -> 0.04 (roughly 2.5x the observed
+accidental jostle). `grasp_bonus` regated on a new, genuinely
+episode-sticky `was_ever_held` parameter, mirroring `touch_bonus`'s own
+`was_touched` pattern, which never had this bug. Took real care wiring
+this up given `was_ever_held` had to be a required (no-default)
+parameter on `compute_reward()` -- a silent wrong default would let a
+real call site forget to thread it through with no error at all, so
+every one of the ~46 self-test call sites plus both real call sites
+(`pickplace_env.py`, `validate_reward_function.py`) needed updating and
+were verified programmatically, not just by eye, to confirm none were
+missed.
+
+Added 12 new self-test cases: direct unit tests of
+`_between_jaws_effective()`, an end-to-end hysteresis sequence through
+`compute_reward()` confirming the shaping genuinely keeps paying out
+through a forgiven flicker and genuinely stops once the flicker outlasts
+the grace window, and real regression tests for both the lift-threshold
+graze and the grasp_bonus re-firing bug, built directly from the actual
+observed numbers rather than hypothetical ones. Verified via a full
+local + remote self-test pass and a production smoke test, all clean.
+Launched run13: 60,000 steps, warm-started from run12's final
+checkpoint -- a relatively cheap verification that these three specific
+fixes work as intended before committing to the much larger investment
+of a full, from-scratch clean retrain against the finalized reward
+design (discussed with the user and agreed as the next step once run13
+confirms the fixes hold up).

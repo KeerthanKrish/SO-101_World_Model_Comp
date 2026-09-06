@@ -487,7 +487,7 @@ withholding credit for the harder skill (straddling) it hasn't learned
 yet. Not evidence the fix is wrong -- evidence it's precisely rejecting
 exactly the behavior it was built to reject.
 
-## Ninth training run (2026-09-03, in progress)
+## Ninth training run (2026-09-03/04)
 
 40,000 steps, `--cube-pos 0.25 0.0 --min-std 0.5 --seed-episodes 2
 --resume-from <run8's final checkpoint>` -- WARM-STARTED from run8
@@ -500,16 +500,125 @@ skill acquisition -- confirmed loading correctly (`[INFO] Resumed agent
 weights from ...`) and using a much smaller seed-exploration phase
 (1,000 steps, the floor) than any prior run, since a resumed policy that
 already knows how to act gets little value from a long pure-random
-warmup. Full results once complete.
+warmup.
+
+**Results**: `touched=True` on the reviewed checkpoints, no
+`between_jaws=True`/`held=True`. Direct video review (`eval_step_036427.mp4`,
+`eval_step_032435.mp4`) showed real, specific progress -- the arm
+touching the cube with the stationary part of the gripper and pushing it
+along, close enough that closing the gripper at the right moment "would've
+basically picked it up" (the user's own read, later confirmed accurate).
+
+**Interpretation**: initially misdiagnosed as a gripper-aperture problem
+(briefly implemented, then fully reverted after direct user correction --
+see docs/progress.md and docs/decisions.md for the full story); correctly
+re-diagnosed as an axial positioning problem, the cube buried near the
+jaws' pivot rather than out near the fingertips. Motivated
+`axial_align_weight`, tested in run10 below.
+
+## Tenth training run (2026-09-04/05)
+
+100,000 steps (the longest single run to date), `--cube-pos 0.25 0.0
+--min-std 0.5 --seed-episodes 2 --resume-from <run9's final checkpoint>`
+-- adds `axial_align_weight` on top of run9's reward.
+
+**Results**: no crash. Frame-by-frame review of three full eval episodes
+(steps 85329, 90319, 95309) showed an open-loop "reach once and freeze"
+reflex -- contact within 1-2 seconds of a 25-second episode, then a
+completely static pose for the remainder regardless of what happens
+next. **The gripper never closed even once, in any sampled frame, across
+all three episodes traced in full.**
+
+**Interpretation**: `axial_align_weight` did not address the actual
+bottleneck (it only concerns position, not the close decision) and was
+reverted via `git revert` rather than built on further -- see
+docs/decisions.md. The real finding motivated a closing-focused redesign
+(`grasp_reach_min` widened, `grasp_close_weight` raised,
+`premature_close_weight` lowered), tested in run11 below, deliberately
+warm-started from run9's checkpoint rather than run10's -- run10's extra
+100,000 steps had been spent reinforcing the counterproductive "freeze"
+habit, a worse starting point than the less-contaminated run9 checkpoint.
+
+## Eleventh training run (2026-09-05)
+
+60,000 steps, `--cube-pos 0.25 0.0 --min-std 0.5 --seed-episodes 2
+--resume-from <run9's final checkpoint>` -- the closing-focused redesign
+(`grasp_reach_min` -0.01 -> -0.04, `grasp_close_weight` 1.0 -> 2.5,
+`premature_close_weight` 0.3 -> 0.1).
+
+**Results**: no crash. Objective per-episode logging across all 11 eval
+checkpoints: `touched=True` on 10 of 11, **`between_jaws=True` on 4 of 11**
+(steps 20459, 35429, 50399, 55389) -- something that essentially never
+happened in runs 9/10 -- but `held=True` on zero. A `--eval-only`
+per-step diagnostic replay of the best checkpoint (step 55389) showed
+`between_jaws` flickering true/false dozens of times across the 500-step
+episode (including a 15-consecutive-step window), with the gripper
+joint barely moving even during that long window, and its one
+meaningful dip (~0.06 radians toward closed, around steps 368-371)
+reversing within a few steps rather than continuing.
+
+**Interpretation**: positioning had genuinely improved (the widened
+window works); closing specifically still had not. Root-caused to
+`premature_close_weight` firing on every step `between_jaws` drops out
+(which it does constantly, being unstable), making "reopen immediately"
+the locally safe strategy versus committing to a multi-step close.
+Motivated zeroing `premature_close_weight` entirely, tested in run12
+below. Also the run this project's video-reading practice was directly
+corrected on: initial claims about visible gripper closing (from still
+frames) turned out to be a foreshortening illusion from the fixed
+external `scene_camera` combined with the arm's own rotation -- resolved
+by pulling the objective logged booleans instead of re-arguing from more
+stills. See docs/progress.md for the full narrative.
+
+## Twelfth training run (2026-09-05/06)
+
+60,000 steps, `--cube-pos 0.25 0.0 --min-std 0.5 --seed-episodes 2
+--resume-from <run11's final checkpoint>` -- `premature_close_weight`
+zeroed (0.1 -> 0.0).
+
+**Results**: no crash. **`held=True` fired for the first time in this
+project's history**, at step 40419's eval episode (`touched=True,
+between_jaws=True, held=True`). `between_jaws=True` on 4 of 11
+checkpoints total.
+
+**Interpretation**: verified rather than taken at face value -- a
+`--eval-only` replay of the exact checkpoint, extended with
+`cube_height`/`gripper_cube_dist`, confirmed all four of `is_holding()`'s
+establishing conditions genuinely fired (not a geometric false positive
+like the run7 bug), but the actual lift was only ~9mm on a 3cm cube
+(`lift_threshold` required just 5mm above resting height), settling back
+toward resting height within a few steps rather than being carried --
+and it recurred 3 separate times in the one episode, each re-firing the
+full `grasp_bonus` due to a bonus-gating bug (see docs/decisions.md).
+Motivated three fixes (`between_jaws_grace_steps` hysteresis,
+`lift_threshold` raised to 0.04, `grasp_bonus` regated on a genuinely
+episode-sticky `was_ever_held`), tested in run13 below.
+
+## Thirteenth training run (2026-09-06, in progress)
+
+60,000 steps, `--cube-pos 0.25 0.0 --min-std 0.5 --seed-episodes 2
+--resume-from <run12's final checkpoint>` -- the between_jaws hysteresis/
+lift_threshold/grasp_bonus fixes, all three verified via self-test and a
+production smoke test before launch. A relatively cheap verification
+that these specific fixes work as intended, deliberately kept at the
+same 60k scale as runs 11/12 for direct comparability, before committing
+to a full, from-scratch clean retrain against the finalized reward
+design. Full results once complete.
 
 ## Known limitations / not yet done
 
-- Nine training runs done so far (30,000 / 15,000 / 15,000 / 50,000 /
-  50,000 / 50,000 / 70,000 / 70,000 / 40,000 steps, under six different
-  reward/exploration/curriculum configurations, one of them warm-started
-  rather than from-scratch -- see the run sections above), still no
-  systematic sweep over training duration, hyperparameters, or fusion
-  strategy.
+- Thirteen training runs done so far (30,000 / 15,000 / 15,000 / 50,000 /
+  50,000 / 50,000 / 70,000 / 70,000 / 40,000 / 100,000 / 60,000 / 60,000
+  / 60,000 steps, under ten different reward/exploration/curriculum
+  configurations, six of them warm-started rather than from-scratch --
+  see the run sections above), still no systematic sweep over training
+  duration, hyperparameters, or fusion strategy. A full clean (non-warm-
+  started) retrain against the current, most-refined reward design is
+  planned as the next major run once run13 confirms the latest fixes
+  hold up -- warm-starting continuously since run9 means the current
+  checkpoint's value function is a patchwork of adaptations to several
+  different, sometimes-conflicting reward regimes, not a clean optimum
+  for the current one.
 - Checkpointing/logging beyond console output + eval videos is not wired
   up (`save_agent`/`enable_wandb` both `False`).
 - The fusion strategy (elementwise sum of two SimNorm-normalized
