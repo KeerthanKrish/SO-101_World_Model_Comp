@@ -1267,3 +1267,94 @@ fixes work as intended before committing to the much larger investment
 of a full, from-scratch clean retrain against the finalized reward
 design (discussed with the user and agreed as the next step once run13
 confirms the fixes hold up).
+
+### 2026-09-06/08 -- Run13 inconclusive, a real tool-limitation catch,
+### positioning itself found to be regressing, a clean retrain that
+### disproved its own premise, and the pivot to demonstration seeding
+
+Run13 finished: 60,000 steps, no crash. `between_jaws=True` on 3 of 12
+checkpoints -- down from run11/12's 4 of 11 each, not the improvement
+hoped for. Tried to verify the fixes directly by replaying two
+checkpoints via `--eval-only`, and caught a real methodology gap instead
+of a clean answer: the first replay came back as a completely different,
+far less-engaged episode than what training-time eval had actually
+logged for that same checkpoint. Root cause: TD-MPC2's CEM planner
+samples internally at every planning step, and nothing in this pipeline
+seeds that RNG -- `eval_mode=True` only suppresses the final action's
+exploration noise, not the planner's own internal search. Every
+`--eval-only` replay is a fresh, independent sample from the policy, not
+a reproduction of one specific past episode -- documented as a real tool
+limitation (see docs/decisions.md) rather than left as an unstated
+assumption the next diagnostic might trip over.
+
+Pulled full videos for both run13 and the replays and asked the user to
+look them over. Their read, watching the actual footage rather than any
+numbers: the arm didn't even seem to be reliably getting positioned
+between the jaws anymore, something that had at least been visible
+earlier in the project, and asked whether recovering that first -- then
+layering the closing-leniency mechanics on top -- was the right
+direction. It was: the raw `between_jaws` numbers back up the same read
+(4/11 -> 4/11 -> 3/11 across runs 11, 12, 13), and `reach_weight`/
+`lateral_align_weight` -- the terms actually responsible for
+positioning -- hadn't been touched since run8/9, meaning five
+generations of continuous warm-starting through several different,
+sometimes-conflicting closing-focused reward regimes since run9 was the
+likely culprit, a patchwork value function rather than a clean optimum
+for positioning specifically.
+
+Since there's no way to surgically recover just the positioning-relevant
+learning from inside an already-warm-started network, launched run14: a
+full, clean, from-scratch retrain (no warm start, the real 15,000-step
+seed phase, 100,000 steps) against the current, fully-refined reward
+design, reasoning that positioning would redevelop cleanly under the
+already-good `reach_weight`/`lateral_align_weight` terms without the
+inherited drift. **The result flatly contradicted the theory**: `touched`
+came back reliably (74% of checkpoints, matching run8's own from-scratch
+benchmark), but `between_jaws` fired on only 1 of 19 checkpoints --
+worse than every warm-started run, not better. Launched run15 as a
+direct test of the fallback theory ("just needs more time on top of
+solid touching," deliberately mirroring the run8-to-run9 pattern that is
+the only time this project has actually seen `between_jaws` take off):
+80,000 more steps warm-started from run14's own checkpoint. Result: 0 of
+15 checkpoints, the entire run.
+
+Reassessed rather than defended the original theory: `lateral_align_weight`
+has only ever been shown to work refining an ALREADY-touching-reliably
+policy (run8 into run9) -- never discovering touching and precise
+lateral straddling simultaneously from a random or under-trained one.
+The warm-start chain likely wasn't degrading positioning after all; it
+may have been the only reason positioning ever worked in the first
+place. Seven consecutive RL runs (9 through 15) against this reward
+design have now never produced a genuine sustained hold, only ever
+momentary, sub-centimeter grazes -- a real, if humbling, result after
+this much iteration on reward shaping alone.
+
+Also fixed a real infrastructure gap in passing: Tailscale (installed
+since early in the project, `100.71.12.16`) had been assumed flaky based
+on an old "stuck starting" note, but turned out to already be fully
+connected and running (`tailscaled` active for 5+ days, `BackendState:
+Running`) -- the note was simply stale. Confirmed and switched to using
+the Tailscale IP for all Ubuntu connections going forward, per the
+user's request, rather than continuing to rely on the LAN IP.
+
+Rather than keep iterating on reward shaping or attempting yet another
+from-scratch run, the user raised an idea floated earlier in the
+project: using the recorded real teleop demonstrations
+(`sim/output/teleop_episodes/episode_000.json` through `episode_007.json`)
+to directly seed TD-MPC2's replay buffer, rather than relying solely on
+the agent's own exploration to ever stumble into a genuine grasp. Before
+committing to this direction, checked the actual demonstration data
+rather than assuming it would help -- an earlier docs/reward_function.md
+note had claimed no validated episode ever reached a genuine
+lift-and-carry state, but that reflected only the one or two episodes
+spot-checked early in the project. Re-checked all 8 directly: every
+single one reaches a cube height of 8.7cm to 14.9cm above the table,
+dramatically higher than the ~2.75cm the best RL rollout ever
+accidentally achieved -- strong evidence these are genuine, deliberate
+lifts, not touches or jostles. Corrected the stale note in
+docs/reward_function.md. At the user's explicit request, took a full
+documentation checkpoint (this entry, plus the corresponding
+docs/decisions.md and docs/tdmpc2_integration.md entries) before
+starting this new direction, given how different a departure
+demonstration-seeded training is from every run so far. Prototyping in
+progress -- see docs/decisions.md for the plan.

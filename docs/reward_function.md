@@ -777,9 +777,19 @@ finalized design.
   happening as training continues.
 - **The transport-phase hold-and-lower path is still not empirically
   validated against real data** -- only against the synthetic self-test
-  (see the correctness audit above). Real validation of that half would
-  need either a closed-loop rollout or a real recorded episode that
-  actually achieves a sustained lift-and-carry, neither available yet.
+  (see the correctness audit above). CORRECTED (2026-09-08): this item
+  previously claimed no recorded episode ever achieves a sustained
+  lift-and-carry, based on only the one or two episodes spot-checked
+  early in the project. Re-checked all 8 recorded episodes directly
+  (`sim/output/teleop_episodes/episode_000.json` through `episode_007.json`)
+  while investigating demonstration-seeded training (see
+  docs/decisions.md): every single one reaches a cube height of 8.7cm to
+  14.9cm above the table, strongly consistent with a genuine lift-and-carry,
+  not a touch or jostle. A real closed-loop replay of one of these episodes
+  through `compute_reward()` -- confirming the transport-phase shaping
+  actually behaves correctly across a genuine hold, not just the
+  hand-constructed self-test cases -- is still not done, and is worth
+  doing as part of the demonstration-seeding work now underway.
 - Now wired into an actual Gym-style training environment
   (`sim/envs/pickplace_env.py`, see docs/training_env.md) -- this item
   is resolved, kept here only as a pointer for anyone who reads this file

@@ -594,31 +594,114 @@ Motivated three fixes (`between_jaws_grace_steps` hysteresis,
 `lift_threshold` raised to 0.04, `grasp_bonus` regated on a genuinely
 episode-sticky `was_ever_held`), tested in run13 below.
 
-## Thirteenth training run (2026-09-06, in progress)
+## Thirteenth training run (2026-09-06)
 
 60,000 steps, `--cube-pos 0.25 0.0 --min-std 0.5 --seed-episodes 2
 --resume-from <run12's final checkpoint>` -- the between_jaws hysteresis/
 lift_threshold/grasp_bonus fixes, all three verified via self-test and a
-production smoke test before launch. A relatively cheap verification
-that these specific fixes work as intended, deliberately kept at the
-same 60k scale as runs 11/12 for direct comparability, before committing
-to a full, from-scratch clean retrain against the finalized reward
-design. Full results once complete.
+production smoke test before launch.
+
+**Results**: no crash. `between_jaws=True` on 3 of 12 checkpoints (down
+from run11/12's 4 of 11 each). `held` never fired.
+
+**Interpretation**: not a clean confirmation either way. Replayed two of
+the checkpoints via `--eval-only` to check the fixes directly, which
+surfaced an important methodology limitation instead of a clean answer:
+these replays are NOT reproductions of the original logged episode --
+TD-MPC2's CEM planner samples internally at every planning step, and
+nothing in this pipeline seeds that RNG, so `eval_mode=True` only
+suppresses the FINAL action's exploration noise, not the planner's own
+internal sampling. Each `--eval-only` invocation is a fresh, independent
+sample from the checkpoint's policy, not a replay of a specific past
+episode. One replay sample (checkpoint 055389) did show the cube jostled
+up to 2.75cm -- comfortably below the new 0.04 `lift_threshold` -- but
+`between_jaws` was independently `False` at that exact moment, so it
+does not cleanly isolate whether the raised threshold specifically
+blocked a would-be false positive; that particular moment would not have
+registered as a hold either way. Logged as a real tool limitation, not
+disproof of the fixes -- see docs/decisions.md.
+
+## Fourteenth training run (2026-09-07) -- the clean, from-scratch retrain
+
+100,000 steps, no `--resume-from` (fresh, randomly-initialized network),
+default `--seed-episodes` (30, i.e. the real 15,000-step seed phase, not
+the tiny warm-start floor), `--cube-pos 0.25 0.0 --min-std 0.5` --
+everything else in the reward design held fixed at its current,
+most-refined state. Motivated by watching run13's videos and noticing
+positioning itself (not just closing) seemed to have quietly regressed
+across the warm-start chain since run11 -- the working theory being that
+five generations of continuous warm-starting through several different,
+sometimes-conflicting reward regimes (see the "Known limitations" entry
+below, now resolved) had left the checkpoint's value function a
+patchwork rather than a clean optimum, and that training fresh against
+the CURRENT, already-good positioning terms (`reach_weight`,
+`lateral_align_weight`, the widened `grasp_reach_min` window -- none of
+which had been touched since run8/9) would let positioning re-develop
+without the inherited drift.
+
+**Results**: no crash, 100972.4s (~28h) total including a genuine
+multi-hour gap in checking on it, 200 episodes collected, ~85,000
+gradient updates. `touched=True` on 14 of 19 checkpoints (74%) --
+comparable to or better than run8's own from-scratch benchmark (10 of
+14, 71%). **`between_jaws=True` on only 1 of 19 checkpoints** -- notably
+WORSE than any of the warm-started runs 11-13 (27-36% each). `held`
+never fired.
+
+**Interpretation**: directly contradicts the working theory above.
+Touching came back reliably from scratch, but precise lateral
+straddling did not -- if anything it came back weaker than the
+"contaminated" warm-started checkpoints it was meant to improve on. The
+more likely explanation in hindsight: `lateral_align_weight` has only
+ever been shown to work with a head start -- run8 (zero `between_jaws`)
+was warm-started INTO by run9, which is where `between_jaws` first
+started firing regularly, refining an already-solved touching problem
+rather than discovering touching and precise straddling simultaneously
+from a random policy. A clean slate has to solve both at once, which
+looks like a strictly harder joint exploration/credit-assignment problem
+than refining straddle-precision on top of touching that already works.
+
+## Fifteenth training run (2026-09-07/08)
+
+80,000 steps, `--cube-pos 0.25 0.0 --min-std 0.5 --seed-episodes 2
+--resume-from <run14's final checkpoint>` -- a direct test of the "just
+needs more time to discover straddling" theory: continue run14's OWN
+already-touching-reliably checkpoint, under the exact same reward
+design, no changes, and see whether `between_jaws` develops given
+substantially more training on top of solid touching (deliberately
+mirroring the run8-to-run9 pattern that is the only time this project
+has seen `between_jaws` take off).
+
+**Results**: no crash, ~28h wall-clock (a large gap between check-ins
+again). `touched=True` on 11 of 15 checkpoints. **`between_jaws=True` on
+0 of 15 checkpoints -- zero, the entire run.** `held` never fired.
+
+**Interpretation**: a clean negative result for the "needs more time"
+theory. A full 80,000 additional steps of continued training on top of
+already-reliable touching did not bring straddle-precision back at all,
+whereas run9's analogous continuation needed only 40,000 steps to show
+real `between_jaws` progress. This argues the gap is not primarily a
+"hasn't had enough time yet" problem for this specific checkpoint
+lineage, and motivated stepping back from pure-RL-from-scratch
+exploration entirely -- see docs/decisions.md for the pivot to
+demonstration-seeded training this motivated.
 
 ## Known limitations / not yet done
 
-- Thirteen training runs done so far (30,000 / 15,000 / 15,000 / 50,000 /
+- Fifteen training runs done so far (30,000 / 15,000 / 15,000 / 50,000 /
   50,000 / 50,000 / 70,000 / 70,000 / 40,000 / 100,000 / 60,000 / 60,000
-  / 60,000 steps, under ten different reward/exploration/curriculum
-  configurations, six of them warm-started rather than from-scratch --
-  see the run sections above), still no systematic sweep over training
-  duration, hyperparameters, or fusion strategy. A full clean (non-warm-
-  started) retrain against the current, most-refined reward design is
-  planned as the next major run once run13 confirms the latest fixes
-  hold up -- warm-starting continuously since run9 means the current
-  checkpoint's value function is a patchwork of adaptations to several
-  different, sometimes-conflicting reward regimes, not a clean optimum
-  for the current one.
+  / 60,000 / 100,000 / 80,000 steps, under eleven different
+  reward/exploration/curriculum configurations, eight of them
+  warm-started rather than from-scratch -- see the run sections above).
+  The full clean (non-warm-started) retrain this list once flagged as
+  the next major run (run14) is now done -- it did NOT confirm the
+  "warm-start drift" theory that motivated it (see run14's own
+  interpretation above), which is itself a useful, if humbling, result:
+  seven runs of pure RL exploration against this reward design (runs
+  9-15) have never produced a genuine sustained hold, only ever a
+  handful of momentary, sub-centimeter grazes. Pivoting to
+  demonstration-seeded training as the next direction rather than
+  further reward-shaping or longer from-scratch runs -- see
+  docs/decisions.md and docs/reward_function.md.
 - Checkpointing/logging beyond console output + eval videos is not wired
   up (`save_agent`/`enable_wandb` both `False`).
 - The fusion strategy (elementwise sum of two SimNorm-normalized

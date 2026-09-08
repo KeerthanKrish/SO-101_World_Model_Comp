@@ -763,3 +763,132 @@ Launched run13, warm-started from run12's final checkpoint, as a
 relatively cheap verification that these specific fixes work as intended
 before committing to the much larger investment of a full, from-scratch
 clean retrain against the finalized reward design.
+
+---
+
+**Decision**: `--eval-only` replays are NOT reproductions of a
+checkpoint's original logged episode -- documenting this as a real tool
+limitation, discovered while trying to verify run13's fixes, rather than
+letting it stand as an unstated assumption.
+
+**Why**: replayed two of run13's `between_jaws=True` checkpoints
+(020459's own step number, and 055389) to check whether the raised
+`lift_threshold` was specifically blocking a would-be false hold. The
+first replay came back as an entirely different, much less-engaged
+episode than what training-time eval had logged for that exact
+checkpoint (no `between_jaws`, cube never left resting height) --
+inconsistent with byte-for-byte reproduction. Root cause: TD-MPC2's CEM
+planner samples candidate trajectories from a random distribution at
+every planning step, and nothing in this pipeline seeds that RNG (the
+`isaaclab.envs.direct_rl_env` "Seed not set" warning that appears in
+every log flags the same underlying issue for env creation, but the
+planner's own sampling is a separate, unstated instance of it).
+`eval_mode=True` only suppresses the FINAL chosen action's added
+exploration noise -- it does not make the planner's own internal search
+deterministic. Each `--eval-only` invocation is therefore a genuine,
+independent fresh sample from the checkpoint's policy, not a replay of
+one specific past episode.
+
+**How to apply**: does not undermine the earlier run12 audit's core
+finding (the lift/grasp_bonus farming pattern was established by
+examining many steps/events within one representative episode, a
+property robust to which exact episode gets sampled) -- but any FUTURE
+`--eval-only` diagnostic must be read as "a representative sample of
+this checkpoint's typical behavior," never as "the exact episode that
+produced a specific past log line." Seeding TD-MPC2's own RNG (e.g. a
+`torch.manual_seed()` call before `agent.act()` inside
+`run_eval_episode()`) would fix this if exact reproducibility is ever
+needed again, but has not been done -- not required for this
+diagnostic's actual purpose (characterizing typical behavior), and
+seeding a planner that samples every step across a 500-step episode
+would need care to get genuinely right, not a one-line fix.
+
+---
+
+**Decision**: Launched run14 -- a full, clean, from-scratch retrain (no
+`--resume-from`, default 30-episode/15,000-step seed phase, 100,000
+steps) against the current, most-refined reward design, and run15 -- an
+80,000-step continuation warm-started from run14's own checkpoint.
+
+**Why**: after watching run13's videos, the user observed that the arm
+no longer seemed to be even getting positioned between the jaws as
+reliably as it had appeared to earlier in the project, and asked whether
+recovering that -- and only then layering the closing-leniency mechanics
+on top -- was the right move. Agreed, and connected it to the run13
+`between_jaws` numbers actually declining across runs 11->12->13 (4/11
+-> 4/11 -> 3/11) -- consistent with five generations of continuous
+warm-starting through several different, sometimes-conflicting reward
+regimes since run9 having left the checkpoint's value function a
+patchwork, not a clean optimum, for positioning specifically (the
+`reach_weight`/`lateral_align_weight` terms actually responsible for
+positioning had not been touched since run8/9 -- everything since had
+been about closing). Since there is no way to surgically recover just
+the positioning-relevant learning from within an already-warm-started
+network, training fresh seemed like the direct way to let positioning
+re-develop without the inherited drift, with every closing-leniency fix
+already active from step zero.
+
+**Result -- the theory was wrong, not confirmed**: run14 (clean) got
+`touched=True` reliably (74% of checkpoints, matching run8's own
+from-scratch benchmark) but `between_jaws=True` on only 1 of 19
+checkpoints -- WORSE than any warm-started run, not better. Run15 (80k
+more steps warm-started from run14, directly testing "just needs more
+time on top of solid touching," deliberately mirroring the run8-to-run9
+pattern) got 0 of 15 checkpoints, the entire run. Reassessed rather than
+forced the original theory: `lateral_align_weight` has only ever been
+shown to work refining an ALREADY-touching-reliably policy (run8 into
+run9), never discovering touching and precise lateral straddling
+simultaneously from a random or under-trained one -- the warm-start
+chain likely was not degrading positioning after all; it may instead
+have been the only reason positioning ever worked in the first place.
+
+**How to apply**: seven runs of pure RL exploration against this reward
+design (runs 9 through 15) have now never produced a genuine sustained
+hold -- only ever momentary, sub-centimeter grazes (see run12's
+`held=True` audit above). Rather than continue iterating on reward
+shaping or attempting a longer/differently-seeded from-scratch run,
+pivoting to demonstration-seeded training as the next direction -- see
+the entry immediately below.
+
+---
+
+**Decision**: Investigating demonstration-seeded training -- replaying
+the project's 8 recorded real teleop episodes
+(`sim/output/teleop_episodes/episode_000.json` through `episode_007.json`)
+through the actual simulator to capture full (observation, action,
+reward, next-observation) transitions, and inserting them into TD-MPC2's
+replay buffer before training starts, rather than continuing to rely on
+the agent's own exploration to ever discover a genuine grasp.
+
+**Why**: seven consecutive RL runs (9 through 15) against the current,
+fully-refined reward design have never produced a real sustained hold --
+`between_jaws` positioning itself even regressed under a clean retrain
+meant to improve it (see the entry above). TD-MPC2 learns its world
+model (dynamics, reward, value) from whatever is in its replay buffer,
+regardless of who generated it -- currently that buffer starts empty and
+fills only with the agent's own, largely unsuccessful rollouts, so the
+value function has never had a real example of "a sustained grasp
+happened, and it was worth a lot" to learn from. Checked the actual
+recorded demonstrations before committing to this direction rather than
+assuming they would help: an earlier docs/reward_function.md note had
+flagged that no validated episode reached a genuine lift-and-carry state
+-- but that note only reflected the one or two episodes checked early in
+the project. Re-checked all 8 directly: every one reaches a cube height
+of 8.7cm to 14.9cm above the table (versus the ~2.75cm the best RL
+rollout ever accidentally achieved), consistent with genuine deliberate
+lifts, not touches or jostles. That earlier note is now corrected in
+docs/reward_function.md.
+
+**How to apply**: prototyping in progress -- extending
+`validate_reward_function.py`'s existing replay machinery (already
+replays these exact episodes through the real simulator and computes
+real rewards) to also capture the camera observations
+(`wrist_rgb`/`top_rgb`) it currently skips, and converting the
+episodes' recorded raw joint-POSITION trajectories into the
+normalized per-joint-DELTA action format `pickplace_env.py`'s action
+space actually uses, before packaging the result into TD-MPC2's buffer
+format. A full clean-retrain-style checkpoint of the project (this
+documentation pass, plus confirming the git tree is clean and tagging
+the current commit) was taken immediately before starting this work, at
+the user's explicit request, given how different a direction this is
+from every run so far.
