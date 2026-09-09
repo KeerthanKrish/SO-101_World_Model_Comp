@@ -111,6 +111,19 @@ sys.stdout.reconfigure(line_buffering=True)
 
 sys.path.insert(0, "/home/keerthan/SO-101-WM/sim")
 from envs.pickplace_env import PickPlaceEnv, PickPlaceEnvCfg  # isort:skip
+# _jaw_offsets -- only used by this script's own trace diagnostic, to
+# report the axial/lateral decomposition is_between_jaws() actually
+# checks, rather than just the combined spherical distance.
+from envs.pickplace_reward import _jaw_offsets  # isort:skip
+
+sys.path.insert(0, "/home/keerthan/SO-101-WM/sim")
+# _rotate_vector -- only used by this script's own diagnostic to
+# independently transform a candidate TRUE fingertip offset (measured
+# directly from moving_jaw_so101_v1.stl, not assumed) through the moving
+# jaw link's own live world pose, to check whether jaw_approach_axis_world()'s
+# "gripper_frame_link-to-pivot direction == pivot-to-fingertip direction"
+# assumption actually holds -- see this script's diagnostic output.
+from robots.grasp_geometry import _rotate_vector  # isort:skip
 
 sys.path.insert(0, "/home/keerthan/SO-101-WM/sim/scripts")
 from tdmpc2_pickplace_env import PickPlaceTDMPC2Wrapper  # isort:skip
@@ -149,21 +162,49 @@ def main():
         episode = json.load(f)
     print(f"[INFO] Loaded episode with {len(episode)} raw (100Hz) frames from {args_cli.episode}")
 
+    # wait_for_textures=False: works around a reproducible Kit/Omniverse
+    # asset-streaming stall (2026-09-09) where DirectRLEnv.reset()'s "if
+    # self.cfg.wait_for_textures: while SimulationManager.assets_loading():
+    # self.sim.render()" loop (isaaclab/envs/direct_rl_env.py) spins
+    # forever -- confirmed via py-spy against the live process (repeatedly
+    # sampled at the exact same render() call) and /proc/<pid>/io (rchar
+    # flat, read_bytes=0 across a 5s window -- no new asset data is being
+    # read from disk at all, so nothing is actually still loading; Kit's
+    # internal busy flag is just stuck). Irrelevant here regardless --
+    # this script never reads a camera IMAGE, only body/joint/cube physics
+    # state, so whether RTX textures finish streaming doesn't affect
+    # anything this script measures. Not a fix to any project code; a
+    # narrow workaround for this script's own use of DirectRLEnvCfg's
+    # stock default (True), scoped here rather than in pickplace_env.py
+    # since production training (which DOES render camera observations for
+    # the policy) should keep the default.
     if args_cli.full_resolution:
         downsampled = episode  # every recorded 100Hz frame is its own control step
-        env_kwargs = dict(use_cameras=True, num_envs=1, episode_length_s=10.0, decimation=1)
+        env_kwargs = dict(use_cameras=True, num_envs=1, episode_length_s=10.0, decimation=1, wait_for_textures=False)
         print(f"[INFO] --full-resolution: replaying all {len(downsampled)} frames at decimation=1 "
               f"({len(downsampled) - 1} env.step() calls)")
     else:
         # Downsample to the env's own 50Hz control rate -- see module
         # docstring's "timing mismatch" section.
         downsampled = episode[0::2]
-        env_kwargs = dict(use_cameras=True, num_envs=1, episode_length_s=10.0)
+        env_kwargs = dict(use_cameras=True, num_envs=1, episode_length_s=10.0, wait_for_textures=False)
         print(f"[INFO] Downsampled to {len(downsampled)} control-rate (50Hz) frames "
               f"({len(downsampled) - 1} env.step() calls)")
 
     base_env = PickPlaceEnv(PickPlaceEnvCfg(**env_kwargs))
     env = PickPlaceTDMPC2Wrapper(base_env)
+
+    # Body index for the moving jaw link itself -- used below to
+    # independently verify jaw_approach_axis_world()'s directional
+    # assumption against the TRUE fingertip position (measured directly
+    # from moving_jaw_so101_v1.stl's own bounding box: local-frame Y
+    # extent [-0.082, +0.010], i.e. the mesh extends ~8.2cm in -Y from
+    # the link's own origin -- the visual/collision <origin> in the URDF
+    # shifts the mesh by only (~0, ~0, 0.0189) relative to the link
+    # frame, so mesh-local Y is link-local Y directly). Candidate
+    # fingertip offset in the link's OWN local frame:
+    _JAW_TIP_LOCAL = (0.0, -0.082, 0.019)
+    _jaw_link_idx = base_env.robot.data.body_names.index("moving_jaw_so101_v1_link")
 
     # Diagnostic: soft joint-position limits for every joint, vs. this
     # demonstration's own recorded range for that joint -- checking
@@ -228,6 +269,17 @@ def main():
     # own observation-building method, so the FIRST transition's
     # observation is consistent with everything after it.
     obs = env._build_obs(base_env._get_observations())
+
+    # Trace the TRUE starting state, right after the override and before
+    # any step -- confirms whether a divergence is present from frame 0
+    # (an override bug) or only develops over subsequent steps.
+    gripper_pos0, _ = base_env._grasp_points_local()
+    cube_pos0_local = (base_env.cube.data.root_pos_w - base_env.scene.env_origins)[0].cpu().tolist()
+    gp0 = gripper_pos0[0].cpu().tolist()
+    dist0 = ((gp0[0] - cube_pos0_local[0]) ** 2 + (gp0[1] - cube_pos0_local[1]) ** 2 + (gp0[2] - cube_pos0_local[2]) ** 2) ** 0.5
+    print(f"[TRACE] step=   0 (post-override, pre-step) gripper_pos=({gp0[0]:.3f},{gp0[1]:.3f},{gp0[2]:.3f}) "
+          f"cube_pos=({cube_pos0_local[0]:.3f},{cube_pos0_local[1]:.3f},{cube_pos0_local[2]:.3f}) "
+          f"recorded_cube_pos={downsampled[0]['cube_pos']} dist={dist0:.4f}")
 
     tds = [to_td(obs, action_dim=6)]
     max_cube_height = downsampled[0]["cube_pos"][2]
@@ -334,20 +386,40 @@ def main():
         # cube never moves at all" unexplained by target-tracking alone,
         # since _joint_pos_target matching the recording doesn't prove
         # the PHYSICAL robot/gripper is actually where that implies.
-        if step_idx % 10 == 0:
-            gripper_pos, _ = base_env._grasp_points_local()
+        if step_idx % 10 == 0 or step_idx <= 15:
+            gripper_pos, gripper_quat = base_env._grasp_points_local()
             cube_pos_local = (base_env.cube.data.root_pos_w - base_env.scene.env_origins)[0].cpu().tolist()
             gp = gripper_pos[0].cpu().tolist()
+            gq = gripper_quat[0].cpu().tolist()
             dist = ((gp[0] - cube_pos_local[0]) ** 2 + (gp[1] - cube_pos_local[1]) ** 2 + (gp[2] - cube_pos_local[2]) ** 2) ** 0.5
+            axial, lateral = _jaw_offsets(gp, gq, cube_pos_local)
             wf_target = base_env._joint_pos_target[0, 3].item()
             wf_actual = base_env.robot.data.joint_pos[0, base_env._joint_indices[3]].item()
             wf_recorded = frame["joint_pos"]["wrist_flex"]
+
+            # Independent check: TRUE fingertip position, from the moving
+            # jaw link's own LIVE world pose plus the mesh-measured local
+            # offset -- entirely separate from grasp_point_world()'s own
+            # gripper_frame_link-based computation, to see whether that
+            # function's directional assumption actually holds.
+            jaw_pos_w = (base_env.robot.data.body_pos_w[0, _jaw_link_idx] - base_env.scene.env_origins[0]).cpu().tolist()
+            jaw_quat_w = base_env.robot.data.body_quat_w[0, _jaw_link_idx].cpu().tolist()
+            tip_rx, tip_ry, tip_rz = _rotate_vector(jaw_quat_w, _JAW_TIP_LOCAL)
+            tip_pos = (jaw_pos_w[0] + tip_rx, jaw_pos_w[1] + tip_ry, jaw_pos_w[2] + tip_rz)
+            tip_to_cube = (
+                (tip_pos[0] - cube_pos_local[0]) ** 2
+                + (tip_pos[1] - cube_pos_local[1]) ** 2
+                + (tip_pos[2] - cube_pos_local[2]) ** 2
+            ) ** 0.5
+
             print(f"[TRACE] step={step_idx:4d} replayed_h={cube_height:.4f} "
                   f"original_h={frame['cube_pos'][2]:.4f} "
                   f"wrist_flex target={wf_target:+.3f} actual={wf_actual:+.3f} recorded={wf_recorded:+.3f} "
                   f"gripper_pos=({gp[0]:.3f},{gp[1]:.3f},{gp[2]:.3f}) "
                   f"cube_pos=({cube_pos_local[0]:.3f},{cube_pos_local[1]:.3f},{cube_pos_local[2]:.3f}) "
-                  f"dist={dist:.4f}")
+                  f"dist={dist:.4f} axial={axial:.4f} lateral={lateral:.4f} between_jaws={info['between_jaws']} "
+                  f"jaw_pos=({jaw_pos_w[0]:.3f},{jaw_pos_w[1]:.3f},{jaw_pos_w[2]:.3f}) "
+                  f"true_tip=({tip_pos[0]:.3f},{tip_pos[1]:.3f},{tip_pos[2]:.3f}) tip_to_cube={tip_to_cube:.4f}")
 
         if done:
             print(f"[WARN] episode terminated early at downsampled step {step_idx} "
