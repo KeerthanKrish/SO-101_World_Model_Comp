@@ -68,17 +68,34 @@ def grasp_point_world(ee_pos_w, ee_quat_w, jaw_offset_local=JAW_OFFSET_LOCAL):
     return (px + rx, py + ry, pz + rz)
 
 
-# Pure direction (unit vector), not a point -- normalized JAW_OFFSET_LOCAL,
-# reused as "the direction the fingers reach from the wrist" rather than
-# deriving a second, separately-calibrated axis. Justified because
-# JAW_OFFSET_LOCAL is BY DEFINITION the vector from gripper_frame_link's
-# origin to where the fingers meet -- i.e. exactly the reach/approach
-# direction already, just also carrying a magnitude that grasp_point_world()
-# needs and this doesn't. Added 2026-09-03 for is_between_jaws() below, see
-# that function's docstring for why a single approach-axis check was needed
-# on top of the existing (grasp_point_world-based) distance-only checks.
+# Pure direction (unit vector), not a point. Originally defined (2026-09-03)
+# as the normalized JAW_OFFSET_LOCAL itself, on the theory that
+# JAW_OFFSET_LOCAL -- the vector from gripper_frame_link's origin to where
+# the fingers meet -- already points in the reach/approach direction. That
+# theory was WRONG: JAW_OFFSET_LOCAL/grasp_point_world() measures the
+# MOVING JAW LINK'S OWN ORIGIN (its pivot/hinge in gripper_frame_link's
+# frame -- see calibrate_grasp.py's methodology, which this constant
+# reproduces), not the fingertip. Pivot-to-cube and fingertip-to-cube are
+# different points along the same physical arm, and moving from the pivot
+# toward the true fingertip -- measured independently on 2026-09-09 via
+# direct binary-STL parsing of moving_jaw_so101_v1.stl's vertex bounding
+# box, giving a fingertip offset of roughly (0, -0.082, 0.019) in the
+# moving jaw link's own local frame -- lands CLOSER to a cube held in a
+# confirmed genuine grasp (~0.055-0.059m fingertip-to-cube vs ~0.088m
+# pivot-to-cube, replayed from teleop episode_002's stable-hold phase).
+# Since "closer to a held cube" is what a positive approach-axis reading is
+# supposed to mean, and JAW_OFFSET_LOCAL/JAW_AXIS_LOCAL pointed the other
+# way (pivot back toward the wrist, not pivot toward the fingertips),
+# is_between_jaws()'s axial term came out negative for real holds, failing
+# the grasp_reach_min/grasp_reach_max check on the wrong side. Fixed by
+# negating: JAW_AXIS_LOCAL now points pivot -> fingertips, opposite
+# JAW_OFFSET_LOCAL's own direction (pivot -> wrist origin). Only the AXIS
+# (direction) is flipped here -- JAW_OFFSET_LOCAL and grasp_point_world()
+# are untouched, since the pivot-position calibration itself was
+# independently confirmed correct (grasp_point_world()'s output exactly
+# matched the moving jaw link's live body_pos_w during replay).
 _JAW_OFFSET_MAGNITUDE = sum(c * c for c in JAW_OFFSET_LOCAL) ** 0.5
-JAW_AXIS_LOCAL = tuple(c / _JAW_OFFSET_MAGNITUDE for c in JAW_OFFSET_LOCAL)
+JAW_AXIS_LOCAL = tuple(-c / _JAW_OFFSET_MAGNITUDE for c in JAW_OFFSET_LOCAL)
 
 
 def jaw_approach_axis_world(ee_quat_w, jaw_axis_local=JAW_AXIS_LOCAL):
@@ -89,7 +106,10 @@ def jaw_approach_axis_world(ee_quat_w, jaw_axis_local=JAW_AXIS_LOCAL):
     direction doesn't translate, only rotate) -- callers wanting "is the
     cube positioned in front of the jaws, not beside them" combine this
     with grasp_point_world()'s point via a dot/cross-product decomposition
-    (see pickplace_reward.is_between_jaws()).
+    (see pickplace_reward.is_between_jaws()). Points OPPOSITE
+    JAW_OFFSET_LOCAL's own direction (see that constant's derivation above
+    for why: JAW_OFFSET_LOCAL runs pivot -> gripper_frame_link's origin,
+    the reverse of pivot -> fingertips).
 
     Args:
         ee_quat_w: world orientation of gripper_frame_link, (w, x, y, z).
@@ -117,11 +137,13 @@ def _self_test():
     # JAW_AXIS_LOCAL must be a genuine unit vector (a direction, not a point).
     mag = sum(c * c for c in JAW_AXIS_LOCAL) ** 0.5
     assert math.isclose(mag, 1.0, abs_tol=1e-9), JAW_AXIS_LOCAL
-    # It must point the same way as JAW_OFFSET_LOCAL, just rescaled --
-    # otherwise "the direction the fingers reach" and "how far they are"
-    # would silently disagree.
+    # It must point the OPPOSITE way from JAW_OFFSET_LOCAL, just rescaled to
+    # unit length -- JAW_OFFSET_LOCAL runs pivot -> gripper_frame_link's
+    # origin, while JAW_AXIS_LOCAL (the fingers' reach direction) runs
+    # pivot -> fingertips, the reverse. See JAW_AXIS_LOCAL's derivation
+    # comment above for the 2026-09-09 measurement that established this.
     for a, o in zip(JAW_AXIS_LOCAL, JAW_OFFSET_LOCAL):
-        assert math.isclose(a * _JAW_OFFSET_MAGNITUDE, o, abs_tol=1e-9), (JAW_AXIS_LOCAL, JAW_OFFSET_LOCAL)
+        assert math.isclose(a * _JAW_OFFSET_MAGNITUDE, -o, abs_tol=1e-9), (JAW_AXIS_LOCAL, JAW_OFFSET_LOCAL)
 
     # jaw_approach_axis_world() must rotate like grasp_point_world() does,
     # but never translate -- identity rotation passes the axis through
