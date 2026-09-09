@@ -892,3 +892,94 @@ documentation pass, plus confirming the git tree is clean and tagging
 the current commit) was taken immediately before starting this work, at
 the user's explicit request, given how different a direction this is
 from every run so far.
+
+---
+
+**Decision**: While building the demo-to-buffer replay prototype
+(`sim/scripts/replay_demo_to_buffer.py`), found and fixed three
+independent bugs that had been silently preventing every recorded
+teleop episode from registering as a real grasp: (1) episode
+segmentation cut off almost the entire pre-lift approach/grasp phase,
+(2) `is_between_jaws()`'s reach thresholds were calibrated around an
+unmeasured guess at roughly half the gripper's true physical reach, and
+(3) `jaw_approach_axis_world()` pointed the wrong physical direction
+(pivot toward the wrist, not pivot toward the fingertips).
+
+**Why / evidence for each**:
+- *Segmentation*: `segment_teleop_episodes.py` only starts an episode
+  when cube height first crosses `lift_threshold` (0.05m), with just 30
+  raw (0.3s) frames of pre-padding -- but the cube sits completely
+  motionless throughout the entire approach+grasp phase, so that padding
+  never reaches it. Checked all 8 original episodes directly: every
+  single one starts with the gripper already closed (recorded gripper
+  joint value below `gripper_closed_threshold` at frame 0). Fixed by
+  re-running segmentation with `--pad-steps 400` against the still-extant
+  raw `teleop_recording.json` into a new `sim/output/teleop_episodes_v2/`
+  (original directory left untouched) -- 7 of 8 episodes now genuinely
+  start with the gripper open. Verified via replay: episode_002's max
+  cube height went from 0.0229m (broken) to 0.0872m, matching the
+  original recording's own 0.0873m almost exactly.
+- *Thresholds*: even after fixing segmentation, a confirmed genuine
+  rigid hold (constant ~0.0896m gripper-to-cube distance while both
+  moved together) still failed every detection check. `grasp_reach_max`
+  (0.05), `grasp_proximity_threshold` (0.05), and `touch_threshold`
+  (0.08) were all originally set from an unmeasured guess. Verified the
+  true reach two independent ways: parsing `moving_jaw_so101_v1.stl`'s
+  binary mesh data directly gives ~8.2cm jaw extent from the pivot;the
+  live replay's own measurement during the hold was ~8.96cm. Corrected
+  (see `sim/envs/pickplace_reward.py` commit `be4e466`): grasp_reach_max
+  0.05->0.09, grasp_proximity_threshold 0.05->0.10, touch_threshold
+  0.08->0.14, align_activation_range 0.10->0.18 (cascading, to preserve
+  its documented looser-than-touch_threshold ordering). grasp_reach_min
+  left unchanged -- that evidence was specifically about the far/positive
+  direction.
+- *Axis direction*: still failed even with corrected thresholds --
+  `is_between_jaws()`'s `axial` component came out consistently NEGATIVE
+  (~-0.087) throughout the confirmed hold, meaning the cube registered as
+  behind the pivot. `JAW_AXIS_LOCAL` had been defined as the normalized
+  `JAW_OFFSET_LOCAL` itself, on the assumption that vector (pivot's
+  position offset from `gripper_frame_link`'s origin) already pointed in
+  the fingers' reach direction -- backwards, since that offset actually
+  points from the pivot back toward the wrist. Independently confirmed by
+  computing the TRUE fingertip position each traced step (moving jaw
+  link's live world pose plus a mesh-measured local offset) and finding
+  it measurably CLOSER to the held cube than the pivot was (~0.055-0.059m
+  vs ~0.088m) -- exactly what a positive axial reading is supposed to
+  mean. Fixed by negating `JAW_AXIS_LOCAL` relative to `JAW_OFFSET_LOCAL`
+  (`sim/robots/grasp_geometry.py` commit `0920adc`); `JAW_OFFSET_LOCAL`
+  and `grasp_point_world()` themselves were untouched, since the pivot
+  position was independently confirmed correct.
+
+**Result**: replaying all 8 re-segmented episodes through the real
+production reward function, 5 of 8 (episodes 000, 002, 003, 005, 006)
+now correctly register `ever_holding=True` for a genuine sustained
+grasp -- the first time this project has ever detected a real hold, from
+any source, RL or replay. The other 3 fail for separate, already-
+understood reasons unrelated to this fix: episode_004 still starts with
+the gripper closed even at 400 pad-steps (needs more padding or a
+different segmentation signal); episodes 001 and 007 both diverge from
+their own recordings under Option 1's joint-limit clipping (their
+replays never reach the recording's own peak cube height), suggesting
+clipping the recorded target rather than the robot's actual velocity is
+losing something for these two specifically.
+
+Also hit and worked around an unrelated Kit/Omniverse engine issue while
+running these replays: `DirectRLEnv.reset()`'s texture-streaming wait
+loop occasionally spins forever (confirmed via `py-spy` against the live
+process and `/proc/<pid>/io` showing zero ongoing disk reads -- nothing
+is actually still loading, an internal Kit busy-flag is just stuck).
+Worked around with `wait_for_textures=False`, scoped to this replay
+script only (it never reads a camera image, only physics state) --
+production training keeps the framework default.
+
+**How to apply**: this closes out the fidelity/detection half of the
+demo-seeding investigation -- the replay pipeline now produces genuine,
+buffer-compatible transitions where `ever_holding` correctly fires for
+real grasps. Remaining before this becomes usable for actual training:
+investigate episode_004 further (or accept 5/8 usable episodes as
+enough to seed with); decide whether to also revisit the 6-of-8
+wrist_flex joint-limit-exceedance finding now that its Option 1 clipping
+workaround looks like the likely cause of episodes 001/007's divergence;
+and wire the validated replay logic into `train_tdmpc2_pickplace.py`
+itself (currently only a standalone diagnostic script) so seeded
+transitions actually populate the buffer before online training starts.

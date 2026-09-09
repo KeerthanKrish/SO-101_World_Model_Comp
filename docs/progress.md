@@ -1358,3 +1358,38 @@ docs/decisions.md and docs/tdmpc2_integration.md entries) before
 starting this new direction, given how different a departure
 demonstration-seeded training is from every run so far. Prototyping in
 progress -- see docs/decisions.md for the plan.
+
+While prototyping the demo-to-buffer replay script, found and fixed
+three separate, independent bugs that had been silently preventing
+every recorded teleop episode from ever registering as a real grasp:
+episode segmentation was cutting off almost the entire approach/grasp
+phase (fixed by re-segmenting with far more pre-padding against the
+still-extant raw recording); the reach/proximity/touch thresholds were
+calibrated around an unmeasured guess at roughly half the gripper's true
+physical reach (corrected after measuring the real value two independent
+ways -- STL mesh parsing and a live replay measurement); and
+`jaw_approach_axis_world()` had been pointing the wrong physical
+direction the whole time (pivot toward the wrist instead of pivot toward
+the fingertips), so the reward function's own grasp-detection geometry
+had a real, previously-undetected sign bug. Full details, evidence, and
+verification for each in docs/decisions.md.
+
+After all three fixes, replaying the 8 re-segmented episodes through the
+real production reward function gets `ever_holding=True` for 5 of 8 --
+the first time this project has ever detected a genuine sustained grasp,
+from any source. This also raises a real open question worth flagging:
+this same axis-direction bug has been present in `is_between_jaws()`
+since it was added (2026-09-03) and would have affected every RL run's
+own grasp evaluation too (runs 9 through 15), not just this replay
+investigation -- not yet acted on beyond fixing it, since the current
+focus is specifically the demo-seeding pipeline, but worth keeping in
+mind if pure-RL training is revisited later.
+
+Remaining before demo-seeded training can actually run: episode_004
+still starts with the gripper closed even at generous re-padding and
+needs further investigation; episodes 001 and 007 diverge from their
+own recordings under the existing joint-limit clipping workaround
+(Option 1), which may need revisiting; and the validated replay logic
+still needs to be wired into `train_tdmpc2_pickplace.py` itself as an
+actual, usable feature -- `replay_demo_to_buffer.py` remains a
+standalone diagnostic script for now.

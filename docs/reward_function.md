@@ -759,7 +759,23 @@ finalized design.
   principled guess at the SO-101 gripper's finger length, not a measured
   spec. If misdetection becomes a real problem once training starts,
   adding a `ContactSensorCfg` to the fingertip geometry would be a more
-  principled fix than further tuning these thresholds.
+  principled fix than further tuning these thresholds. CORRECTED
+  (2026-09-09): `grasp_reach_max` is no longer a guess -- while
+  investigating why a confirmed genuine teleop hold still failed
+  detection, measured the true value two independent ways (binary-STL
+  parsing of `moving_jaw_so101_v1.stl` giving ~8.2cm jaw extent; a live
+  replay's own ~8.96cm gripper-to-cube measurement during the hold) and
+  found the guess was roughly half the real value. Corrected
+  `grasp_reach_max`/`grasp_proximity_threshold`/`touch_threshold`/
+  `align_activation_range` accordingly (see docs/decisions.md). Also
+  found and fixed a real direction bug in the same investigation:
+  `jaw_approach_axis_world()` (via `JAW_AXIS_LOCAL`) had been pointing
+  from the pivot back toward the wrist instead of out toward the
+  fingertips, so `is_between_jaws()`'s axial check failed a genuine hold
+  on the wrong side regardless of threshold size -- see
+  `sim/robots/grasp_geometry.py` and docs/decisions.md for the fix and
+  its verification. A `ContactSensorCfg` may still be worth adding
+  eventually, but the geometry itself is now measured, not guessed.
 - **Target position is fixed**, not yet randomized. This was deliberate
   for this first version (fixed positions are what let this module be
   validated against fixed-position recorded demonstrations at all), but
@@ -790,6 +806,15 @@ finalized design.
   actually behaves correctly across a genuine hold, not just the
   hand-constructed self-test cases -- is still not done, and is worth
   doing as part of the demonstration-seeding work now underway.
+  UPDATE (2026-09-09): this is now partially done -- replaying the
+  re-segmented episodes (see docs/decisions.md) through the real
+  `compute_reward()` gets `ever_holding=True` for 5 of 8 (after fixing
+  the segmentation, threshold, and axis-direction bugs described there),
+  confirming detection itself works across a genuine hold in practice,
+  not just the self-test's synthetic cases. Whether the transport-phase
+  reward SHAPING (the actual reward values paid out during a hold, as
+  opposed to just whether `is_holding()` fires) behaves sensibly across
+  these real holds has not yet been specifically examined.
 - Now wired into an actual Gym-style training environment
   (`sim/envs/pickplace_env.py`, see docs/training_env.md) -- this item
   is resolved, kept here only as a pointer for anyone who reads this file
