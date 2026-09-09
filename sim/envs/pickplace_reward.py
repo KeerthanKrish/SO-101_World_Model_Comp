@@ -411,14 +411,27 @@ class PickPlaceRewardConfig:
     # barely above the 0.02m lift_threshold, gripper joint happened to
     # read as closed, but the gripper was physically 0.38m away). See
     # docs/reward_function.md.
-    grasp_proximity_threshold: float = 0.05
+    #
+    # Raised from 0.05 to 0.10 (2026-09-09), alongside grasp_reach_max and
+    # touch_threshold below -- see grasp_reach_max's own docstring for the
+    # full derivation. All three were sized around the SAME wrong
+    # assumption (grasp_point_world()'s pivot reference sits ~5cm from a
+    # held cube); the real distance, confirmed two independent ways, is
+    # ~8-9cm. 0.10 is that plus a little slack for the lateral component
+    # (sqrt(0.09^2 + grasp_lateral_threshold^2) ~= 0.092).
+    grasp_proximity_threshold: float = 0.10
     # Looser than grasp_proximity_threshold on purpose -- represents "the
     # gripper has reached genuine contact range," an earlier, easier
     # milestone than actually being close/closed enough to count as
     # holding. Rewarding this separately (see touch_bonus below) gives a
     # concrete, achievable-before-a-full-grasp target for the touch_bonus
     # milestone.
-    touch_threshold: float = 0.08
+    #
+    # Raised from 0.08 to 0.14 (2026-09-09) -- see grasp_reach_max's own
+    # docstring. Kept comfortably looser than the new
+    # grasp_proximity_threshold (0.10), preserving the same relationship
+    # as before, just at the corrected scale.
+    touch_threshold: float = 0.14
 
     # -- Between-jaws geometry (2026-09-03) --
     # Added after run7's eval log showed a genuine false positive: an
@@ -433,11 +446,33 @@ class PickPlaceRewardConfig:
     # These two thresholds define a cone-shaped "graspable zone" extending
     # from the jaw pivot along jaw_approach_axis_world() (see
     # grasp_geometry.py) -- see is_between_jaws() below for the actual
-    # decomposition. grasp_reach_max is a principled guess at the SO-101
-    # gripper's finger length (no exact spec measured) -- deliberately
-    # smaller than touch_threshold (0.08) and grasp_proximity_threshold
-    # (0.05), since "within reach along the correct axis" should be a
-    # STRICTER bar than either of those, not a looser one.
+    # decomposition. grasp_reach_max was originally a principled GUESS at
+    # the SO-101 gripper's finger length (no exact spec measured) -- kept
+    # smaller than touch_threshold and grasp_proximity_threshold on
+    # purpose, since "within reach along the correct axis" should be a
+    # STRICTER bar than either of those, not a looser one. That
+    # relationship stays true after the correction below, just at a
+    # larger scale.
+    #
+    # Raised from 0.05 to 0.09 (2026-09-09) -- the guess was roughly HALF
+    # the true value, confirmed two independent ways while investigating
+    # why a real, physically-confirmed demonstration replay (see
+    # docs/decisions.md, demonstration-seeded training) never registered
+    # between_jaws/holding despite genuinely, rigidly carrying the cube
+    # (constant gripper-to-cube distance across many steps while both
+    # moved together through space -- the unambiguous signature of an
+    # actual grasp, not a near-miss): (1) parsing
+    # moving_jaw_so101_v1.stl (the mesh calibrate_grasp.py itself measures
+    # grasp_point_world() against) directly gives a jaw extent of ~8.2cm
+    # from the pivot end, not ~5cm; (2) the live replay's own measured
+    # gripper-to-cube distance during the confirmed hold was ~8.96cm to
+    # the cube's CENTER, consistent with an ~8cm reach plus roughly the
+    # cube's own half-size (1.5cm) to its near face. This one guess being
+    # roughly 2x too small is a plausible SEPARATE contributor to why
+    # pure RL exploration (runs 9-15) never registered a genuine hold --
+    # a policy that DID achieve a real grasp near the natural fingertip
+    # contact zone would have been rejected by this same check the whole
+    # time, not just under-rewarded for imprecision.
     #
     # grasp_reach_min widened from -0.01 to -0.04 (2026-09-05, run10
     # closing-focused redesign -- see this module's docstring's "Closing
@@ -450,8 +485,11 @@ class PickPlaceRewardConfig:
     # actually cover that observed contact point, without touching
     # grasp_reach_max or grasp_lateral_threshold (the axial-near-pivot case
     # is the one directly evidenced in run10's video, not a lateral one).
+    # Left unchanged by the 2026-09-09 grasp_reach_max correction above --
+    # that evidence was specifically about the FAR/positive-reach
+    # direction, nothing has evidenced this near-side boundary is wrong.
     grasp_reach_min: float = -0.04
-    grasp_reach_max: float = 0.05  # meters -- roughly the fingers' own reach past the pivot
+    grasp_reach_max: float = 0.09  # meters -- the fingers' own reach past the pivot, measured (see above), not guessed
     # How far off the approach axis the cube may sit and still count as
     # "centered between the jaws" -- a bit more than the cube's own half-
     # size (0.015m) for slight slack, deliberately tighter than the old
@@ -533,9 +571,17 @@ class PickPlaceRewardConfig:
     #
     # How close (spatially) the gripper must be before the lateral-
     # alignment shaping activates at all -- deliberately a bit LOOSER than
-    # touch_threshold (0.08), so the gradient can start pulling the
-    # approach into alignment slightly before contact, not only after.
-    align_activation_range: float = 0.10
+    # touch_threshold, so the gradient can start pulling the approach into
+    # alignment slightly before contact, not only after.
+    #
+    # Raised from 0.10 to 0.18 (2026-09-09), alongside touch_threshold's
+    # own 0.08 -> 0.14 correction (see grasp_reach_max's docstring) --
+    # otherwise this would have quietly flipped from "a bit looser than
+    # touch_threshold" to tighter than it, defeating the "slightly before
+    # contact" purpose. Scaled by roughly the same ~1.75x factor as
+    # touch_threshold itself, preserving the original ~0.02m gap between
+    # them proportionally.
+    align_activation_range: float = 0.18
     # Weight for the alignment shaping term. Smaller than reach_weight
     # (1.0) on purpose -- this is a secondary, fine-grained refinement
     # signal layered on top of the primary reach shaping once already
@@ -1305,11 +1351,11 @@ def _self_test():
         (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
         F, F, None, None, was_ever_held=F, cfg=cfg,
     )
-    # Deliberately just outside touch_threshold (dist ~0.10m > 0.08m), so
+    # Deliberately just outside touch_threshold (dist ~0.16m > 0.14m), so
     # this isolates the shaping-only property without also tripping
     # touch_bonus -- that's covered separately by test 12 below.
     near_fresh, info_near_fresh = compute_reward(
-        (0.18, 0.0, 0.015), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
+        (0.12, 0.0, 0.015), Q, cube_at_start, zero_vel, gripper_open_joint, zero_joint_vel,
         F, F, None, None, was_ever_held=F, cfg=cfg,
     )
     assert not info_near_fresh["touched"], "test setup error: this point must be outside touch range"
@@ -1373,8 +1419,8 @@ def _self_test():
     #    phase, AND fire the one-time grasp_bonus milestone -- and ONLY
     #    grasp_bonus, since touch_bonus already fired on the previous
     #    (still-open) step and was_touched=True is carried forward here
-    #    (the realistic staged sequence: touch range (0.08m) is looser than
-    #    holding proximity (0.05m), so touching is reached first).
+    #    (the realistic staged sequence: touch range (0.14m) is looser than
+    #    holding proximity (0.10m), so touching is reached first).
     lifted = (0.28, 0.0, 0.10)
     _, info = compute_reward(
         lifted, Q, lifted, zero_vel, gripper_closed_joint, zero_joint_vel,
@@ -1593,7 +1639,9 @@ def _self_test():
     # -> False in each case.
     cube_valid = tuple(pivot[i] + 0.03 * axis[i] for i in range(3))
     assert is_between_jaws(pivot, Q, cube_valid, cfg), "directly ahead, within reach, zero lateral offset must pass"
-    cube_too_far = tuple(pivot[i] + 0.08 * axis[i] for i in range(3))
+    # 0.14, not 0.08 -- must clear the CORRECTED grasp_reach_max (0.09,
+    # 2026-09-09) with room to spare, not just the original 0.05 guess.
+    cube_too_far = tuple(pivot[i] + 0.14 * axis[i] for i in range(3))
     assert not is_between_jaws(pivot, Q, cube_too_far, cfg), "past the fingers' own reach must fail"
     # -0.06, not -0.03 -- must clear the WIDENED grasp_reach_min (-0.04,
     # 2026-09-05) with room to spare, not just the original -0.01.
@@ -1640,7 +1688,9 @@ def _self_test():
     # nothing, no matter how large the joint-angle change -- this is the
     # user-specified requirement that closing must not be rewarded just
     # for happening "near" the cube in some looser sense.
-    cube_far_axis = tuple(lifted[i] + 0.08 * axis[i] for i in range(3))
+    # 0.14, not 0.08 -- same reasoning as cube_too_far above (test 14):
+    # must clear the corrected grasp_reach_max (0.09) with room to spare.
+    cube_far_axis = tuple(lifted[i] + 0.14 * axis[i] for i in range(3))
     _, info_close_far = compute_reward(
         lifted, Q, cube_far_axis, zero_vel, gripper_closed_joint, zero_joint_vel,
         F, F, None, gripper_open_joint, was_ever_held=F, cfg=cfg,
