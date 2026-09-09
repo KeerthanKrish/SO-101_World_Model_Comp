@@ -154,6 +154,21 @@ parser.add_argument(
     "versus the gripper simply never trending toward closed even while it had time to. See "
     "docs/decisions.md.",
 )
+parser.add_argument(
+    "--seed-demos", type=str, default=None,
+    help="Directory of recorded teleop episode_*.json files (see "
+    "sim/scripts/segment_teleop_episodes.py) to replay through the real env and add to the "
+    "buffer before training starts, seeding it with genuine successful-grasp transitions "
+    "instead of relying solely on RL exploration to ever discover one -- seven straight runs "
+    "(9 through 15) against this reward design never did. See docs/decisions.md. Every "
+    "episode_*.json found in this directory is replayed and added, so point this at a "
+    "directory containing only the episodes worth seeding with (e.g. a curated subset "
+    "confirmed via replay_demo_to_buffer.py to reach a genuine ever_holding=True), not "
+    "necessarily the full raw segmentation output. Buffer capacity is enlarged to fit these "
+    "transitions PERMANENTLY, never evicted for the life of the run -- see the buffer_cfg "
+    "comment in main() for why a one-time bootstrap that fades was deliberately rejected. "
+    "Omit for the original behavior (empty buffer, pure RL exploration).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -162,9 +177,28 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import glob
+import json
 import shutil
 from datetime import datetime
 from time import time
+
+# Force line-buffered stdout -- this box's known Kit shutdown-hang (real
+# work completes, including the final [RESULT] summary, but the process
+# hangs afterward in simulation_app.close()) means a run can sit hung for
+# a long time before it's noticed and killed. Every backgrounded run here
+# redirects stdout to a file, which Python fully block-buffers by
+# default -- without this, whatever happened after the last flush
+# (potentially the entire run, including [RESULT]) is invisible in the
+# log until the buffer happens to fill, making a finished-but-hung run
+# indistinguishable from a genuinely stuck one. Confirmed necessary the
+# hard way (2026-09-09): a seed-demos smoke test hung in close() with
+# nothing printed past step 125 in the log, even though loss/step
+# progress had clearly continued (confirmed via nvidia-smi/py-spy against
+# the live process) well past that point. Already applied to
+# replay_demo_to_buffer.py for the same reason. `sys` itself is already
+# imported at the top of this file, before AppLauncher.
+sys.stdout.reconfigure(line_buffering=True)
 
 import torch
 from omegaconf import OmegaConf
@@ -381,6 +415,143 @@ def to_td(obs, action=None, reward=None, terminated=None, action_dim=6):
     )
 
 
+_JOINT_ORDER = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+
+
+def replay_episode_to_tds(base_env, env, episode_path):
+    """Replays one recorded teleop episode (sim/output/teleop_episodes_v2/
+    episode_*.json format, or any directory produced the same way) through
+    the REAL env/wrapper this run already constructed -- the exact
+    env/observation/reward pipeline real training uses, not a separate
+    instance -- producing genuine TD-MPC2-format transitions. Distilled
+    from sim/scripts/replay_demo_to_buffer.py, which validated this
+    approach directly (5 of 8 re-segmented episodes reach a genuine
+    ever_holding=True when replayed this way -- see docs/decisions.md for
+    the full derivation, evidence, and remaining caveats). Strips that
+    prototype's investigation-only diagnostics (step traces, fingertip-
+    position verification against the STL mesh) -- those answered
+    questions already resolved; keeps only the per-episode saturation/
+    clipping summary, still useful for auditing a specific seed episode's
+    replay fidelity when this actually gets used.
+
+    Calls env.reset() at the start -- REQUIRED even though the state gets
+    immediately overridden below, since multiple episodes may be replayed
+    in sequence on this same persistent env instance (unlike the
+    prototype, which only ever replayed one episode per process): reset()
+    is what clears PickPlaceEnv's own per-episode reward-tracking state
+    (_was_holding/_prev_dist/_ever_held/etc, see pickplace_env.py's
+    _reset_idx()) and restarts its internal episode-length timeout
+    counter. Skipping it would let one episode's leftover state (e.g.
+    _ever_held=True from a genuine hold) silently leak into the next
+    replayed episode's reward computation.
+
+    Note: replayed episodes are subject to the SAME episode-length
+    timeout as real training rollouts (episode_length_s, ~500 steps at
+    50Hz) -- a demonstration whose own downsampled length exceeds that
+    gets truncated, matching every real training episode's own hard cap
+    rather than injecting anomalously long episodes into a buffer/sampler
+    built around that fixed length. Confirmed via replay_demo_to_buffer.py
+    that this did not cost any of the 5 successful episodes their
+    holding-worthy moment (each occurs well within the first 500 steps).
+
+    Returns (tds, stats): tds is a list of to_td()-format TensorDicts
+    (torch.cat(tds) is directly buffer.add()-able); stats is a dict of
+    the episode's own outcome for the caller to log/audit.
+    """
+    with open(episode_path) as f:
+        episode = json.load(f)
+    downsampled = episode[0::2]  # 100Hz recording -> the env's own 50Hz control rate
+
+    env.reset()  # see docstring -- clears prior-episode persistent reward state, restarts the timeout counter
+
+    default_root_state = base_env.cube.data.default_root_state.clone()
+    root_pose = default_root_state[:, :7].clone()
+    root_pose[0, 0:3] = torch.tensor(downsampled[0]["cube_pos"], device=base_env.device) + base_env.scene.env_origins[0]
+    base_env.cube.write_root_pose_to_sim(root_pose)
+    base_env.cube.write_root_velocity_to_sim(torch.zeros_like(default_root_state[:, 7:]))
+
+    initial_joint_pos = base_env.robot.data.default_joint_pos.clone()
+    for i, joint_name in enumerate(base_env.robot.data.joint_names):
+        if joint_name in downsampled[0]["joint_pos"]:
+            initial_joint_pos[0, i] = downsampled[0]["joint_pos"][joint_name]
+    base_env.robot.write_joint_state_to_sim(initial_joint_pos, base_env.robot.data.default_joint_vel)
+    base_env.robot.reset()
+    base_env.scene.reset()
+
+    # PickPlaceEnv's action mechanism is INCREMENTAL (each action is a
+    # delta from _joint_pos_target, not absolute -- see
+    # PickPlaceEnv._pre_physics_step()); must match the state override
+    # above or the first computed action below is a delta from the wrong
+    # baseline.
+    base_env._joint_pos_target = torch.tensor(
+        [[downsampled[0]["joint_pos"][j] for j in _JOINT_ORDER]], device=base_env.device
+    )
+    obs = env._build_obs(base_env._get_observations())  # env.reset()'s own obs is stale after the override above
+
+    tds = [to_td(obs, action_dim=6)]
+    max_cube_height = downsampled[0]["cube_pos"][2]
+    ever_touched = ever_between_jaws = ever_holding = False
+    reward_sum = 0.0
+    clamp_events = 0
+    limit_clip_events = 0
+    n_steps_run = 0
+
+    for frame in downsampled[1:]:
+        desired_target_raw = torch.tensor([[frame["joint_pos"][j] for j in _JOINT_ORDER]], device=base_env.device)
+        # OPTION 1 (chosen after discussion with the user, 2026-09-08):
+        # clip the recorded target to the robot's own physical joint
+        # limits before using it for anything below -- see
+        # replay_demo_to_buffer.py's module docstring for the full
+        # reasoning, and docs/decisions.md for the two episodes (001, 007)
+        # whose replay fidelity this clipping appears to cost the most.
+        desired_target = torch.clamp(desired_target_raw, base_env._soft_limits[..., 0], base_env._soft_limits[..., 1])
+        if not torch.equal(desired_target_raw, desired_target):
+            limit_clip_events += 1
+        desired_delta = desired_target - base_env._joint_pos_target
+        raw_ratio = (desired_delta / base_env._max_delta)[0]  # unclamped -- kept only as a label/diagnostic
+        action_label = raw_ratio.clamp(-1.0, 1.0)
+        if bool((raw_ratio.abs() > 1.0).any()):
+            clamp_events += 1
+
+        # Bypasses the normal delta-action velocity clamp -- overriding
+        # _joint_pos_target directly and passing a ZERO action makes
+        # _pre_physics_step()'s own delta math a no-op on top of it, so
+        # the actual PD command becomes exactly the recorded target,
+        # matching how the original recording was made (no per-tick
+        # velocity ceiling -- see replay_demo_to_buffer.py's "ROOT-CAUSE
+        # FIX" comment for the full derivation). action_label above (what
+        # a normal delta-action would have needed, clamped for
+        # representability) is still the action stored in the buffer --
+        # an honest, direction-consistent label for what happened, even
+        # on the rare saturated step where it does not exactly reconstruct
+        # the commanded target (checked against the 5 seed-worthy
+        # episodes directly: each joint saturates on at most ~0.8% of
+        # steps -- see docs/decisions.md).
+        base_env._joint_pos_target = desired_target
+        zero_action = torch.zeros(6, device=base_env.device)
+        obs, reward, done, info = env.step(zero_action)
+        tds.append(to_td(obs, action_label.cpu(), reward, torch.tensor(float(info["terminated"])), action_dim=6))
+
+        n_steps_run += 1
+        cube_height = base_env.cube.data.root_pos_w[0, 2].item()
+        max_cube_height = max(max_cube_height, cube_height)
+        ever_touched = ever_touched or info["touched"]
+        ever_between_jaws = ever_between_jaws or info["between_jaws"]
+        ever_holding = ever_holding or info["holding"]
+        reward_sum += reward.item()
+        if done:
+            break
+
+    stats = dict(
+        n_transitions=len(tds), n_steps_run=n_steps_run, n_steps_available=len(downsampled) - 1,
+        reward_sum=reward_sum, max_cube_height=max_cube_height,
+        recorded_max_cube_height=max(s["cube_pos"][2] for s in episode),
+        ever_touched=ever_touched, ever_between_jaws=ever_between_jaws, ever_holding=ever_holding,
+        clamp_events=clamp_events, limit_clip_events=limit_clip_events,
+    )
+    return tds, stats
+
+
 def run_eval_episode(env, base_env, agent, cfg, video_path, step_log_path=None):
     """Runs ONE episode with the CURRENT policy (eval_mode=True -- no
     exploration noise), using the SAME env instance training already
@@ -584,9 +755,63 @@ def main():
         # Calling it a second time here would be redundant at best.
         return
 
-    buffer = Buffer(cfg)
+    # --seed-demos: replay real recorded teleop episodes through this
+    # exact env/wrapper instance BEFORE the buffer is even constructed --
+    # see replay_episode_to_tds()'s own docstring and docs/decisions.md
+    # for the full derivation. Collected into a plain list first (not
+    # added to a buffer yet) specifically so the total transition count
+    # is known before Buffer(cfg) runs, needed for the capacity
+    # adjustment below.
+    seed_episodes = []
+    total_demo_transitions = 0
+    if args_cli.seed_demos is not None:
+        episode_paths = sorted(glob.glob(os.path.join(args_cli.seed_demos, "episode_*.json")))
+        print(f"[INFO] --seed-demos: found {len(episode_paths)} episode file(s) in {args_cli.seed_demos}")
+        for path in episode_paths:
+            tds, stats = replay_episode_to_tds(base_env, env, path)
+            seed_episodes.append((path, tds, stats))
+            total_demo_transitions += len(tds)
+            truncated = stats["n_steps_run"] < stats["n_steps_available"]
+            print(f"[INFO] seed-demo replay {os.path.basename(path)}: "
+                  f"transitions={stats['n_transitions']} reward_sum={stats['reward_sum']:+.3f} "
+                  f"max_cube_height={stats['max_cube_height']:.4f} "
+                  f"(recorded={stats['recorded_max_cube_height']:.4f}) "
+                  f"ever_touched={stats['ever_touched']} ever_between_jaws={stats['ever_between_jaws']} "
+                  f"ever_holding={stats['ever_holding']} clamp_events={stats['clamp_events']} "
+                  f"limit_clip_events={stats['limit_clip_events']} truncated_by_timeout={truncated}")
+        print(f"[INFO] --seed-demos: {total_demo_transitions} total transitions from "
+              f"{len(episode_paths)} episode(s)")
+
+    # Buffer's own capacity is min(cfg.buffer_size, cfg.steps) -- see
+    # common/buffer.py. buffer_size already defaults to 1,000,000 (never
+    # the binding constraint at any step count used so far), so cfg.steps
+    # alone determines capacity -- exactly the number of RL steps this run
+    # takes. Seeded demo transitions inserted first would eventually get
+    # evicted (the buffer is a ring buffer -- LazyTensorStorage wrapped by
+    # a torchrl ReplayBuffer, which overwrites oldest entries once
+    # extend() pushes past capacity) once total insertions exceed
+    # capacity, right as the run approaches its own step budget --
+    # discarding the seed data for exactly the reason it was added in the
+    # first place: to give the value function a persistent example of a
+    # genuine hold. A copy of cfg with `steps` inflated by the demo
+    # transition count -- used ONLY for sizing Buffer's capacity, never
+    # cfg.steps itself, which still drives the main loop/eval schedule/
+    # logging completely unchanged -- reserves that many extra slots so
+    # seed transitions are never evicted, for the entire run. See
+    # docs/decisions.md for why persistent presence (not a one-time
+    # bootstrap that fades once RL data wraps the ring buffer around) was
+    # the deliberate choice.
+    buffer_cfg = cfg
+    if total_demo_transitions > 0:
+        buffer_cfg = OmegaConf.merge(cfg, {"steps": cfg.steps + total_demo_transitions})
+    buffer = Buffer(buffer_cfg)
     logger = Logger(cfg)
     print(agent.model)
+
+    for path, tds, stats in seed_episodes:
+        seed_ep_idx = buffer.add(torch.cat(tds))
+        print(f"[INFO] seed-demo episode {seed_ep_idx} added to buffer from {os.path.basename(path)} "
+              f"(len={len(tds)}, reward_sum={stats['reward_sum']:+.3f})")
 
     step, ep_idx, done = 0, 0, True
     tds = None
