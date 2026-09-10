@@ -169,6 +169,21 @@ parser.add_argument(
     "comment in main() for why a one-time bootstrap that fades was deliberately rejected. "
     "Omit for the original behavior (empty buffer, pure RL exploration).",
 )
+parser.add_argument(
+    "--seed-demos-min-fraction", type=float, default=0.15,
+    help="Only used with --seed-demos. TD-MPC2's own buffer sampler (torchrl SliceSampler) "
+    "picks each training batch's trajectories UNIFORMLY BY EPISODE COUNT, not weighted by "
+    "episode length or recency -- confirmed by reading its source directly (torchrl/data/"
+    "replay_buffers/samplers.py's _sample_slices()), not assumed. A one-time seeding batch "
+    "therefore becomes a SHRINKING fraction of what gets sampled as more RL episodes "
+    "accumulate (run16: 5 seed episodes out of 85 total by the end, ~5.9% -- confirmed present "
+    "in every batch throughout, but not a large signal, and would keep shrinking further on a "
+    "longer run). This periodically re-adds the already-replayed seed episodes (no new env "
+    "stepping needed -- just another buffer.add() of already-computed transitions, effectively "
+    "free) whenever their share of total buffered episodes would otherwise drop below this "
+    "fraction, keeping their presence roughly constant rather than one-time-and-fading. See "
+    "docs/decisions.md.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -786,21 +801,19 @@ def main():
     # common/buffer.py. buffer_size already defaults to 1,000,000 (never
     # the binding constraint at any step count used so far), so cfg.steps
     # alone determines capacity -- exactly the number of RL steps this run
-    # takes. Seeded demo transitions inserted first would eventually get
-    # evicted (the buffer is a ring buffer -- LazyTensorStorage wrapped by
-    # a torchrl ReplayBuffer, which overwrites oldest entries once
-    # extend() pushes past capacity) once total insertions exceed
-    # capacity, right as the run approaches its own step budget --
-    # discarding the seed data for exactly the reason it was added in the
-    # first place: to give the value function a persistent example of a
-    # genuine hold. A copy of cfg with `steps` inflated by the demo
-    # transition count -- used ONLY for sizing Buffer's capacity, never
-    # cfg.steps itself, which still drives the main loop/eval schedule/
-    # logging completely unchanged -- reserves that many extra slots so
-    # seed transitions are never evicted, for the entire run. See
-    # docs/decisions.md for why persistent presence (not a one-time
-    # bootstrap that fades once RL data wraps the ring buffer around) was
-    # the deliberate choice.
+    # takes. A copy of cfg with `steps` inflated by the demo transition
+    # count -- used ONLY for sizing Buffer's capacity, never cfg.steps
+    # itself, which still drives the main loop/eval schedule/logging
+    # completely unchanged -- gives the FIRST seeding batch a little extra
+    # headroom before anything needs to be evicted for it. This is now a
+    # minor nicety, not the main mechanism: since TD-MPC2's own sampler
+    # picks trajectories uniformly BY EPISODE COUNT (see
+    # --seed-demos-min-fraction's help text), a one-time batch still
+    # becomes a shrinking fraction of what gets sampled as more RL
+    # episodes accumulate regardless of whether it's ever evicted from
+    # storage -- the periodic re-injection below (not this capacity bump)
+    # is what actually keeps the seed episodes' SAMPLING share from
+    # fading over a long run.
     buffer_cfg = cfg
     if total_demo_transitions > 0:
         buffer_cfg = OmegaConf.merge(cfg, {"steps": cfg.steps + total_demo_transitions})
@@ -812,6 +825,30 @@ def main():
         seed_ep_idx = buffer.add(torch.cat(tds))
         print(f"[INFO] seed-demo episode {seed_ep_idx} added to buffer from {os.path.basename(path)} "
               f"(len={len(tds)}, reward_sum={stats['reward_sum']:+.3f})")
+
+    # Cache the already-replayed transitions (torch.cat once, reused many
+    # times below) -- re-injection needs no new Isaac Sim stepping at all,
+    # just another buffer.add() of data already computed above, so it's
+    # effectively free to do often. buffer.add() re-tags `episode` on
+    # whatever TensorDict it's given to the buffer's own current counter
+    # before copying it into storage, so reusing the same cached object
+    # across many add() calls is exactly how it's designed to be called
+    # repeatedly (confirmed by reading common/buffer.py directly) -- no
+    # aliasing/staleness risk.
+    num_seed_episodes = len(seed_episodes)
+    seed_tds_concat = [torch.cat(tds) for _, tds, _ in seed_episodes]
+    reinject_every = None
+    if num_seed_episodes > 0:
+        frac = args_cli.seed_demos_min_fraction
+        # Steady-state share of total episode INSERTIONS (not necessarily
+        # of whatever happens to still be resident after eviction, a
+        # subtly different and harder-to-track quantity) converges to
+        # num_seed_episodes / (reinject_every + num_seed_episodes) -- solve
+        # for reinject_every given the target fraction.
+        reinject_every = max(1, round(num_seed_episodes * (1 - frac) / frac))
+        print(f"[INFO] --seed-demos-min-fraction={frac}: re-injecting all {num_seed_episodes} "
+              f"seed episode(s) every {reinject_every} real episode(s) added")
+    real_episodes_since_reinject = 0
 
     step, ep_idx, done = 0, 0, True
     tds = None
@@ -825,6 +862,15 @@ def main():
                 ep_idx = buffer.add(torch.cat(tds))
                 print(f"[INFO] step {step}: episode {ep_idx} added to buffer "
                       f"(len={len(tds)}, reward_sum={sum(td['reward'].item() for td in tds[1:]):.3f})")
+
+                if reinject_every is not None:
+                    real_episodes_since_reinject += 1
+                    if real_episodes_since_reinject >= reinject_every:
+                        for demo_td in seed_tds_concat:
+                            ep_idx = buffer.add(demo_td)
+                        print(f"[INFO] step {step}: re-injected {num_seed_episodes} seed-demo "
+                              f"episode(s) to maintain sampling share (buffer.num_eps={ep_idx})")
+                        real_episodes_since_reinject = 0
 
             if not args_cli.smoke_test and step >= next_eval_at:
                 video_path = os.path.join(run_video_dir, f"eval_step_{step:06d}.mp4")
