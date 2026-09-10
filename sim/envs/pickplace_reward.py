@@ -513,7 +513,29 @@ class PickPlaceRewardConfig:
     # being made, weakening the overall gradient during a real attempt.
     # 2 steps forgives a single- or double-step flicker without forgiving
     # a genuinely-lost, longer absence.
-    between_jaws_grace_steps: int = 2
+    #
+    # Raised from 2 to 5 (2026-09-09, demonstration-seeded run17 diagnostic
+    # -- see docs/decisions.md). A per-step --eval-only CSV of run17's own
+    # checkpoint (fixed cube position + seed-demos re-injection, the first
+    # run to ever reach between_jaws=True at all) showed a genuine
+    # 5-consecutive-step miss streak (steps 58-62 of that episode) in the
+    # MIDDLE of an otherwise-continuous approach/close attempt -- longer
+    # than the 1-2 step flickers run12's evidence was based on, and long
+    # enough that the old grace_steps=2 would have cut grasp_close_weight's
+    # shaping off for 3 of those 5 steps even though gripper_joint_pos was
+    # still trending steadily toward closed the entire time. The arm's own
+    # lateral position was oscillating in and out of grasp_lateral_threshold
+    # while closing proceeded on a slower, apparently unsynchronized
+    # timescale -- exactly the kind of "genuinely still attempting, briefly
+    # out of the strict window" case this mechanism exists to forgive, just
+    # under-provisioned for how long that window turned out to last in
+    # practice once a real close attempt was finally happening. Still
+    # deliberately scoped to grasp_close_weight's gate only, same as
+    # before -- is_between_jaws()/is_holding()'s own strict establishment
+    # logic is untouched, so this does not loosen what counts as a genuine
+    # hold, only how patient the CLOSING REWARD is with brief position loss
+    # during a real attempt.
+    between_jaws_grace_steps: int = 5
     # The URDF's gripper joint range (see gripper_closed_threshold above)
     # -- named separately since gripper_closed_threshold is a chosen
     # CUTOFF ("counts as closed enough"), while these two are the joint's
@@ -555,7 +577,29 @@ class PickPlaceRewardConfig:
     # the observed contact point, this also needs to be a strong, clearly
     # dominant signal on the occasions it fires -- 2.5x reach/place's own
     # weight, not merely equal to it.
-    grasp_close_weight: float = 2.5
+    #
+    # Raised from 2.5 to 4.0 (2026-09-09, alongside between_jaws_grace_steps
+    # above -- see that field's docstring and docs/decisions.md for the
+    # run17 diagnostic this responds to). This is a genuinely different
+    # problem from the one 2.5 was chosen for: is_between_jaws() is now
+    # reachable and grasp_close_weight DOES fire, but the same --eval-only
+    # trace showed gripper_joint_pos closing only gradually (roughly 15-20
+    # steps from open to past gripper_closed_threshold) while the arm's own
+    # lateral position was independently drifting in and out of the
+    # between_jaws window on a similar timescale -- a race the closing
+    # attempt was frequently losing. Nothing in this potential-based term's
+    # construction rewards closing QUICKLY over closing eventually (the
+    # telescoping sum from open to closed is the same total regardless of
+    # how many steps it takes); raising the weight does not change that
+    # property, but it does make every increment of closing progress more
+    # valuable relative to reach/lateral shaping and, through TD-MPC2's own
+    # discounting, makes finishing sooner (before more discounting applies)
+    # comparatively more attractive than before -- a real but indirect
+    # lever, not a direct speed bonus. Tried as the simpler, lower-risk
+    # change first, alongside the grace-window widening above; a more
+    # direct speed-specific shaping term is a candidate follow-up if this
+    # alone proves insufficient.
+    grasp_close_weight: float = 4.0
 
     # -- Lateral-alignment shaping and premature-close penalty (2026-09-03,
     # after run8) -- see this module's docstring for the full story: run8
@@ -1909,18 +1953,21 @@ def _self_test():
 
     # 19c. Consecutive misses starting from a genuine hit stay effective
     # up to and including exactly between_jaws_grace_steps misses -- the
-    # boundary case matters, not just "somewhere in the middle."
-    eff1, streak1 = _between_jaws_effective(False, 0, cfg)  # 1st consecutive miss after a hit
-    assert eff1 and streak1 == 1, "a single miss right after a hit must still be within the grace window"
-    eff2, streak2 = _between_jaws_effective(False, streak1, cfg)  # 2nd consecutive miss
-    assert eff2 and streak2 == cfg.between_jaws_grace_steps, (
-        "exactly between_jaws_grace_steps consecutive misses must still be within the grace window"
-    )
+    # boundary case matters, not just "somewhere in the middle." Looped
+    # over cfg.between_jaws_grace_steps calls (not hardcoded to 2) so this
+    # actually tests the configured boundary whatever it's set to --
+    # a fixed 2-call version silently stopped testing the real boundary
+    # the moment between_jaws_grace_steps changed away from 2
+    # (2026-09-09).
+    streak = 0
+    for i in range(1, cfg.between_jaws_grace_steps + 1):
+        eff, streak = _between_jaws_effective(False, streak, cfg)
+        assert eff and streak == i, f"consecutive miss {i} must still be within the grace window"
 
     # 19d. One miss beyond the grace window must stop being effective --
     # confirms the window genuinely ends, not just an off-by-one guess.
-    eff3, streak3 = _between_jaws_effective(False, streak2, cfg)  # 3rd consecutive miss
-    assert not eff3 and streak3 == cfg.between_jaws_grace_steps + 1, (
+    eff_beyond, streak_beyond = _between_jaws_effective(False, streak, cfg)
+    assert not eff_beyond and streak_beyond == cfg.between_jaws_grace_steps + 1, (
         "a miss streak beyond the grace window must no longer be treated as effectively between the jaws"
     )
 
@@ -1933,44 +1980,56 @@ def _self_test():
     # reasoning as test 16b) so `holding` never establishes and confounds
     # the close_shaping-only property being tested here. Reuses
     # `cube_between` (a genuine hit) and `cube_far_axis` (a genuine miss,
-    # from test 16a) so no new geometry fixtures are needed.
-    j0, j1, j2, j3, j4 = 1.0, 0.8, 0.6, 0.4, 0.35
-    for j in (j0, j1, j2, j3, j4):
-        assert j > cfg.gripper_closed_threshold, "test setup: must never count as closed enough to hold"
+    # from test 16a) so no new geometry fixtures are needed. Generated as
+    # a loop over cfg.between_jaws_grace_steps + 1 miss steps (not
+    # hardcoded to a specific count) so this test automatically covers
+    # whatever the grace window is actually configured to, rather than
+    # silently under-testing it after a future change to that value --
+    # exactly the kind of gap that would have hidden the grace_steps=2 ->
+    # 5 change's own effect on this test if left as a fixed 3-miss
+    # sequence (2026-09-09).
+    grace = cfg.between_jaws_grace_steps
+    n_joints = grace + 3  # baseline + hit + (grace misses within window + 1 beyond it)
+    joints = [1.0 - 0.05 * k for k in range(n_joints)]
+    for j in joints:
+        assert j > cfg.gripper_closed_threshold, (
+            "test setup: must never count as closed enough to hold -- if this fires, "
+            "between_jaws_grace_steps has grown large enough that this test's joint "
+            "sequence needs a smaller step size to stay above gripper_closed_threshold"
+        )
 
     _, info_hz_hit = compute_reward(
-        lifted, Q, cube_between, zero_vel, j1, zero_joint_vel,
-        F, F, None, j0, was_ever_held=F, cfg=cfg,
+        lifted, Q, cube_between, zero_vel, joints[1], zero_joint_vel,
+        F, F, None, joints[0], was_ever_held=F, cfg=cfg,
     )
     assert info_hz_hit["between_jaws"], "test setup: must be a genuine hit"
     assert info_hz_hit["jaws_miss_streak"] == 0
     assert info_hz_hit["grasp_close"] > 0.0, "closing while genuinely between the jaws must be rewarded"
 
-    _, info_hz_miss1 = compute_reward(
-        lifted, Q, cube_far_axis, zero_vel, j2, zero_joint_vel,
-        F, F, None, j1, was_ever_held=F, prev_jaws_miss_streak=info_hz_hit["jaws_miss_streak"], cfg=cfg,
-    )
-    assert not info_hz_miss1["between_jaws"], "test setup: must be a genuine miss (raw check)"
-    assert info_hz_miss1["jaws_miss_streak"] == 1
-    assert info_hz_miss1["grasp_close"] > 0.0, (
-        "closing must still be rewarded on the 1st consecutive miss -- within the grace window"
-    )
+    # Steps 2..grace+1 (inclusive): grace consecutive misses, all still
+    # within the grace window and still rewarded.
+    prev_streak = info_hz_hit["jaws_miss_streak"]
+    prev_joint = joints[1]
+    for i in range(1, grace + 1):
+        _, info_miss = compute_reward(
+            lifted, Q, cube_far_axis, zero_vel, joints[i + 1], zero_joint_vel,
+            F, F, None, prev_joint, was_ever_held=F, prev_jaws_miss_streak=prev_streak, cfg=cfg,
+        )
+        assert not info_miss["between_jaws"], "test setup: must be a genuine miss (raw check)"
+        assert info_miss["jaws_miss_streak"] == i, f"expected miss streak {i}, got {info_miss['jaws_miss_streak']}"
+        assert info_miss["grasp_close"] > 0.0, (
+            f"closing must still be rewarded on consecutive miss {i} -- within the grace window "
+            f"(grace={grace})"
+        )
+        prev_streak, prev_joint = info_miss["jaws_miss_streak"], joints[i + 1]
 
-    _, info_hz_miss2 = compute_reward(
-        lifted, Q, cube_far_axis, zero_vel, j3, zero_joint_vel,
-        F, F, None, j2, was_ever_held=F, prev_jaws_miss_streak=info_hz_miss1["jaws_miss_streak"], cfg=cfg,
+    # One more miss, now genuinely beyond the grace window.
+    _, info_beyond = compute_reward(
+        lifted, Q, cube_far_axis, zero_vel, joints[n_joints - 1], zero_joint_vel,
+        F, F, None, prev_joint, was_ever_held=F, prev_jaws_miss_streak=prev_streak, cfg=cfg,
     )
-    assert info_hz_miss2["jaws_miss_streak"] == cfg.between_jaws_grace_steps
-    assert info_hz_miss2["grasp_close"] > 0.0, (
-        "closing must still be rewarded on exactly the between_jaws_grace_steps-th consecutive miss"
-    )
-
-    _, info_hz_miss3 = compute_reward(
-        lifted, Q, cube_far_axis, zero_vel, j4, zero_joint_vel,
-        F, F, None, j3, was_ever_held=F, prev_jaws_miss_streak=info_hz_miss2["jaws_miss_streak"], cfg=cfg,
-    )
-    assert info_hz_miss3["jaws_miss_streak"] == cfg.between_jaws_grace_steps + 1
-    assert info_hz_miss3["grasp_close"] == 0.0, (
+    assert info_beyond["jaws_miss_streak"] == grace + 1
+    assert info_beyond["grasp_close"] == 0.0, (
         "closing must earn nothing once the miss streak genuinely outlasts the grace window, "
         "even though the joint is still moving toward closed"
     )
