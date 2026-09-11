@@ -600,6 +600,56 @@ class PickPlaceRewardConfig:
     # direct speed-specific shaping term is a candidate follow-up if this
     # alone proves insufficient.
     grasp_close_weight: float = 4.0
+    # Added 2026-09-11, after run21's own final checkpoint was found (via
+    # --eval-only, then confirmed on video) to have settled into a stable,
+    # repeating loop: approach, dip to roughly 35-45% closed, retreat,
+    # repeat -- across one 500-step episode this happened ~15 separate
+    # times, the cube never once leaving the table, while still earning
+    # the highest total reward of any episode this project had produced
+    # (+11.06) purely from re-collecting ordinary reach/align/close
+    # shaping on each fresh approach leg. See docs/decisions.md for the
+    # full trace analysis.
+    #
+    # The gap: grasp_close_weight's shaping (above) rewards ANY closing
+    # progress each step via a plain step-to-step potential delta -- it
+    # has no memory, so re-doing the exact same shallow dip a fifth time
+    # earns the same reward it did the first time. Nothing makes
+    # genuinely exceeding a prior attempt's depth worth more than safely
+    # repeating it, so a policy that's found a shallow dip-and-retreat
+    # comfortable has no direct incentive to ever risk going deeper.
+    #
+    # deepest_close_weight closes that gap directly: potential-based, like
+    # every other shaping term here, but measured against a MONOTONIC
+    # high-water mark (the deepest -- i.e. most-closed -- point reached so
+    # far THIS EPISODE, tracked via compute_reward()'s prev_deepest_close
+    # parameter / info["deepest_close"], the same persisted-across-steps
+    # pattern as prev_dist/prev_lateral/prev_jaws_miss_streak) rather than
+    # against just the previous step. Concretely: pays
+    # weight * max(0, Phi_close(now) - Phi_close(best-so-far)), and only
+    # updates the record when this step's potential genuinely exceeds it.
+    # Gated identically to grasp_close_weight (not holding, and
+    # between_jaws_for_closing -- the SAME hysteresis-adjusted gate, so a
+    # brief forgiven miss doesn't also erase progress already banked
+    # here).
+    #
+    # Why this can't be farmed by oscillating, unlike a plain per-step
+    # velocity reward would be (see close_speed_bonus's own docstring for
+    # that specific rejected design): summed over an entire episode,
+    # regardless of how many times the gripper dips and retreats, the
+    # TOTAL payout from this term telescopes to exactly
+    # weight * (deepest point ever reached - the starting baseline of
+    # fully open) -- repeating an already-reached depth, however many
+    # times, contributes nothing further, only a genuinely new record
+    # does. This is a stricter, ratcheted version of the same
+    # potential-based-shaping guarantee (Ng/Harada/Russell) the rest of
+    # this module already relies on, not a new kind of safety argument.
+    #
+    # Set equal to grasp_close_weight (not derived from first principles
+    # -- there's no way to derive the "right" value without empirical
+    # testing, same as every other weight in this file): genuinely new
+    # depth this episode is worth double the base closing rate, a clear
+    # but not extreme differential from merely repeating a prior depth.
+    deepest_close_weight: float = 4.0
 
     # -- Lateral-alignment shaping and premature-close penalty (2026-09-03,
     # after run8) -- see this module's docstring for the full story: run8
@@ -1051,6 +1101,7 @@ def compute_reward(
     was_ever_held: bool,
     prev_lateral=None,
     prev_jaws_miss_streak=None,
+    prev_deepest_close=None,
     cfg: PickPlaceRewardConfig = PickPlaceRewardConfig(),
 ):
     """Computes one step's scalar reward plus a diagnostics dict.
@@ -1114,6 +1165,26 @@ def compute_reward(
     not a bug: it discourages closing prematurely on approach and then
     re-opening, since that round trip nets zero at best under the
     potential-based formulation, same as any other non-progress.
+
+    ## Deepest-close progress shaping (added 2026-09-11)
+
+    That exact zero-net-at-best property has a real downside: run21's own
+    final checkpoint was found (--eval-only, then confirmed on video) to
+    have settled into a stable, repeating loop -- approach, dip to
+    roughly 35-45% closed, retreat, repeat, about 15 times across one
+    500-step episode, the cube never once leaving the table -- while
+    still earning the highest total reward of any episode this project
+    had produced, purely by re-collecting ordinary reach/align/close
+    shaping on each fresh approach leg. grasp_close_weight's plain
+    step-to-step delta has no memory: redoing the exact same shallow dip
+    a fifth time pays exactly what it did the first time, so nothing
+    makes genuinely exceeding a prior attempt's depth worth more than
+    safely repeating it. deepest_close_weight (see its own config
+    docstring for the full derivation and the farm-proofing argument)
+    closes that gap: potential-based like everything else here, but
+    measured against a monotonic high-water mark -- the deepest point
+    reached so far THIS EPISODE -- rather than just the previous step, so
+    only genuinely new progress ever pays out again.
 
     ## Lateral-alignment shaping and premature-close penalty (2026-09-03)
 
@@ -1255,6 +1326,19 @@ def compute_reward(
             between_jaws_grace_steps's own docstrings. The caller
             persists whatever this function returns as
             `info["jaws_miss_streak"]`.
+        prev_deepest_close: the `deepest_close` value THIS function
+            returned in its info dict on the PREVIOUS step, or None on a
+            fresh episode / first step after a reset -- treated as a
+            fully-open (0.0) baseline internally, NOT as "no record set
+            yet requires special-casing," so the very first qualifying
+            step still earns a normal, proportional deepest_close_weight
+            payout rather than a cliff. Defaults to None for the same
+            reason as prev_lateral. Tracks the deepest (most-closed)
+            gripper potential reached so far THIS EPISODE while genuinely
+            eligible (see deepest_close_weight's own docstring) -- a
+            MONOTONIC high-water mark, never allowed to regress even on
+            a step that doesn't beat it. The caller persists whatever
+            this function returns as `info["deepest_close"]`.
         cfg: reward configuration/weights.
 
     Returns:
@@ -1264,8 +1348,9 @@ def compute_reward(
         step's `prev_dist`), `joint_pos` (to be passed back as next step's
         `prev_joint_pos`), `lateral` (to be passed back as next step's
         `prev_lateral`), `ever_held` (to be passed back as next step's
-        `was_ever_held`), and `jaws_miss_streak` (to be passed back as
-        next step's `prev_jaws_miss_streak`).
+        `was_ever_held`), `jaws_miss_streak` (to be passed back as next
+        step's `prev_jaws_miss_streak`), and `deepest_close` (to be passed
+        back as next step's `prev_deepest_close`).
     """
     holding = is_holding(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, was_holding, cfg)
     grasped = is_grasped(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, cfg)
@@ -1315,6 +1400,29 @@ def compute_reward(
         )
     else:
         close_shaping = 0.0
+
+    # Deepest-close progress shaping (added 2026-09-11) -- see
+    # deepest_close_weight's own docstring for the full derivation
+    # (the run21 dip-and-retreat oscillation loop this responds to).
+    # Same gate as close_shaping above (not holding, between_jaws_for_closing),
+    # since this is specifically about progress made while genuinely
+    # eligible to catch the cube, not closing anywhere. Unlike
+    # close_shaping, this is measured against a MONOTONIC high-water
+    # mark, not just the previous step -- prev_deepest_close=None is
+    # treated as a fully-open (potential 0.0) baseline, NOT as "no
+    # record, skip this term," so the very first qualifying step still
+    # earns a normal, proportional payout. The record (`deepest_close`)
+    # itself persists untouched whenever this step isn't eligible to
+    # extend it (including staying None if never set) -- a brief,
+    # already-forgiven miss must not erase progress already banked.
+    current_close_potential = _gripper_close_potential(gripper_joint_pos, cfg)
+    if not holding and between_jaws_for_closing:
+        prior_best_close = 0.0 if prev_deepest_close is None else prev_deepest_close
+        deepest_close = max(prior_best_close, current_close_potential)
+        deepest_close_bonus = cfg.deepest_close_weight * max(0.0, current_close_potential - prior_best_close)
+    else:
+        deepest_close = prev_deepest_close
+        deepest_close_bonus = 0.0
 
     # Lateral-alignment shaping (added 2026-09-03, see this function's
     # docstring) -- potential-based, same delta pattern as everything
@@ -1389,7 +1497,10 @@ def compute_reward(
 
     action_penalty = cfg.action_penalty_weight * sum(v * v for v in joint_vel)
 
-    reward = shaping + close_shaping + align_shaping + milestone_bonus - action_penalty - premature_close_penalty
+    reward = (
+        shaping + close_shaping + deepest_close_bonus + align_shaping + milestone_bonus
+        - action_penalty - premature_close_penalty
+    )
     if placed:
         reward += cfg.success_bonus
 
@@ -1403,6 +1514,7 @@ def compute_reward(
         "failed": failed,
         "dense": shaping,
         "grasp_close": close_shaping,
+        "deepest_close_bonus": deepest_close_bonus,
         "lateral_align": align_shaping,
         "premature_close_penalty": premature_close_penalty,
         "milestone_bonus": milestone_bonus,
@@ -1412,6 +1524,7 @@ def compute_reward(
         "lateral": lateral if in_align_zone else None,
         "ever_held": ever_held,
         "jaws_miss_streak": jaws_miss_streak,
+        "deepest_close": deepest_close,
     }
     return reward, info
 
@@ -1617,6 +1730,129 @@ def _self_test():
     )
     assert info_speed_again["milestone_bonus"] == 0.0, (
         "close_speed_bonus must not fire again on an already-holding step, same as grasp_bonus"
+    )
+
+    # 5g-5m. deepest_close_weight (added 2026-09-11, see its own config
+    # docstring for the full derivation -- the run21 dip-and-retreat
+    # oscillation loop this responds to). Uses coincident gripper/cube
+    # positions for "hit" steps (same established pattern as test 5's own
+    # hit case above -- dist=0 trivially satisfies is_between_jaws()
+    # regardless of orientation) and a position far outside any threshold
+    # for the one "miss" step -- defined locally since this runs before
+    # cube_between/cube_far_axis are constructed later in this self-test.
+    # All depths below stay strictly above gripper_closed_threshold, so
+    # `holding` never establishes and confounds the deepest-close-only
+    # property being tested here (same reasoning as test 16b/19e-h).
+    far_away_cube = (lifted[0] + 1.0, lifted[1], lifted[2])
+    partial_close_1 = 1.0
+    shallower_close = 1.3
+    deeper_close = 0.6
+    for j in (partial_close_1, shallower_close, deeper_close):
+        assert j > cfg.gripper_closed_threshold, "test setup: must never count as closed enough to hold"
+    assert shallower_close > partial_close_1 > deeper_close, "test setup: must be a genuine shallow/deep ordering"
+
+    # 5g. First qualifying step this episode (prev_deepest_close=None):
+    # must be treated as a fully-open (potential 0.0) baseline, not
+    # skipped for lack of a prior record -- a normal, proportional
+    # payout, not a cliff.
+    _, info_deep1 = compute_reward(
+        lifted, Q, lifted, zero_vel, partial_close_1, zero_joint_vel,
+        F, F, None, gripper_open_joint, was_ever_held=F, cfg=cfg,
+    )
+    assert info_deep1["between_jaws"], "test setup: must be a genuine hit"
+    expected_phi1 = _gripper_close_potential(partial_close_1, cfg)
+    assert abs(info_deep1["deepest_close_bonus"] - cfg.deepest_close_weight * expected_phi1) < 1e-9, (
+        "the first qualifying step this episode must earn a normal, proportional payout against "
+        "an implicit fully-open baseline, not be skipped for lack of a prior record"
+    )
+    assert abs(info_deep1["deepest_close"] - expected_phi1) < 1e-9, "the record must be set to this step's own potential"
+
+    # 5h. Repeating the EXACT same depth: must earn nothing further, and
+    # the record must not change -- the core farm-proofing property.
+    _, info_deep2 = compute_reward(
+        lifted, Q, lifted, zero_vel, partial_close_1, zero_joint_vel,
+        F, F, None, partial_close_1, was_ever_held=F, prev_deepest_close=info_deep1["deepest_close"], cfg=cfg,
+    )
+    assert info_deep2["deepest_close_bonus"] == 0.0, "repeating an already-reached depth must earn nothing further"
+    assert abs(info_deep2["deepest_close"] - info_deep1["deepest_close"]) < 1e-9, "the record must be unchanged"
+
+    # 5i. A SHALLOWER dip than the record (gripper partly re-opens, but
+    # still between the jaws): must earn nothing, and -- critically --
+    # the record must NOT regress down to this shallower value.
+    _, info_deep3 = compute_reward(
+        lifted, Q, lifted, zero_vel, shallower_close, zero_joint_vel,
+        F, F, None, partial_close_1, was_ever_held=F, prev_deepest_close=info_deep2["deepest_close"], cfg=cfg,
+    )
+    assert info_deep3["deepest_close_bonus"] == 0.0, "a shallower dip than the existing record must earn nothing"
+    assert abs(info_deep3["deepest_close"] - info_deep1["deepest_close"]) < 1e-9, (
+        "the record must never regress -- a shallower step must not overwrite a deeper prior record"
+    )
+
+    # 5j. A genuinely DEEPER dip than the record: must earn a payout
+    # proportional to the improvement over the PRIOR record specifically
+    # (not from zero), and the record must update to this new, deeper
+    # value.
+    _, info_deep4 = compute_reward(
+        lifted, Q, lifted, zero_vel, deeper_close, zero_joint_vel,
+        F, F, None, shallower_close, was_ever_held=F, prev_deepest_close=info_deep3["deepest_close"], cfg=cfg,
+    )
+    expected_phi4 = _gripper_close_potential(deeper_close, cfg)
+    assert abs(info_deep4["deepest_close_bonus"] - cfg.deepest_close_weight * (expected_phi4 - expected_phi1)) < 1e-9, (
+        "a genuinely deeper dip must earn a payout proportional to the improvement over the PRIOR record"
+    )
+    assert abs(info_deep4["deepest_close"] - expected_phi4) < 1e-9, "the record must update to the new, deeper value"
+
+    # 5k. Not eligible this step (genuinely far from the cube, outside
+    # even the grace window): the record must persist untouched, not be
+    # erased -- a lost attempt must not wipe out progress already banked.
+    _, info_deep5 = compute_reward(
+        far_away_cube, Q, lifted, zero_vel, gripper_open_joint, zero_joint_vel,
+        F, F, None, deeper_close, was_ever_held=F, prev_deepest_close=info_deep4["deepest_close"], cfg=cfg,
+    )
+    assert not info_deep5["between_jaws"], "test setup: must be a genuine miss"
+    assert info_deep5["deepest_close_bonus"] == 0.0, "an ineligible step must earn nothing from this term"
+    assert abs(info_deep5["deepest_close"] - info_deep4["deepest_close"]) < 1e-9, (
+        "the record must persist through an ineligible step, not be erased"
+    )
+
+    # 5l. Once holding, this term must also go silent (mirrors
+    # grasp_close_weight's own `not holding` gate) -- nothing left to
+    # reward once the grasp is already established.
+    _, info_deep6 = compute_reward(
+        lifted, Q, lifted, zero_vel, gripper_closed_joint, zero_joint_vel,
+        True, F, None, deeper_close, was_ever_held=True, prev_deepest_close=info_deep4["deepest_close"], cfg=cfg,
+    )
+    assert info_deep6["holding"], "test setup: must be a genuine hold"
+    assert info_deep6["deepest_close_bonus"] == 0.0, "deepest_close_bonus must not pay out once already holding"
+
+    # 5m. The core farm-proofing guarantee, checked directly rather than
+    # just implied by the individual cases above: summed across an entire
+    # multi-cycle episode (several dip-and-retreat cycles, interleaved
+    # with two genuinely new deepest points), the TOTAL payout from this
+    # term must equal exactly weight * (deepest point ever reached - the
+    # fully-open baseline) -- regardless of how many shallower repeats or
+    # retreats happened in between. This is the actual property being
+    # relied on to make the run21 oscillation loop unprofitable.
+    cycle_depths = [1.0, 1.3, 1.0, 1.3, 0.6, 1.3, 0.4]  # dip, retreat, repeat, retreat, new deepest, retreat, new deepest
+    for j in cycle_depths:
+        assert j > cfg.gripper_closed_threshold, "test setup: must never count as closed enough to hold"
+    total_bonus = 0.0
+    prev_deep = None
+    prev_j = gripper_open_joint
+    for depth in cycle_depths:
+        _, info_cycle = compute_reward(
+            lifted, Q, lifted, zero_vel, depth, zero_joint_vel,
+            F, F, None, prev_j, was_ever_held=F, prev_deepest_close=prev_deep, cfg=cfg,
+        )
+        total_bonus += info_cycle["deepest_close_bonus"]
+        prev_deep = info_cycle["deepest_close"]
+        prev_j = depth
+    expected_total = cfg.deepest_close_weight * _gripper_close_potential(min(cycle_depths), cfg)
+    assert abs(total_bonus - expected_total) < 1e-9, (
+        "total payout across a whole multi-cycle episode must equal exactly weight * (deepest "
+        "point ever reached - the fully-open baseline), regardless of how many shallower repeats "
+        "or retreats happened in between -- the actual farm-proofing guarantee this term is "
+        "designed around"
     )
 
     # 6. Regression test for a real bug caught during validation against
@@ -2149,6 +2385,9 @@ def _self_test():
     print(f"  premature_close_penalty={info_premature['premature_close_penalty']:+.4f}")
     print(f"  lateral_align_improve={info_align_improve['lateral_align']:+.4f} lateral_align_worsen={info_align_worsen['lateral_align']:+.4f}")
     print(f"  close_speed_bonus(1 rad/s)={expected_speed_bonus:+.4f} close_speed_bonus(capped)={expected_capped_bonus:+.4f}")
+    print(f"  deepest_close_bonus(new record)={info_deep1['deepest_close_bonus']:+.4f} "
+          f"deepest_close_bonus(repeat)={info_deep2['deepest_close_bonus']:+.4f} "
+          f"oscillation_total={total_bonus:+.4f} (== weight*deepest_ever={expected_total:+.4f})")
 
 
 if __name__ == "__main__":

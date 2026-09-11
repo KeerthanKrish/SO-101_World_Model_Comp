@@ -81,6 +81,12 @@ compute_reward() signature:
     grasp_close_weight's shaping, not is_grasped()/is_holding()'s own
     establishment logic -- see _between_jaws_effective()'s own docstring
     in pickplace_reward.py.
+  - `_prev_deepest_close`: same NaN-sentinel pattern as `_prev_dist`, for
+    compute_reward()'s deepest_close_weight shaping (added 2026-09-11) --
+    feeds `prev_deepest_close`, a MONOTONIC high-water mark of the
+    deepest gripper-closing potential reached so far this episode, not
+    reset by a brief between_jaws miss (only by a genuine env reset) --
+    see deepest_close_weight's own docstring in pickplace_reward.py.
 
 This is a deliberate simplicity/performance tradeoff: pickplace_reward.py
 was specifically built and empirically validated as a small,
@@ -257,6 +263,13 @@ class PickPlaceEnv(DirectRLEnv):
         # grasp_close_weight's shaping, see _between_jaws_effective()'s
         # own docstring in pickplace_reward.py.
         self._prev_jaws_miss_streak = torch.full((self.num_envs,), float("nan"), device=self.device)
+        # Same NaN-sentinel pattern again, for compute_reward()'s
+        # deepest_close_weight shaping (added 2026-09-11) -- feeds
+        # `prev_deepest_close`, a MONOTONIC high-water mark that must
+        # persist across a brief between_jaws miss (NOT reset the way
+        # _prev_lateral is), only cleared by a genuine env reset below --
+        # see deepest_close_weight's own docstring in pickplace_reward.py.
+        self._prev_deepest_close = torch.full((self.num_envs,), float("nan"), device=self.device)
 
     def _setup_scene(self):
         # Everything (robot, cube, table, ground, light, optional cameras)
@@ -340,6 +353,7 @@ class PickPlaceEnv(DirectRLEnv):
             prev_j = self._prev_joint_pos[i].item()
             prev_lat = self._prev_lateral[i].item()
             prev_streak = self._prev_jaws_miss_streak[i].item()
+            prev_deepest = self._prev_deepest_close[i].item()
             reward, info = compute_reward(
                 gripper_pos_local[i].tolist(),
                 gripper_quat[i].tolist(),
@@ -354,6 +368,7 @@ class PickPlaceEnv(DirectRLEnv):
                 was_ever_held=bool(self._ever_held[i].item()),
                 prev_lateral=None if math.isnan(prev_lat) else prev_lat,
                 prev_jaws_miss_streak=None if math.isnan(prev_streak) else prev_streak,
+                prev_deepest_close=None if math.isnan(prev_deepest) else prev_deepest,
                 cfg=self._reward_cfg,
             )
             rewards[i] = reward
@@ -365,6 +380,9 @@ class PickPlaceEnv(DirectRLEnv):
             self._prev_lateral[i] = float("nan") if info["lateral"] is None else info["lateral"]
             self._ever_held[i] = info["ever_held"]
             self._prev_jaws_miss_streak[i] = info["jaws_miss_streak"]
+            self._prev_deepest_close[i] = (
+                float("nan") if info["deepest_close"] is None else info["deepest_close"]
+            )
             placed[i] = info["placed"]
             failed[i] = info["failed"]
             touched[i] = info["touched"]
@@ -433,6 +451,10 @@ class PickPlaceEnv(DirectRLEnv):
         # counter -- a fresh episode must not inherit a miss streak (or
         # lack thereof) from a completely unrelated previous episode.
         self._prev_jaws_miss_streak[env_ids] = float("nan")
+        # Same reasoning again, for the deepest-close high-water mark --
+        # a fresh episode must not inherit "how deep the gripper got" from
+        # a completely unrelated previous episode.
+        self._prev_deepest_close[env_ids] = float("nan")
 
         cube_x = sample_uniform(self.cfg.cube_x_range[0], self.cfg.cube_x_range[1], (n,), self.device)
         cube_y = sample_uniform(self.cfg.cube_y_range[0], self.cfg.cube_y_range[1], (n,), self.device)
