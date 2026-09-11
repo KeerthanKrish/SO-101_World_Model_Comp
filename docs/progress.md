@@ -1506,3 +1506,61 @@ a full smoke test both pass clean.
 Next: a real training run warm-started from
 `run21_more_demo_weight/agent_step_070359.pt` (the good checkpoint, not
 the regressed final one) with `deepest_close_weight` now active.
+
+Launched run22 (48,000 steps, `run22_deepest_close`, warm-started from
+`run21_more_demo_weight/agent_step_070359.pt`, `deepest_close_weight`
+active) after tagging `pre-deepest-close-run`. Confirmed healthy at
+step ~5545 (GPU active, buffer growing, updates progressing). Left
+running in the background per instruction; not polled further until
+asked.
+
+While run22 trains, started the diffusion-policy side of the project
+(no teleop access currently, so this work doesn't depend on the robot).
+Reviewed docs/diffusion_policy_data_strategy.md's already-decided plan
+(custom MimicGen-lite: segment a source demo at the grasp event,
+SE(3)-retarget the reach-and-grasp segment to a new cube position,
+splice into the unchanged transport-and-place segment) and picked the
+SE(3) transform-and-replay mechanism as the first validation target,
+since it's the part most likely to reveal a hard blocker.
+
+Found that Isaac Lab's own `isaaclab_mimic` module (NVIDIA's MimicGen
+port) provides the exact pose-math needed
+(`isaaclab.utils.math.pose_in_A_to_pose_in_B`/`make_pose`/`unmake_pose`/
+`pose_inv` -- plain, dependency-free 4x4 tensor ops) and that
+`isaaclab.controllers.DifferentialIKController` (generic Jacobian
+pseudo-inverse IK, `dq = J+dx`, confirmed via
+`IsaacLab/scripts/tutorials/05_controllers/run_diff_ik.py`) is
+robot-agnostic and needs no SO-101-specific IK derivation. The full
+`isaaclab_mimic` generation framework requires `ManagerBasedRLMimicEnv`,
+a different env-authoring paradigm than this project's
+`PickPlaceEnv(DirectRLEnv)` -- decided to reuse only the standalone math
+and IK controller directly in a custom script, not adopt the framework.
+
+Built and validated the first piece: `extract_grasp_segment.py`,
+adapted from `replay_demo_to_buffer.py`'s proven state-override replay
+pattern. Replays a source episode through the real `PickPlaceEnv`,
+records the gripper's own live world pose (position + quaternion, read
+back each step -- this IS the forward-kinematics step, no analytic FK
+computed by hand) alongside the recorded gripper joint value, and uses
+the now-fixed `is_holding()` to find the exact grasp-event boundary
+splitting "reach-and-grasp" (needs retargeting) from
+"transport-and-place" (fixed target, replayed unchanged).
+
+Ran against `episode_002` (one of the 5/8 episodes already confirmed
+`ever_holding=True`, and the same episode run17 fixed the cube position
+to). Result: grasp boundary at downsampled step 194 of 545 (of a
+645-step raw episode at 100Hz), with holding sustained for 222 of the
+306 traced steps after the boundary -- a genuine, non-flickering hold,
+not a one-step blip. The extracted 195-step reach-and-grasp segment
+travels only ~2.5cm end-to-end (the recorded demo's final approach was
+already a short final reach), gripper joint closing from 0.588 to 0.156
+over the segment. No crashes, no bugs found on the first real run
+(after fixing two Isaac-Sim launch-flag mismatches, not logic errors --
+see docs/decisions.md).
+
+Next: use this segment plus a new target cube position to validate the
+SE(3) retargeting math itself (`pose_in_A_to_pose_in_B`), then drive the
+transformed poses through `DifferentialIKController` in closed loop, and
+finally splice the retargeted segment into the source episode's own
+unchanged transport-and-place tail and confirm `is_holding()` still
+fires at the new cube position.

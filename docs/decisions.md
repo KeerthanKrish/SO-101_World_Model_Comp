@@ -1202,3 +1202,94 @@ and the config's own docstring.
 **How to apply**: next test should warm-start from
 `run21_more_demo_weight/agent_step_070359.pt` specifically (see above,
 not the final checkpoint), with `deepest_close_weight` now active.
+Launched as run22 (48,000 steps), confirmed healthy, left running.
+
+## MimicGen-lite for the diffusion-policy side (2026-09-11)
+
+With no current teleop access, started the diffusion-policy side of the
+project (docs/diffusion_policy_data_strategy.md's already-decided plan)
+rather than sit idle on the world-model side. Chose the SE(3)
+transform-and-replay mechanism as the first thing to validate, over
+collecting more raw teleop or scaling scripted IK, since it's the
+mechanism most likely to hide a hard blocker (if the retargeting math or
+the closed-loop IK replay can't actually reproduce a valid grasp at a
+new cube position, the whole MimicGen-lite plan needs rethinking before
+any further demo-collection effort is worth spending).
+
+**Framework decision**: Isaac Lab ships its own MimicGen port,
+`isaaclab_mimic`, but its full data-generation framework
+(`isaaclab_mimic/datagen/data_generator.py`) requires environments
+authored against `ManagerBasedRLMimicEnv` -- a different env-authoring
+paradigm than this project's `PickPlaceEnv(DirectRLEnv)`. Porting the
+env to that paradigm just to use the framework would be substantially
+more work than the retargeting logic itself. Decision: reuse only the
+framework's underlying, dependency-free math utilities directly
+(`isaaclab.utils.math.make_pose`/`unmake_pose`/`pose_inv`/
+`pose_in_A_to_pose_in_B` -- plain 4x4 tensor operations with no env
+coupling) in a custom script, not adopt the framework. Confirmed via
+reading `data_generator.py` and `isaaclab/utils/math.py` directly.
+
+**IK decision**: driving the retargeted Cartesian end-effector poses
+back into joint-space commands needs inverse kinematics. Rather than
+hand-deriving SO-101-specific IK, `isaaclab.controllers.
+DifferentialIKController` is a generic Jacobian pseudo-inverse
+controller (`dq = J+dx`, configured via `DifferentialIKControllerCfg
+(command_type="pose", use_relative_mode=False, ik_method="dls")`) that
+works for any articulated robot Isaac Lab can simulate, SO-101 included
+-- confirmed via `IsaacLab/scripts/tutorials/05_controllers/
+run_diff_ik.py`, which gives the exact wiring pattern (Jacobian via
+`robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, joint_ids]`
+with a `-1` body-index offset for a fixed-base robot; ee pose converted
+to the robot's root frame via `subtract_frame_transforms()`; desired
+joint positions from `diff_ik_controller.compute(...)`; applied via
+`robot.set_joint_position_target(...)`).
+
+**First implemented piece -- `extract_grasp_segment.py`** (new script):
+adapted from `replay_demo_to_buffer.py`'s proven state-override replay
+pattern (override cube pose, robot joint state, `_joint_pos_target`
+directly, bypass the velocity clamp via a zero action). Replays a
+source episode and records, at every step, the gripper's own live
+world pose (`gripper_frame_link`'s `body_pos_w`/`body_quat_w`, corrected
+by `env_origins` -- the same live-simulator-as-ground-truth reasoning
+used throughout this project's grasp-geometry work, not an analytically
+computed FK) plus the recorded gripper joint value. Uses the reward
+function's own `info["holding"]` -- the same, now axis-bug-fixed
+function this project's whole demo-seeding investigation already
+validated -- to find the first step a genuine hold is established: the
+natural reach-and-grasp / transport-and-place segmentation boundary
+MimicGen's own methodology calls for. Deliberately does no retargeting
+or IK yet -- built incrementally, one validated piece at a time, matching
+how every other piece of this project has been built.
+
+Two launch-flag issues surfaced getting this running on the Ubuntu box,
+neither a logic bug: (1) the SSH command needed
+`source ~/miniforge3/etc/profile.d/conda.sh && conda activate
+env_isaaclab` first -- confirmed by checking the actual interpreter path
+of the already-running run22 training process
+(`/home/keerthan/miniforge3/envs/env_isaaclab/bin/python`) rather than
+guessing; (2) the script's `use_cameras=True` env config (kept to match
+`replay_demo_to_buffer.py`'s own buffer-format-compatible observation
+shape) requires the `--enable_cameras` CLI flag or Isaac Lab's camera
+sensor init raises immediately -- added to match
+`replay_demo_to_buffer.py`'s own documented usage.
+
+**Result**: ran against `episode_002` (one of the 5/8 episodes already
+confirmed `ever_holding=True`; also the episode run17 fixed the cube
+position to, so its `source_cube_pos` readback -- (0.113, 0.240, 0.015)
+-- served as a consistency check against that prior finding). Grasp
+boundary found at downsampled step 194 of 545. Holding sustained for
+222 of the 306 steps traced after the boundary -- confirms this is a
+genuine, non-flickering grasp, not a one-step flicker that would poison
+every episode retargeted from it. Extracted a 195-step reach-and-grasp
+segment (written to `sim/output/segment_002.json`), spanning only
+~2.5cm of end-effector travel (this recording's segmentation already
+cut close to the final approach) with the gripper joint closing from
+0.588 to 0.156 over the segment.
+
+**How to apply**: next step is validating the SE(3) retargeting math
+itself (`pose_in_A_to_pose_in_B`) against a new target cube position
+using this segment, then closed-loop `DifferentialIKController` replay,
+then splicing into the source episode's own unchanged
+transport-and-place tail, then confirming `is_holding()` still fires at
+the new position -- the same empirical validation standard used
+throughout this project, not "looks plausible."
