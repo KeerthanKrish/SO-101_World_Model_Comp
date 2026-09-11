@@ -1473,3 +1473,36 @@ to see directly whether the abandons-partway pattern has actually
 improved, before deciding whether to keep warm-starting on the
 assumption the late-run trend continues, or intervene more directly
 (e.g. discouraging abandoning a close once started).
+
+That diagnostic turned up two real findings. First: run21's own final
+checkpoint (step 75001) is actually a regression -- 4 of 4 fresh
+`--eval-only` draws failed to even touch the cube, while the same run's
+earlier checkpoint at step 70359 immediately produced a genuine
+`between_jaws=True` and the best reward yet (+11.06). Training isn't
+monotonic; the last checkpoint saved isn't necessarily the best one a
+run produced, so any future warm start from run21 should resume from
+step 70359, not the final checkpoint.
+
+Second, and more important: that +11.06 episode's high reward was
+misleading. The full per-step trace showed the gripper cycling through
+the same approach-dip-retreat pattern about 15 times across the
+episode, each dip stalling around 35-45% closed before reversing --
+`cube_height` never rose above resting height once, the entire episode.
+The reward was earned by repeatedly re-collecting ordinary approach
+shaping on each fresh attempt, not by getting closer to an actual
+grasp. Confirmed independently on video before any fix was written.
+
+Root cause: `grasp_close_weight`'s shaping has no memory of prior
+attempts -- redoing an identical shallow dip pays exactly what it paid
+the first time, so nothing makes pushing deeper than before worth more
+than safely repeating a known-survivable dip. Added
+`deepest_close_weight` (docs/decisions.md has the full derivation): a
+shaping term measured against the deepest point reached so far THIS
+episode, not just the previous step, so only genuinely exceeding a
+prior attempt ever pays out again -- verified directly in the self-test
+that this can't be gamed by oscillating, not just argued. Self-test and
+a full smoke test both pass clean.
+
+Next: a real training run warm-started from
+`run21_more_demo_weight/agent_step_070359.pt` (the good checkpoint, not
+the regressed final one) with `deepest_close_weight` now active.

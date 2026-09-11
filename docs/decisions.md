@@ -1147,3 +1147,58 @@ upward trend continues, or intervene more directly (e.g. something that
 specifically discourages abandoning a close once started), is an open
 decision -- see the entry immediately below for the diagnostic run
 against run21's own final checkpoint used to inform it.
+
+---
+
+**Decision**: Diagnosed run21's own final checkpoint (`agent_step_075001_final.pt`)
+directly via `--eval-only`, rather than assuming its own training-log
+numbers were representative. Result: 4 of 4 fresh draws failed to even
+reach `touched=True` -- a real, consistent regression, not noise (4
+independent stochastic samples all missing is far more than chance).
+The SAME run's earlier checkpoint at step 70359 (`agent_step_070359.pt`)
+immediately produced `touched=True, between_jaws=True`, reward +11.06 --
+even better than that checkpoint's own training-log figure. **Concrete
+implication for any future warm start from run21: resume from
+`agent_step_070359.pt`, not the final checkpoint** -- training is not
+monotonic, and the very last snapshot saved is not necessarily the best
+one a run produced.
+
+Analyzed the full per-step CSV from that +11.06 episode in detail and
+found the reward number itself was misleading: the gripper cycled
+through the same approach-dip-retreat pattern roughly 15 separate times
+across the 500-step episode, each dip bottoming out in a narrow band
+(joint potential corresponding to roughly 35-45% closed, never
+approaching `gripper_closed_threshold`) before reversing -- and
+`cube_height` never once rose above resting height anywhere in the
+entire episode. The high total reward was earned entirely by
+re-collecting ordinary reach/align/close shaping on each fresh approach
+leg, not by getting closer to an actual grasp. User independently
+confirmed this exact pattern on video before any fix was attempted.
+
+Root cause: `grasp_close_weight`'s shaping has no memory -- redoing an
+identical shallow dip pays exactly what it paid the first time, so nothing
+makes genuinely exceeding a prior attempt's depth worth more than safely
+repeating it. A secondary, mechanical contributor considered but not
+acted on: CEM's 3-step planning horizon can't directly "see" a 15-20+
+step full commitment, so it must trust the value function's own
+(still-uncertain) longer-horizon estimate, making the short, verified-safe
+dip-and-retreat reward easier to have confidence in than a longer,
+riskier commitment.
+
+**Fix -- `deepest_close_weight`** (commit `27e7c1e`): a new potential-based
+shaping term, measured against a MONOTONIC high-water mark (the deepest
+point reached so far THIS episode) rather than just the previous step --
+repeating an already-reached depth earns nothing further, only a
+genuinely new record does. Summed over a whole episode this telescopes
+to exactly `weight * (deepest point ever reached - fully open)`,
+regardless of how many shallower repeats or retreats happen in between --
+verified directly in the self-test (not just argued), and set equal to
+`grasp_close_weight` (4.0) so genuinely new depth is worth double the
+base closing rate. Full design reasoning, including why a plain
+continuous velocity-style reward was rejected again here for the same
+farming-risk reasons as `close_speed_bonus`, is in the commit message
+and the config's own docstring.
+
+**How to apply**: next test should warm-start from
+`run21_more_demo_weight/agent_step_070359.pt` specifically (see above,
+not the final checkpoint), with `deepest_close_weight` now active.
