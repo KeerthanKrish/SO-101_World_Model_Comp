@@ -1092,3 +1092,58 @@ misses) -- a more direct mechanical or reward-shaping fix aimed
 specifically at closing speed (not just closing eventually) is the
 natural next step; see the entry immediately below for that
 investigation.
+
+---
+
+**Decision**: Added `close_speed_bonus` (commit `bf8107e`) -- a one-time
+reward, riding `grasp_bonus`'s exact anti-farming gate, crediting how
+fast the gripper's joint was moving in the closing direction at the
+instant a hold is first established (capped via
+`close_speed_bonus_max_vel`). Full derivation and the two rejected
+alternative designs (a continuous/per-step velocity reward, both a
+farm-proof symmetric version -- mathematically redundant with the
+existing `grasp_close_weight` term -- and an asymmetric one -- reopens
+oscillation-farming) are in that commit's own message and the config's
+docstring; not repeated here.
+
+**Result -- run20** (warm-started from run19's checkpoint,
+`--seed-episodes 2`, otherwise identical settings): the first genuine,
+detected hold this project has ever produced, at the very first eval
+checkpoint (step 5489). Across all 10 checkpoints: `touched=True` 10/10,
+`between_jaws=True` 8/10 (up from run19's 6/10), `held=True` 1/10.
+Positioning consistency kept improving; actual holding remained rare.
+
+**New diagnostic finding**: a fresh per-step `--eval-only` trace
+(reusing the same tooling that diagnosed run17) on a `between_jaws=True,
+held=False` episode from run20's final checkpoint showed the gripper
+closing genuinely fast now (~0.045 rad/step, ~3x run17's rate) -- but
+stopping at roughly 42% of the way to `gripper_closed_threshold` and
+then REVERSING, opening back up, right as `lateral` drifted past its
+threshold. `gripper_cube_dist` stayed smooth throughout (no spike),
+ruling out an actual physical knock-away -- this is the POLICY deciding
+to abandon the attempt, not a collision. Best-supported explanation:
+the value function has had very few genuine "finishing pays off"
+examples to learn from -- only the 5 demo episodes reliably show a
+complete close, and evaluation episodes (where recent successes have
+shown up, including this run's own step-5489 hold) are never added back
+into the training buffer, so a lucky eval success doesn't directly
+teach the model anything.
+
+**Response -- run21** (warm-started from run20, 75k steps,
+`--seed-demos-min-fraction` raised 0.15 -> 0.20 to give the
+demonstrations' complete closures more weight, otherwise identical):
+a genuinely mixed result. Overall `between_jaws=True` only 4 of 14
+checkpoints (~29%) -- worse than run20's 80% -- and `held=True` never
+fired at all this run. But the LAST 3 of 4 checkpoints all showed
+`between_jaws=True` with steadily climbing reward (-7.08 -> +2.57 ->
++7.65), the two best total-reward episodes this project has produced,
+right as the run ended. Can't yet cleanly attribute this to the demo-
+weight change specifically versus just more steps/variance -- the
+middle of the run was worse than run20 on positioning, for reasons not
+yet understood.
+
+**How to apply**: whether to keep warm-starting on the assumption this
+upward trend continues, or intervene more directly (e.g. something that
+specifically discourages abandoning a close once started), is an open
+decision -- see the entry immediately below for the diagnostic run
+against run21's own final checkpoint used to inform it.

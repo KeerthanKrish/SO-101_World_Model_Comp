@@ -1437,3 +1437,39 @@ This checkpoint (code, docs, and the run19 model checkpoint on the
 Ubuntu box) is tagged `run19-close-timing` specifically so it can be
 returned to regardless of what the next experiment (making the gripper
 close faster/more decisively) does to it.
+
+Added `close_speed_bonus` -- a one-time reward, riding `grasp_bonus`'s
+own anti-farming gate, crediting how fast the gripper was closing at
+the instant a hold is first established. Full reasoning (including two
+rejected continuous-reward designs) in docs/decisions.md.
+
+- run20 (warm-started from run19, `--seed-episodes 2`): the first
+  genuine, detected hold this project has ever produced, at the very
+  first eval checkpoint. `between_jaws=True` 8 of 10 checkpoints (up
+  from run19's 6), `held=True` 1 of 10. A fresh per-step diagnostic
+  trace on a non-holding checkpoint found the real remaining issue:
+  the gripper now closes genuinely fast, but sometimes stops around
+  40% closed and reverses back open right as the arm's own lateral
+  position drifts -- confirmed via a smooth (non-spiking)
+  gripper-cube distance that this is a policy decision to abandon, not
+  a physical bounce. Best explanation: very few genuine "finishing
+  pays off" examples exist in training data, worsened by evaluation
+  episodes (where recent successes show up) never being added back to
+  the buffer.
+- run21 (warm-started from run20, 75k steps, `--seed-demos-min-fraction`
+  raised 0.15 -> 0.20 to weight the demonstrations' complete closures
+  more heavily): a mixed result. Overall `between_jaws=True` only 4 of
+  14 checkpoints (worse than run20's 8/10), `held=True` never fired.
+  But the last 3 of 4 checkpoints all showed `between_jaws=True` with
+  sharply climbing reward, ending on the two best-reward episodes this
+  project has produced (+2.57, then +7.65) right as the run ended.
+  Not yet clear whether the demo-weight change helped, or the
+  improvement is just from more training time/variance -- the middle
+  of the run was worse than run20 on positioning for reasons not yet
+  understood.
+
+Next: a fresh diagnostic trace against run21's own final checkpoint,
+to see directly whether the abandons-partway pattern has actually
+improved, before deciding whether to keep warm-starting on the
+assumption the late-run trend continues, or intervene more directly
+(e.g. discouraging abandoning a close once started).
