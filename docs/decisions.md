@@ -983,3 +983,112 @@ workaround looks like the likely cause of episodes 001/007's divergence;
 and wire the validated replay logic into `train_tdmpc2_pickplace.py`
 itself (currently only a standalone diagnostic script) so seeded
 transitions actually populate the buffer before online training starts.
+
+---
+
+**Decision**: Wired the validated replay logic into `train_tdmpc2_pickplace.py`
+itself as `--seed-demos <dir>` (commit `c1cc5e8`), then ran a sequence of
+four real training runs (16 through 19) iterating on what it actually
+takes for demo-seeding to produce a genuine sustained hold, rather than
+stopping once the pipeline merely ran without crashing.
+
+**run16** (40k steps, seed-demos, cube position fully randomized):
+`ever_holding` never fired at any of 7 eval checkpoints, `between_jaws`
+never fired either -- seeding alone, with a randomized target, was not
+enough.
+
+**run17** (40k steps, seed-demos, cube FIXED to episode_002's own
+recorded position 0.113/0.240, plus periodic re-injection of the seed
+episodes -- see below): `between_jaws=True` fired at 2 of 7 checkpoints
+(25449, 30439) -- the first time ANY training run, RL or seeded, had
+ever gotten the gripper correctly positioned. Investigated via torchrl's
+own `SliceSampler` source (not assumed): it picks trajectories UNIFORMLY
+BY EPISODE COUNT, not weighted by length, so a one-time seeding batch
+becomes a shrinking fraction of what gets sampled as real episodes
+accumulate (5/85 ≈ 5.9% by run16's end). `--seed-demos-min-fraction`
+(default 0.15) periodically re-adds the already-replayed seed episodes
+(free -- no new env stepping) to hold their share roughly constant
+instead of fading. A per-step `--eval-only` CSV trace of run17's own
+checkpoint then diagnosed WHY `holding` still never fired despite
+`between_jaws` working: `gripper_joint_pos` was genuinely, steadily
+trending toward closed over ~15-20 steps, but the arm's own lateral
+position was independently drifting in and out of the `between_jaws`
+window on a similar timescale (a real 5-consecutive-step miss streak
+observed) -- a timing race the close was losing, not a policy that
+never attempted to close at all.
+
+**Reward tuning in response** (commit `2b00af4`): `between_jaws_grace_steps`
+2 -> 5 (the existing tolerance mechanism for `grasp_close_weight`'s gate
+was sized from run12-era evidence of 1-2 step flickers, not the 5-step
+drift actually observed here) and `grasp_close_weight` 2.5 -> 4.0 (this
+potential-based term's total payout is the same regardless of how many
+steps closing takes, so raising the weight doesn't directly reward
+speed, but does make closing more valuable relative to other shaping and,
+through TD-MPC2's own discounting, makes finishing sooner comparatively
+more attractive).
+
+**run18** (120k steps, same reward tuning, NO `--min-std`): a clear
+regression -- `between_jaws` never fired across all 24 checkpoints, and
+`touched` became sporadic in the run's second half after being
+consistent in the first. Video review (contact-sheet frame grids, not
+just the logged booleans) showed the arm reaching toward the cube then
+retreating into a small, fixed, tucked pose and simply freezing there
+for the rest of the episode -- the exact signature of TD-MPC2's CEM
+planner over-confidently collapsing its own exploration std toward a
+falsely-precise idle action, a mechanism this project already diagnosed
+and fixed once before (runs 4/5, `--min-std`), but had left out of every
+seed-demos run so far specifically to isolate that variable. Also
+discovered mid-run18: the buffer's automatically-inflated capacity
+(122,458, to fit seed transitions + steps) pushed storage from GPU to
+CPU memory (a `2.5*bytes_required < free_gpu_memory` heuristic in
+`common/buffer.py`), making this run take 7.1 hours instead of the
+estimated 4.5 -- purely a wall-clock/throughput effect, not a
+correctness issue.
+
+**Separately, mid-investigation: a genuine machine-level networking bug
+was found and fixed on the Ubuntu box.** A `--seed-demos`+`--min-std`
+smoke test failed with `FileNotFoundError` fetching IsaacLab's default
+ground-plane asset (`GroundPlaneCfg`'s stock fallback `usd_path`, a
+`https://omniverse-content-production.s3-us-west-2.amazonaws.com/...`
+URL -- NVIDIA's own Nucleus/Omniverse cloud content server, not
+anything this project's code requests). Root-caused via `curl -v`
+(`Immediate connect fail ... Network is unreachable`) and `ip route
+show` (returned empty for IPv4): the box's WiFi interface
+(`wlx001325ae639d`) had NO IPv4 default gateway route at all, only an
+IPv6 one -- explaining why `google.com` worked (IPv6 fallback) while the
+IPv4-only S3 endpoint didn't. Confirmed `nmcli device show` recorded
+`IP4.GATEWAY: --` (never received/applied). Fixed by manually adding the
+missing routes (`ip route add 10.0.0.0/24 dev wlx001325ae639d scope
+link`, then `ip route add default via 10.0.0.1 dev wlx001325ae639d`) --
+a pure addition, not touching the live WiFi association at all, chosen
+specifically to avoid any risk to the existing SSH/Tailscale session
+(confirmed intact throughout). This fix is runtime-only (`ip route add`,
+not persisted to NetworkManager config) -- will need reapplying if this
+machine reboots or the WiFi interface reconnects.
+
+**run19** (55k steps, ~2.8 hours, min-std restored to 0.5, same reward
+tuning as run18, same fixed cube position + re-injection as run17): by
+far the best result this investigation has produced. `touched=True` at
+all 10/10 eval checkpoints (no gaps, no sign of run18's freeze pattern).
+`between_jaws=True` at 6 of 10 checkpoints (15469, 20459, 30439, 40419,
+45409, 50399) -- both more frequent and earlier-appearing than run17's
+2/7. Video review (contact-sheet grids of steps 30439 and 50399)
+confirmed this wasn't just a logged-boolean artifact: the arm stays
+visibly, continuously engaged with the cube for the large majority of
+each episode (roughly 80% of the 50399 episode specifically), a
+qualitatively different, much more sustained pattern than either
+run17's brief hover-then-retreat or run18's reach-then-freeze.
+`ever_holding` still never fired.
+
+**How to apply**: this is the strongest checkpoint this project has
+reached -- tagged `run19-close-timing` (see below) specifically so it
+can be returned to regardless of what the next experiment does. The
+remaining, now well-characterized gap is purely about CLOSING SPEED:
+positioning is frequent and sustained, but the gripper still doesn't
+close decisively enough within the window it has. `grasp_close_weight`
+and `between_jaws_grace_steps` were the first, lower-risk, INDIRECT
+levers tried (make closing more valuable / more tolerant of brief
+misses) -- a more direct mechanical or reward-shaping fix aimed
+specifically at closing speed (not just closing eventually) is the
+natural next step; see the entry immediately below for that
+investigation.

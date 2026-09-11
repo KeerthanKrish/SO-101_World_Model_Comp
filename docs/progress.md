@@ -1393,3 +1393,47 @@ own recordings under the existing joint-limit clipping workaround
 still needs to be wired into `train_tdmpc2_pickplace.py` itself as an
 actual, usable feature -- `replay_demo_to_buffer.py` remains a
 standalone diagnostic script for now.
+
+Wired demo-seeding into real training (`--seed-demos`) and ran four full
+training runs (16-19) to find out what it actually takes to turn this
+into a genuine hold, not just a working pipeline. Full details, evidence,
+and reasoning for each step in docs/decisions.md; summary here:
+
+- run16 (randomized cube position): no `between_jaws`, no `holding`.
+- run17 (cube fixed to episode_002's own position, plus periodic
+  re-injection of the seed episodes to stop their sampling share from
+  fading as real episodes accumulate -- discovered via reading torchrl's
+  own sampler source that it picks episodes uniformly by count, not
+  weighted by length): `between_jaws=True` for the first time ever, 2 of
+  7 checkpoints. A per-step diagnostic trace then showed exactly why
+  `holding` still didn't fire: the gripper was genuinely, steadily
+  closing, just too slowly relative to the arm's own lateral drift in
+  and out of position -- a timing race, not a policy that never tries.
+- Raised `between_jaws_grace_steps` (2->5) and `grasp_close_weight`
+  (2.5->4.0) in response, then ran run18 (120k steps) WITHOUT
+  `--min-std` to isolate the reward changes -- this backfired badly: the
+  policy collapsed into reaching toward the cube then freezing in a
+  fixed tucked pose for the rest of every episode, the same CEM
+  planner-std-collapse failure mode this project fixed once before
+  (runs 4/5) but had left out of every seed-demos run to isolate
+  variables.
+- Also hit and fixed a real machine-level bug on the Ubuntu box mid-way
+  through this: its WiFi interface had no IPv4 default gateway route at
+  all (only IPv6), so any IPv4-only external fetch failed outright --
+  traced to IsaacLab's own default ground-plane asset needing a cloud
+  fetch on one particular run. Fixed by manually adding the missing
+  routes without touching the live WiFi connection, so the existing
+  SSH/Tailscale session was never at risk.
+- run19 (55k steps, ~2.8 hours, min-std restored, same reward tuning as
+  run18): the best result yet. `touched=True` at all 10 checkpoints
+  (no gaps -- run18's freeze pattern is gone), `between_jaws=True` at 6
+  of 10 (more and earlier than run17). Video review confirmed real,
+  sustained engagement with the cube for the majority of an episode, not
+  just a brief pass-by. `holding` still never fired, but the remaining
+  gap is now well-characterized: closing proceeds too slowly relative to
+  the window available, not a positioning or exploration problem anymore.
+
+This checkpoint (code, docs, and the run19 model checkpoint on the
+Ubuntu box) is tagged `run19-close-timing` specifically so it can be
+returned to regardless of what the next experiment (making the gripper
+close faster/more decisively) does to it.
