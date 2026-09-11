@@ -700,6 +700,51 @@ class PickPlaceRewardConfig:
     # pattern exactly) -- see compute_reward()'s docstring for the
     # parameter itself.
     grasp_bonus: float = 2.0
+    # Added 2026-09-10, alongside between_jaws_grace_steps/grasp_close_weight
+    # above (see docs/decisions.md for the full run17-19 investigation this
+    # responds to): even after those two changes, a per-step --eval-only
+    # trace of run19's own checkpoint (the best result this project has
+    # produced -- between_jaws=True at 6 of 10 eval checkpoints, sustained
+    # engagement confirmed on video) still showed the gripper closing at a
+    # small fraction of its own mechanically-available speed -- confirmed
+    # NOT a hardware limit: _max_delta (joint_vel_limits * step_dt) allows
+    # a full open-to-closed traverse in under 10 control steps, but the
+    # observed closing rate implied roughly 15-20 steps, well under 10% of
+    # what's actually available. grasp_close_weight's existing potential-
+    # based shaping already gives a bigger single-step reward for a bigger
+    # single-step movement, but the TOTAL payout for a full close is the
+    # same regardless of how many steps it takes (a telescoping sum) --
+    # so nothing directly rewards finishing fast specifically, only
+    # finishing at all, and the policy has had very few real examples of
+    # "closed too slowly and lost the position" to learn the risk of
+    # dawdling from indirectly.
+    #
+    # close_speed_bonus is a ONE-TIME bonus, gated at the EXACT same
+    # condition as grasp_bonus (`holding and not was_ever_held`) -- see
+    # compute_reward()'s milestone_bonus block. This is a deliberate
+    # choice over a per-step or continuous velocity reward: a continuous
+    # reward for closing velocity, if made symmetric/farm-proof (charging
+    # the same amount for opening as it pays for closing, the only way to
+    # keep it potential-based), reduces to something mathematically
+    # equivalent to grasp_close_weight's existing position-based term
+    # (velocity integrated over any closed open-close-open loop is just
+    # net displacement, i.e. zero) -- not a genuinely new lever. Making it
+    # asymmetric (reward closing velocity without an equal-and-opposite
+    # opening charge) reopens exactly the oscillation-farming risk this
+    # module has been burned by before (grasp_bonus's own history, the
+    # premature_close_weight saga): repeatedly snapping the gripper shut
+    # then back open would earn this bonus every closing half-cycle for
+    # free. Tying it to the SAME one-shot gate as grasp_bonus sidesteps
+    # this cleanly -- it can fire at most once per episode, at the exact
+    # moment a genuine hold is first established, using data (gripper
+    # joint velocity) already computed every step for the existing
+    # action_penalty term, so no new persisted state is needed at all.
+    # close_speed_bonus_max_vel caps the velocity this credits (rad/s) --
+    # bounds the maximum one-time payout regardless of how fast the
+    # physics engine ever reports the joint moving, so a single glitchy
+    # reading can't produce an outsized reward.
+    close_speed_bonus_weight: float = 0.5
+    close_speed_bonus_max_vel: float = 2.0  # rad/s -- well above the ~0.8 rad/s observed in run19, comfortably below the ~10 rad/s the joint's own URDF velocity limit permits
     success_bonus: float = 10.0  # one-time; must clearly dominate everything else so success always wins
     # Lowered 5x from 0.01 (2026-09-01): both run4 and run5 (50k steps
     # each, under the potential-based-shaping reward) showed the arm
@@ -1134,6 +1179,14 @@ def compute_reward(
     established -- see was_ever_held's and grasp_bonus's own docstrings
     for the real farming bug this fixes, added 2026-09-06).
 
+    A fourth, close_speed_bonus (added 2026-09-10), rides along with
+    grasp_bonus at the exact same gate and moment -- see its own config
+    docstring for the full reasoning -- crediting how fast the gripper
+    was closing (capped, via close_speed_bonus_max_vel) at the instant a
+    hold is first established. Sharing grasp_bonus's one-shot gate is
+    what keeps it farm-proof: it cannot be re-triggered by repeatedly
+    opening and re-closing the gripper within an episode.
+
     Args:
         gripper_pos: (x, y, z) world position of the actual grasp point
             (use grasp_point_world() on gripper_frame_link's pose -- NOT
@@ -1321,6 +1374,18 @@ def compute_reward(
         milestone_bonus += cfg.touch_bonus
     if holding and not was_ever_held:
         milestone_bonus += cfg.grasp_bonus
+        # close_speed_bonus -- see its own config docstring for why this
+        # is a one-time bonus at the exact same gate as grasp_bonus,
+        # rather than a per-step/continuous reward. `joint_vel[-1]` is the
+        # gripper's own velocity -- "gripper" is last in _JOINT_ORDER, the
+        # same convention already used for gripper_joint_pos itself
+        # (extracted as `joint_pos[i, -1]` by every caller). Negative
+        # velocity means closing (gripper_joint_closed_limit <
+        # gripper_joint_open_limit); max(0.0, ...) so an (implausible, at
+        # the exact instant a hold is established) positive/opening
+        # reading simply earns nothing, rather than a negative bonus.
+        closing_vel = max(0.0, -joint_vel[-1])
+        milestone_bonus += cfg.close_speed_bonus_weight * min(closing_vel, cfg.close_speed_bonus_max_vel)
 
     action_penalty = cfg.action_penalty_weight * sum(v * v for v in joint_vel)
 
@@ -1509,6 +1574,49 @@ def _self_test():
     assert info_regrasped["milestone_bonus"] == 0.0, (
         "grasp_bonus must NOT fire again on a re-established hold later the same episode -- "
         "only the first-ever establishment counts (the run12 farming bug this fixes)"
+    )
+
+    # 5d-5f. close_speed_bonus (added 2026-09-10, see its own config
+    # docstring): rides on grasp_bonus's exact gate/moment, proportional
+    # to (capped) gripper closing velocity. Reuses test 5's setup
+    # (info_touch_step) as the pre-hold state, same as test 5 itself.
+    gripper_vel_closing = (0.0, 0.0, 0.0, 0.0, 0.0, -1.0)  # gripper closing at 1.0 rad/s, well under the cap
+    _, info_speed = compute_reward(
+        lifted, Q, lifted, zero_vel, gripper_closed_joint, gripper_vel_closing,
+        F, info_touch_step["touched"], info_touch_step["dist"], None, was_ever_held=F, cfg=cfg,
+    )
+    assert info_speed["holding"], "test setup: must still establish a genuine hold"
+    expected_speed_bonus = cfg.close_speed_bonus_weight * 1.0
+    assert abs(info_speed["milestone_bonus"] - (cfg.grasp_bonus + expected_speed_bonus)) < 1e-9, (
+        "milestone_bonus must include grasp_bonus plus the closing-speed bonus, proportional to gripper velocity"
+    )
+
+    # 5e. Velocity beyond close_speed_bonus_max_vel must be capped, not
+    # paid out in full -- bounds the maximum one-time payout regardless
+    # of how fast the physics engine ever reports the joint moving.
+    gripper_vel_fast = (0.0, 0.0, 0.0, 0.0, 0.0, -(cfg.close_speed_bonus_max_vel + 5.0))
+    _, info_speed_capped = compute_reward(
+        lifted, Q, lifted, zero_vel, gripper_closed_joint, gripper_vel_fast,
+        F, info_touch_step["touched"], info_touch_step["dist"], None, was_ever_held=F, cfg=cfg,
+    )
+    expected_capped_bonus = cfg.close_speed_bonus_weight * cfg.close_speed_bonus_max_vel
+    assert abs(info_speed_capped["milestone_bonus"] - (cfg.grasp_bonus + expected_capped_bonus)) < 1e-9, (
+        "closing velocity beyond close_speed_bonus_max_vel must be capped, not paid out in full"
+    )
+
+    # 5f. Must not fire again on a second, already-holding step, even
+    # with nonzero closing velocity that step -- rides on grasp_bonus's
+    # own one-shot gate (was_ever_held), not a separate check, so this
+    # also confirms the two milestones share the same anti-farming
+    # property as the run12 grasp_bonus farming bug (test 5c) -- an
+    # agent cannot repeatedly open/re-close the gripper to collect this
+    # bonus more than once.
+    _, info_speed_again = compute_reward(
+        lifted, Q, lifted, zero_vel, gripper_closed_joint, gripper_vel_closing,
+        True, info_speed["touched"], info_speed["dist"], None, was_ever_held=info_speed["ever_held"], cfg=cfg,
+    )
+    assert info_speed_again["milestone_bonus"] == 0.0, (
+        "close_speed_bonus must not fire again on an already-holding step, same as grasp_bonus"
     )
 
     # 6. Regression test for a real bug caught during validation against
@@ -2040,6 +2148,7 @@ def _self_test():
     print(f"  grasp_close_closing={info_closing['grasp_close']:+.4f} grasp_close_opening={info_opening['grasp_close']:+.4f}")
     print(f"  premature_close_penalty={info_premature['premature_close_penalty']:+.4f}")
     print(f"  lateral_align_improve={info_align_improve['lateral_align']:+.4f} lateral_align_worsen={info_align_worsen['lateral_align']:+.4f}")
+    print(f"  close_speed_bonus(1 rad/s)={expected_speed_bonus:+.4f} close_speed_bonus(capped)={expected_capped_bonus:+.4f}")
 
 
 if __name__ == "__main__":
