@@ -1564,3 +1564,41 @@ transformed poses through `DifferentialIKController` in closed loop, and
 finally splice the retargeted segment into the source episode's own
 unchanged transport-and-place tail and confirm `is_holding()` still
 fires at the new cube position.
+
+Meanwhile, run22 finished and it's a real regression: `held=True` never
+fired (0/9 eval checkpoints), `between_jaws=True` only once (1/9),
+ending on its two weakest checkpoints -- worse than the checkpoint it
+was warm-started from. Dug into why with per-step `--eval-only` traces
+at three points (the original run21 checkpoint, run22's one
+`between_jaws` hit mid-run, and run22's final checkpoint) instead of
+guessing. Found a clean, monotonic pattern: the gripper's oscillation
+amplitude and how often it dips into the tight lateral window
+`is_between_jaws()` needs both shrink together the longer training
+continues -- from full-range swings hitting the window 30% of the time,
+to modest swings hitting it 4.5% of the time, to barely-there
+adjustments that get within 0.1mm of the window but never cross it, 0%
+of the time. The approach phase itself is untouched (still a smooth,
+purposeful reach every time) -- this is specifically a collapse in the
+close-range commitment behavior.
+
+Root cause: `deepest_close_weight` is correctly farm-proof (verified
+again here), but farm-proofing it this way means the reward bar rises
+every time it's cleared, so genuine reward gets sparser as training goes
+on. The existing (small, previously harmless) `action_penalty_weight`
+had been swamped by the old exploit's reward before; once that exploit
+is closed off, this same small constant cost of attempting starts to
+outweigh the shrinking expected payoff, and training correctly grinds
+the policy toward smaller, safer motions that increasingly miss the
+precision window. Also found the deeper reason run21's oscillation loop
+paid out in the first place: gating a potential-based term on
+`between_jaws_for_closing` breaks the exact telescoping guarantee
+potential-based shaping normally provides (it requires evaluating the
+potential every step, not just while a gate happens to be open) --
+`deepest_close_weight` avoids that specific hole by persisting its
+record independent of the gate, which is also exactly what makes the
+reward landscape sparser over time. Full derivation, the data table, and
+the proposed fix (phase-gating `action_penalty_weight` down during the
+pre-hold approach/grasp phase, not touching `deepest_close_weight`
+itself) are in docs/decisions.md. Not yet implemented -- checking with
+the user on direction before another reward change and another
+multi-hour run.

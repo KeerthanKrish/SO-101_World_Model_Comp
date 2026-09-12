@@ -1293,3 +1293,92 @@ then splicing into the source episode's own unchanged
 transport-and-place tail, then confirming `is_holding()` still fires at
 the new position -- the same empirical validation standard used
 throughout this project, not "looks plausible."
+
+## run22's regression, root-caused (2026-09-12)
+
+run22 (48,000 steps, warm-started from `run21_more_demo_weight/
+agent_step_070359.pt`, `deepest_close_weight` newly active) finished
+worse than its own starting point: `held=True` 0/9 eval checkpoints,
+`between_jaws=True` only 1/9, ending on its two weakest checkpoints. Dug
+into why via `--eval-only` per-step CSV traces at three points --
+run21's step-70359 starting checkpoint, run22's step-20459 (its one
+`between_jaws` hit), and run22's final checkpoint -- rather than
+guessing from the aggregate booleans alone.
+
+**What the traces actually show**, in `gripper_joint_pos` amplitude
+(higher = more open) and how often `lateral` dips under the tight
+`grasp_lateral_threshold` (0.02m) `is_between_jaws()` needs:
+
+| Checkpoint | joint_pos stdev (steps 100+) | mean abs step-delta | % steps lateral<0.02 | between_jaws hits |
+|---|---|---|---|---|
+| run21 step 70359 (pre-deepest-close) | full-range swings (0.74-1.74) | large | 30.6% (153/500) | 153/500 |
+| run22 step 20459 (mid-run) | 0.102 | 0.033 | 4.5% | 42/500 |
+| run22 final (048001) | 0.077 | 0.015 | 0% (min 0.0201 -- misses by 0.1mm, never crosses) | 0/500 |
+
+A clean, monotonic decay across the run: the gripper's oscillation
+amplitude and the frequency of dipping into the tight lateral window
+both shrink together, in lockstep, the longer training continues. The
+approach phase itself is unaffected (first 15 steps of the final
+checkpoint's trace show a smooth, monotonic dist reduction 0.378m ->
+0.197m, same as always) -- this is specifically a collapse in the
+close-range "commit to it" behavior, not a broken policy overall.
+
+**Root cause -- an unintended interaction between two independently-fine
+mechanisms.** `deepest_close_weight` is correctly farm-proof against the
+old exploit (verified again here: unlike `grasp_close_weight`, its
+record persists across the `between_jaws_for_closing` gate turning off
+and on, not just across steps -- so timing when the gate happens to be
+open/closed can't manufacture free reward the way it could before). But
+farm-proofing it this way has a side effect nothing in this project had
+reason to anticipate until now: the reward bar it sets RISES every time
+it's cleared, making genuine reward strictly sparser as an episode (and
+a training run) goes on. Meanwhile `action_penalty_weight` (0.002 *
+sum of squared joint velocities, all 6 joints, unconditional) has been
+in this reward function since early on, quietly doing nothing much
+because the OLD exploit's reward was large enough to swap for it many
+times over. Once `deepest_close_weight` closes that exploit and makes
+new reward genuinely hard to earn, the same small, constant
+action-penalty cost of attempting (again) to close and correct position
+starts to outweigh the shrinking expected payoff -- and gradient
+descent, correctly following that signal, trains the policy toward
+smaller, safer, lower-energy adjustments that increasingly fail to
+reach the millimeter-tight lateral window needed to even get another
+shot at the record.
+
+This also retroactively explains HOW run21's oscillation loop earned
+reward in the first place, beyond "no memory": `close_shaping` (like
+`align_shaping`) is only computed while `between_jaws_for_closing` is
+true -- a real potential-based term, but one that stops being evaluated
+during the ungated part of the cycle. Ng/Harada/Russell's policy-
+invariance guarantee for potential-based shaping (the theoretical basis
+this whole reward function is built on -- see this file's earlier
+entries) requires the potential to be evaluated every single step; a
+term that's gated off for part of a trajectory no longer has that exact
+telescoping guarantee, because the "opening" portion of a cycle that
+happens to occur outside the gate is never charged, while the
+"closing" portion that happens to occur back inside the gate always
+is. That asymmetry, not just a lack of memory, is the concrete
+mechanism that let run21 farm real (if misleading) reward from pure
+oscillation. `deepest_close_weight` avoids this specific hole by
+persisting the record independent of the gate -- correctly -- but doing
+so is also what makes the reward landscape sparser over time, which is
+the new problem.
+
+**Proposed fix -- phase-gate `action_penalty_weight` down (not to zero)
+during the pre-hold approach/grasp phase, full strength once holding**:
+this is a penalty, not a reward, so reducing it can't reopen a farming
+exploit the way adding a new positive term could (nothing to gain by
+lingering in a low-penalty state -- the existing `premature_close_weight
+= 0.0` precedent already established this same reasoning). It targets
+the diagnosed mechanism directly (the fixed cost of attempting now
+outweighs deepest_close_weight's shrinking expected payoff) without
+touching deepest_close_weight itself, which is doing its job correctly.
+Full-strength action_penalty during holding/transport is kept, since
+smoothness while actually carrying the cube is still worth protecting.
+Not yet implemented -- checking with the user on this direction (versus
+alternatives considered and set aside: a decayed, still-nonzero
+repeat-reward on `deepest_close_weight` itself, which would need new
+farm-proofing work to avoid reopening exactly the gate-timing exploit
+above; and reverting the demos/warm-start chain further back, which
+doesn't address the mechanism found here at all) before making another
+reward-function change and spending another multi-hour run on it.
