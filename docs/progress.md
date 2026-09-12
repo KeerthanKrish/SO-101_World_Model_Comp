@@ -1612,3 +1612,47 @@ in Isaac Sim's own scene loading, unrelated to this change, not yet
 investigated) in docs/decisions.md. Ready for a real training run to see
 whether it actually recovers the oscillation/exploration behavior and
 `between_jaws`/`held` rates.
+
+Ran run23 (48k steps, warm-started from the same checkpoint as run22,
+with the fix active). Single-draw eval results looked like a partial,
+ambiguous improvement over run22 (4/9 between_jaws vs 1/9, still no
+held), matching this project's whole recent pattern of "fix something,
+get an unclear result, need another fix." Rather than write fix #4,
+stepped back and asked why every fix keeps landing here.
+
+Two things this project's methodology had never actually checked: (1)
+TD-MPC2's planner is genuinely non-deterministic even in eval mode --
+confirmed by reading tdmpc2.py's _plan() directly, the executed action
+is always a real stochastic sample over the elite trajectory set, every
+single planning call -- so every between_jaws/held number this project
+has ever reported for a checkpoint was exactly one noisy draw, never
+verified against repeats. (2) Laid the whole warm-start chain side by
+side (19->20->21->22/23) and found only the very first hop ever improved
+on its starting point -- every hop since has cost something, regardless
+of which specific reward term changed alongside it, pointing at the
+shared mechanism (weights-only warm-starting, buffer always reset) more
+than any one reward term.
+
+Built `--eval-only-repeats N` (loops eval episodes in one Kit boot,
+aggregate hit-rate summary) and used it to properly re-test three
+checkpoints at 6 draws each, plus a min_std=0.2 vs 0.5 comparison. Real
+results, not single draws: the ancestor checkpoint genuinely gets
+between_jaws 100% of the time (12/12 across two settings); run22's
+collapse to 0% was real, not noise; the action_penalty fix genuinely,
+substantially recovered it to 67% (not fully back to 100%, a real
+remaining gap); lowering min_std changed nothing about between_jaws or
+held rates, ruling out planner noise as what's capping precision.
+
+The actual headline finding: `held=True` came up 0 times in all 18
+draws across every checkpoint tested, including the best one available.
+Every reward-shaping fix this project has made recently has been aimed
+at a target (reliably finishing a hold) that this specific lineage of
+checkpoints has never actually demonstrated even once under honest,
+repeated measurement -- run20's one recorded hold, this project's only
+ever example, has never been reproduced by any descendant checkpoint.
+Full numbers and reasoning in docs/decisions.md. Conclusion: keep the
+action_penalty fix (it genuinely worked), adopt multi-draw testing as
+the standard going forward, and stop adding reactive reward terms --
+the next real experiment is more UNINTERRUPTED training time on the
+current best checkpoint, properly measured, before considering anything
+structural (buffer persistence, demo re-weighting).

@@ -1546,3 +1546,101 @@ LAST one's outcome was even real signal. Concretely:
    otherwise-identical checkpoint -- directly testing whether the
    planner's own noise floor, not the reward function, is what's
    capping precision on the tight `grasp_lateral_threshold` window.
+
+## The variance study results, and what they actually show (2026-09-12)
+
+All three planned checks finished. Full results, 6 draws each unless
+noted:
+
+| Checkpoint | min_std | touched | between_jaws | held | mean reward |
+|---|---|---|---|---|---|
+| run21 step70359 (ancestor, shared by run22 & run23) | 0.5 (default) | 1.00 | **1.00** | 0.00 | +14.11 |
+| run21 step70359 (same checkpoint, noise only) | 0.2 | 1.00 | **1.00** | 0.00 | +22.31 |
+| run22 final (deepest_close_weight only) | 0.5 | 1.00 | **0.00** | 0.00 | -1.11 |
+| run23 step45409 (+ action_penalty_approach_scale) | 0.5 | 0.83 | **0.67** | 0.00 | +1.08 |
+
+Four real conclusions follow directly from this table, not from a single
+draw each:
+
+**1. This wasn't noise -- the diagnosed regression and the fix were both
+real.** The ancestor checkpoint genuinely, reliably gets between the
+jaws (6/6, then another 6/6 at a different min_std -- 12/12). run22's
+collapse to 0/6 is a real, fully reproducible failure, not an unlucky
+sample -- matching the per-step CSV/video evidence already gathered.
+`action_penalty_approach_scale` genuinely, substantially recovered this
+-- 0.67 vs 0.00, a real and large effect, not noise. The single training-
+time eval draws that made this fix look "ambiguous" (4/9 checkpoints
+during the run, ending on a good one) understated how much it actually
+helped -- a proper multi-draw check of its best checkpoint shows a much
+clearer win than the single-draw training log suggested. **Keep this
+fix. It worked.**
+
+**2. It's still not fully recovered** -- 0.67 vs the ancestor's 1.00 is a
+real, remaining gap, not just measurement noise (95% CI on a 4/6 binomial
+sample is wide, but 0.67 is a full 6-draw run below a checkpoint that
+scored 12/12 across two separate 6-draw runs at two different min_std
+settings -- a meaningfully different regime, not the same number
+restated).
+
+**3. `min_std` is NOT the lever holding back `between_jaws` or `held` --
+ruling out that hypothesis directly, not just deprioritizing it.**
+Lowering it from 0.5 to 0.2 on the identical, already-good ancestor
+checkpoint left `between_jaws` at 1.00 (no room to improve -- already
+maxed) and, more importantly, left `held` at 0.00 too. If planner noise
+were what was preventing a hold, cutting it by more than half should
+have shown SOME movement on `held` for a checkpoint that already nails
+positioning every time. It didn't move at all. (It did raise mean reward
+noticeably, +22.31 vs +14.11 -- plausibly less wasted energy/action
+penalty from reduced search noise -- a real but secondary effect, not
+chased further here.)
+
+**4. The actual headline finding: `held=True` is 0 out of 18 draws,
+across every checkpoint tested, including the best one available.**
+This is the one that reframes the whole investigation. Every reward
+change in this project's recent history --
+`close_speed_bonus` -> `deepest_close_weight` -> `action_penalty_approach_scale`
+-- has been designed and judged against single training-time eval draws
+that occasionally showed `held=True` (run20: 1/10 checkpoints, one time,
+ever, in this project's entire history). Under an honest, repeated,
+multi-draw test, NOT ONE of the three checkpoints examined here --
+including the very checkpoint every one of these runs warm-started
+from, the strongest one this whole lineage has -- ever produced a held
+episode. That single run20 result has never been reproduced by any
+descendant checkpoint under rigorous testing. The reward-shaping chain
+has been iterating on symptoms of "doesn't commit to closing decisively
+enough" on top of a foundation that has not been shown, even once under
+honest measurement, to reliably finish a grasp.
+
+**What this means for "why does every fix only half-work"**: it's not
+that each fix was wrong -- `action_penalty_approach_scale` demonstrably
+was a real, correct, verified improvement (finding 1). It's that the
+target being aimed at (recover `between_jaws`/`held` rates) was always
+being measured through a single noisy draw, so "did this help" was
+answerable only approximately, and the actual hardest part of the task
+(reliably finishing a hold, not just reaching good position) has never
+had a genuine success to build FROM in this specific lineage -- run20's
+one recorded hold was likely itself a low-probability event under the
+same unseeded-planner stochasticity documented above, not a skill this
+family of checkpoints ever reliably possessed.
+
+**Recommendation going forward** (a change in approach, not a fourth
+reward term):
+
+1. Keep `action_penalty_approach_scale` -- verified working, don't
+   revert or second-guess it further.
+2. Adopt `--eval-only-repeats` (>=6) as the standard for judging any
+   future checkpoint or change -- a single draw is no longer treated as
+   evidence of anything, in either direction.
+3. Stop adding new reward-shaping terms reactively to the most recent
+   symptom. The actual bottleneck now is getting this lineage to
+   reliably finish a grasp even once under honest testing -- more
+   training TIME on the current best checkpoint (uninterrupted, no new
+   warm-start hop, no new reward term) is the next thing to actually try
+   and then MEASURE properly with the new tooling, before concluding
+   another reward change is needed at all.
+4. If a longer uninterrupted run still shows `held_rate=0` under
+   multi-draw testing, that's the point to reconsider something
+   structural (buffer persistence across warm starts; concentrating more
+   seed-demo weight specifically on the hold-and-carry portion of the
+   5 available demo episodes) -- not before, since neither has been ruled
+   in or out yet by real evidence.
