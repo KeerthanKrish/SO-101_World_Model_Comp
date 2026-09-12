@@ -1423,3 +1423,126 @@ actually restores the oscillation/exploration behavior and recovers
 `between_jaws`/`held` rates, warm-started from the same
 `run21_more_demo_weight/agent_step_070359.pt` checkpoint run22 used, with
 both `deepest_close_weight` and `action_penalty_approach_scale` active.
+
+## Stepping back: why does every fix look like it only half-works? (2026-09-12)
+
+run23 (the fix above) finished on schedule (~3h, confirmed from the
+training script's own "Ran 48001 env steps ... in 10693.2s" summary line
+-- an earlier alarm about a 7-hour runtime was a misread of the log
+file's mtime, which kept advancing for hours after training actually
+finished because of the already-known Kit shutdown-hang continuing to
+emit harmless internal warnings; not a new problem). Eval results:
+`between_jaws=True` 4/9 (vs run22's 1/9) opening with three CONSECUTIVE
+hits (run22 never had two in a row) and closing on a positive-reward
+`between_jaws=True` checkpoint rather than run22's two weakest -- a real,
+different, better shape. But `held=True` still never fired, and a
+5-checkpoint mid-run dip (steps 20459-40419) persisted.
+
+Rather than treat this as "close but needs fix #4," stepped back to ask
+why this project keeps landing here: implement a fix, get a partial/
+ambiguous result, diagnose a new issue, implement another fix, repeat.
+Two structural things this investigation had never actually checked,
+despite bearing directly on every conclusion drawn since run17:
+
+**1. TD-MPC2's planner is NOT deterministic even in eval mode, and the
+env's own tolerances are tight enough for this to matter a lot.** Read
+`tdmpc2.py`'s `_plan()` directly rather than assuming eval_mode makes
+this a non-issue. `eval_mode` only skips ONE thing:
+`a = a + std * torch.randn(...)`, the post-selection noise injection.
+Everything upstream of that still runs identically in eval mode: MPPI
+resamples `num_samples=512` candidate trajectories per planning call
+across `iterations=6` refinement rounds, narrows toward `num_elites=64`
+elites each round (never below `min_std=0.5`'s floor -- exactly the
+same floor raised project-wide to stop CEM's own confidence from
+collapsing prematurely), and then the ACTUALLY EXECUTED action is
+`torch.index_select(elite_actions, 1, gumbel_softmax_sample(score))` --
+a genuine categorical sample over the surviving elite set, weighted by
+`exp(temperature=0.5 * (elite_value - max_value))` (not sharply peaked
+at this temperature -- multiple elites retain real weight). So
+`min_std`'s floor, which exists specifically to keep the elite set from
+collapsing to a single point, also means the elite set retains genuine
+diversity every single eval planning call -- and every step's executed
+action is a real stochastic draw from that diversity, EVEN IN EVAL
+MODE. This isn't a hypothesis; it's what the code does. Every single
+`between_jaws`/`held`/reward number this whole project has ever reported
+for a checkpoint has been exactly ONE such draw.
+
+**Confirmed empirically, not just from the code**: re-ran
+`run21_more_demo_weight/agent_step_070359.pt` (the shared warm-start
+ancestor of both run22 and run23) multiple times with nothing at all
+changed -- same checkpoint, same cube position, same everything. Reward
+across draws: +12.51 (the original single draw this whole
+investigation's plan was built on), +20.17, +22.84, +18.61, .... a >80%
+relative spread between the highest and lowest, on the IDENTICAL
+network weights. `between_jaws=True` on every draw so far -- but the
+reward magnitude swinging this much on a fixed policy means the
+between_jaws/held BOOLEANS for less reliable checkpoints could easily
+be flipping between True and False from draw to draw too, not from any
+real change in policy quality.
+
+**Added `--eval-only-repeats N`** to `train_tdmpc2_pickplace.py` (loops
+`run_eval_episode()` N times in one Kit boot, reusing the same env --
+`env.reset()` at the top of each call already clears every persisted
+per-episode state, so successive draws are genuinely independent;
+confirmed via reading `run_eval_episode()` itself, not assumed) so this
+is actually checkable going forward instead of continuing to judge
+single draws. Prints a per-draw line plus an aggregate hit-rate summary;
+video/CSV filenames get a `_drawN` suffix when N>1, byte-identical
+unsuffixed behavior at the N=1 default so nothing existing changes.
+
+**2. Every warm-start hop AFTER the first has underperformed its own
+immediate predecessor; the first one didn't.** Laid out side by side
+from docs/progress.md's own numbers:
+
+| Hop | between_jaws rate | held rate | vs predecessor |
+|---|---|---|---|
+| run19 (baseline) | 6/10 | 0/10 | -- |
+| run19 -> run20 | 8/10 | 1/10 | improved |
+| run20 -> run21 | 4/14 (~29%) | 0/14 | regressed mid-run, recovered late |
+| run21(070359) -> run22 | 1/9 | 0/9 | regressed, no recovery |
+| run21(070359) -> run23 | 4/9 | 0/9 | partial recovery vs run22, still below run21's own start |
+
+Only the very FIRST warm start (19->20, introducing close_speed_bonus)
+came out ahead of its starting point. Every hop since has cost
+something relative to where it started, regardless of which specific
+reward term changed alongside it (`--seed-demos-min-fraction` for 21,
+`deepest_close_weight` for 22, `action_penalty_approach_scale` for 23).
+That pattern -- consistent across three different reward changes -- is a
+real signal that the REWARD TERM being tuned each time may not be the
+actual variable driving the outcome. The common thread across every one
+of these hops instead: `--resume-from` restores network weights only,
+never the replay buffer (`TDMPC2.save()` never persisted it, a design
+decision from run9, unchanged since) -- every single one of these runs
+restarts training with a value function that was calibrated against a
+large, diverse, converged buffer, now bootstrapping against a buffer
+containing only 5 demo episodes plus whatever this run collects fresh.
+This is the same "offline-to-online RL" destabilization documented in
+the literature (e.g. Nakamoto et al., "Cal-QL", NeurIPS 2023) -- a
+value function fine-tuned online against a buffer that doesn't match
+the distribution it converged on offline tends to take an initial
+quality hit before (if ever) recovering, and the more times this
+transition is repeated in a chain, the more chances for it to compound
+or fail to fully recover.
+
+**What this changes about the plan going forward**: stop treating each
+run's eval numbers as ground truth from a single draw, and stop
+adding a new reward term per run without first checking whether the
+LAST one's outcome was even real signal. Concretely:
+
+1. Finish the 3-checkpoint x 6-draw variance study already running
+   (`run21_070359`, `run22_final`, `run23_045409`) to get real,
+   multi-draw hit rates for the two "before/after this fix" checkpoints,
+   before drawing any conclusion about whether
+   `action_penalty_approach_scale` helped.
+2. If the warm-start-chain-degrades-regardless-of-reward-term pattern
+   holds up under multi-draw scrutiny, the next experiment should target
+   the ACTUAL shared mechanism -- e.g. a real comparison of continuing
+   training UNINTERRUPTED for longer from a single verified-good
+   checkpoint (no further warm-start hop at all) versus another
+   warm-start hop -- rather than a fourth reward-shaping term.
+3. Separately worth a controlled check with the new repeats tooling:
+   whether a LOWER `min_std` at eval/inference time (not necessarily
+   during training) changes the between_jaws/held hit rate on an
+   otherwise-identical checkpoint -- directly testing whether the
+   planner's own noise floor, not the reward function, is what's
+   capping precision on the tight `grasp_lateral_threshold` window.

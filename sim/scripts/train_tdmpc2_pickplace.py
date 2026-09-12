@@ -142,17 +142,31 @@ parser.add_argument(
 )
 parser.add_argument(
     "--eval-only", action="store_true",
-    help="Skip training entirely. Requires --resume-from. Loads that checkpoint, runs exactly "
-    "ONE eval episode (agent.act(eval_mode=True), same as a normal training-time eval), and "
-    "writes both the usual eval video AND a per-step diagnostic CSV (step, the raw commanded "
-    "gripper action, reward, gripper_joint_pos, axial/lateral offset, between_jaws/holding/"
-    "touched) to <run_video_dir>/eval_only_<checkpoint-name>_steps.csv, then exits -- no buffer, "
-    "no logger, no training loop constructed at all. Added 2026-09-06 specifically to answer one "
-    "question run11's own eval logs couldn't: is_holding() never fired even in the episodes where "
-    "between_jaws briefly did -- this checks whether that's a genuine TIMING problem (the cube "
-    "only in the correctly-positioned zone for a handful of steps, not enough time to close) "
-    "versus the gripper simply never trending toward closed even while it had time to. See "
-    "docs/decisions.md.",
+    help="Skip training entirely. Requires --resume-from. Loads that checkpoint, runs "
+    "--eval-only-repeats eval episode(s) (agent.act(eval_mode=True), same as a normal "
+    "training-time eval), and writes both the usual eval video AND a per-step diagnostic CSV "
+    "(step, the raw commanded gripper action, reward, gripper_joint_pos, axial/lateral offset, "
+    "between_jaws/holding/touched) to <run_video_dir>/eval_only_<checkpoint-name>[_<draw>]_"
+    "steps.csv, then exits -- no buffer, no logger, no training loop constructed at all. Added "
+    "2026-09-06 specifically to answer one question run11's own eval logs couldn't: "
+    "is_holding() never fired even in the episodes where between_jaws briefly did -- this "
+    "checks whether that's a genuine TIMING problem (the cube only in the correctly-positioned "
+    "zone for a handful of steps, not enough time to close) versus the gripper simply never "
+    "trending toward closed even while it had time to. See docs/decisions.md.",
+)
+parser.add_argument(
+    "--eval-only-repeats", type=int, default=1,
+    help="Only used with --eval-only. Number of independent eval episodes to draw against the "
+    "SAME checkpoint, in one Kit boot (re-using the same env instance -- see run_eval_episode()'s "
+    "own docstring for why a second SimulationContext isn't possible in this process, so this "
+    "loops rather than relaunching). Added 2026-09-12: CEM planning is never seeded (confirmed "
+    "genuinely non-reproducible even against an identical checkpoint and starting state -- see "
+    "docs/decisions.md), so every eval boolean this project has ever reported (between_jaws, "
+    "held, touched) has been a SINGLE stochastic draw per checkpoint. run22/run23's diagnostic "
+    "traces couldn't tell apart 'this checkpoint genuinely regressed' from 'this one draw was "
+    "unlucky' -- this makes that distinguishable by drawing a real sample. Prints a per-draw line "
+    "plus an aggregate hit-rate summary at the end; video/CSV filenames get a `_drawN` suffix when "
+    "this is >1 (unsuffixed, exactly the original behavior, when left at the default of 1).",
 )
 parser.add_argument(
     "--seed-demos", type=str, default=None,
@@ -755,15 +769,37 @@ def main():
         if args_cli.resume_from is None:
             raise ValueError("--eval-only requires --resume-from (nothing meaningful to evaluate otherwise).")
         ckpt_name = os.path.splitext(os.path.basename(args_cli.resume_from))[0]
-        video_path = os.path.join(run_video_dir, f"eval_only_{ckpt_name}.mp4")
-        step_log_path = os.path.join(run_video_dir, f"eval_only_{ckpt_name}_steps.csv")
-        eval_reward, eval_success, eval_touched, eval_held, eval_between_jaws = run_eval_episode(
-            env, base_env, agent, cfg, video_path, step_log_path=step_log_path
-        )
-        print(f"[INFO] eval-only episode -- reward={eval_reward:+.3f} success={eval_success} "
-              f"touched={eval_touched} between_jaws={eval_between_jaws} held={eval_held}")
-        print(f"[INFO] video={video_path}")
-        print(f"[INFO] steps_csv={step_log_path}")
+        n_repeats = args_cli.eval_only_repeats
+        draws = []
+        for draw_idx in range(n_repeats):
+            # Unsuffixed at the default (n_repeats=1) -- exactly the
+            # original filenames, so any existing tooling/paths pointed at
+            # a specific eval_only_<ckpt>.mp4 keeps working unchanged.
+            suffix = "" if n_repeats == 1 else f"_draw{draw_idx}"
+            video_path = os.path.join(run_video_dir, f"eval_only_{ckpt_name}{suffix}.mp4")
+            step_log_path = os.path.join(run_video_dir, f"eval_only_{ckpt_name}{suffix}_steps.csv")
+            eval_reward, eval_success, eval_touched, eval_held, eval_between_jaws = run_eval_episode(
+                env, base_env, agent, cfg, video_path, step_log_path=step_log_path
+            )
+            draws.append((eval_reward, eval_success, eval_touched, eval_held, eval_between_jaws))
+            print(f"[INFO] eval-only draw {draw_idx}/{n_repeats - 1} -- reward={eval_reward:+.3f} "
+                  f"success={eval_success} touched={eval_touched} between_jaws={eval_between_jaws} "
+                  f"held={eval_held}")
+            print(f"[INFO] video={video_path}")
+            print(f"[INFO] steps_csv={step_log_path}")
+        if n_repeats > 1:
+            # Aggregate hit-rate summary -- see --eval-only-repeats' own
+            # help text for why a single draw can't be trusted to tell a
+            # genuine regression apart from an unlucky sample against
+            # CEM's own unseeded, per-call stochastic planning.
+            n = len(draws)
+            touched_rate = sum(d[2] for d in draws) / n
+            between_jaws_rate = sum(d[4] for d in draws) / n
+            held_rate = sum(d[3] for d in draws) / n
+            mean_reward = sum(d[0] for d in draws) / n
+            print(f"[RESULT] eval-only aggregate over {n} draws of {ckpt_name}: "
+                  f"touched_rate={touched_rate:.2f} between_jaws_rate={between_jaws_rate:.2f} "
+                  f"held_rate={held_rate:.2f} mean_reward={mean_reward:+.3f}")
         # NOT simulation_app.close() here -- the `if __name__ ==
         # "__main__":` block at the bottom of this file already does
         # that exactly once after main() returns, on every code path.
