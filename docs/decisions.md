@@ -1382,3 +1382,44 @@ farm-proofing work to avoid reopening exactly the gate-timing exploit
 above; and reverting the demos/warm-start chain further back, which
 doesn't address the mechanism found here at all) before making another
 reward-function change and spending another multi-hour run on it.
+
+**Implemented** (user confirmed): added `action_penalty_approach_scale:
+float = 0.2` to `PickPlaceRewardConfig`, applied in `compute_reward()` as
+`action_penalty_scale = 1.0 if holding else cfg.action_penalty_approach_scale`,
+multiplying `action_penalty_weight` before it scales the summed squared
+joint velocities. No new required parameter to `compute_reward()` --
+confirmed via `grep -rn 'compute_reward(' sim/` that this touches no
+other call site (`pickplace_env.py`, `validate_reward_function.py`)
+beyond the config default they already inherit.
+
+Verified, in order: (1) 4 new self-test cases (20a-20d) -- the reduced
+scale applies while not holding, full (unscaled) weight applies once
+holding, the same motion costs strictly less pre-hold than post-hold, and
+the production default is a genuine partial reduction (0 < scale < 1,
+not accidentally 0 or >=1) -- passing both locally (Mac) and on the
+Ubuntu training box; (2) a full `--smoke-test` run of
+`train_tdmpc2_pickplace.py` (301 env steps, 202 agent.update() calls) --
+no crash, full pipeline runs end to end through the ACTUAL call site
+(`pickplace_env.py`'s `_get_dones()`) this fix needs to work through, not
+just the reward function in isolation. `validate_reward_function.py`
+(a separate, lower-level verification path that builds its own
+`InteractiveScene` directly rather than going through `PickPlaceEnv`) was
+also attempted against `episode_002`, but hung for 13+ minutes in Isaac
+Sim's own scene/asset-loading phase, before ever reaching the step loop
+or calling `compute_reward()` even once -- confirmed via the log
+(nothing beyond the `PhysxCfg` warning that prints during `sim.reset()`)
+and process CPU/GPU profile (steady CPU use, 0% GPU, far below the other
+scripts' memory footprint). This is upstream of anything this change
+touches, so it can't be evidence about the fix either way; killed it
+rather than wait further, since the smoke test already exercises the
+real call site. Not otherwise investigated -- if this script is needed
+again, its scene-loading path may itself be worth a fresh look (possibly
+the same texture/asset-streaming stall `replay_demo_to_buffer.py` hit and
+worked around, which this script never adopted since it doesn't build
+its scene through `PickPlaceEnv` at all).
+
+**How to apply**: ready for a real training run to test whether this
+actually restores the oscillation/exploration behavior and recovers
+`between_jaws`/`held` rates, warm-started from the same
+`run21_more_demo_weight/agent_step_070359.pt` checkpoint run22 used, with
+both `deepest_close_weight` and `action_penalty_approach_scale` active.

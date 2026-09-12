@@ -813,6 +813,45 @@ class PickPlaceRewardConfig:
     # experiment, not a proven fix -- see docs/decisions.md.
     action_penalty_weight: float = 0.002
 
+    # Phase-gated down during the pre-hold ("approach", i.e. `not holding`)
+    # phase -- added 2026-09-12 after run22's regression (full derivation
+    # in docs/decisions.md). deepest_close_weight is correctly farm-proof
+    # (its record persists independent of the between_jaws_for_closing
+    # gate, unlike grasp_close_weight's own old gate-timing hole -- see
+    # deepest_close_weight's own docstring), but that guarantee comes from
+    # a bar that RISES every time it's cleared, making genuine reward
+    # strictly sparser as an episode/run goes on. action_penalty_weight's
+    # small, constant, unconditional cost had always been swamped by the
+    # old (farmable) reward; once that farming is closed off, the same
+    # small cost starts to outweigh the shrinking expected payoff of
+    # continuing to try, and training correctly (if unhelpfully) grinds
+    # the policy toward smaller, safer motions. Confirmed directly via
+    # --eval-only per-step traces at three points across run22: gripper
+    # oscillation amplitude and how often `lateral` reaches the tight
+    # grasp_lateral_threshold window both shrink together, monotonically,
+    # the longer training continues (30.6% of steps -> 4.5% -> 0%, ending
+    # within 0.1mm of the threshold but never crossing it), while the
+    # approach phase itself (reaching the cube's general vicinity) stays
+    # untouched throughout.
+    #
+    # This is a REDUCTION, not a removal, of a PENALTY (never a reward) --
+    # matching the same reasoning already used for premature_close_weight
+    # (nothing to farm by lingering in a low-penalty state) and for
+    # action_penalty_weight's own 5x reduction just above. Like that
+    # change, this doesn't remove the eventual intent to discourage
+    # unrealistic/jerky motion once real hardware is in the loop, it just
+    # stops that intent from dominating a training signal that needs room
+    # to keep exploring while the close-range skill is still being
+    # learned. 0.2 (an 80% reduction while `not holding`) is a
+    # deliberately large cut -- chosen to comfortably outlast the
+    # sparsifying dynamic above within a normal 48-75k-step run, not
+    # formally tuned -- while still leaving a real, nonzero cost so this
+    # doesn't train habits a real robot could never unlearn later. Full
+    # strength (1.0, unchanged) once holding: transport/carry smoothness
+    # is a different, still-fully-valid concern once the cube is actually
+    # secured.
+    action_penalty_approach_scale: float = 0.2
+
 
 def _dist3(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
@@ -1258,6 +1297,28 @@ def compute_reward(
     what keeps it farm-proof: it cannot be re-triggered by repeatedly
     opening and re-closing the gripper within an episode.
 
+    ## Phase-gated action_penalty (added 2026-09-12)
+
+    deepest_close_weight (above) closing the old oscillation exploit had
+    a side effect nothing in this project had reason to anticipate until
+    run22: the reward bar it sets RISES every time it's cleared, making
+    genuine reward strictly sparser as an episode/run goes on.
+    action_penalty_weight's small, constant, unconditional cost had always
+    been swamped by the old (farmable) reward; once that's closed off, the
+    same small cost starts to outweigh the shrinking expected payoff of
+    continuing to try, and training correctly (if unhelpfully) grinds the
+    policy toward smaller, safer motions. Confirmed directly via
+    --eval-only per-step traces at three points across run22: gripper
+    oscillation amplitude and how often `lateral` reaches the tight
+    grasp_lateral_threshold window both shrink together, monotonically,
+    the longer training continues, while the approach phase itself stays
+    untouched throughout (see docs/decisions.md for the full data table).
+    `action_penalty_approach_scale` (see its own config docstring) reduces
+    action_penalty_weight's effect while `not holding`, full strength once
+    holding -- a reduction, not removal, of a PENALTY (never a reward), so
+    there's nothing new to farm here, the same reasoning already used for
+    premature_close_weight.
+
     Args:
         gripper_pos: (x, y, z) world position of the actual grasp point
             (use grasp_point_world() on gripper_frame_link's pose -- NOT
@@ -1495,7 +1556,10 @@ def compute_reward(
         closing_vel = max(0.0, -joint_vel[-1])
         milestone_bonus += cfg.close_speed_bonus_weight * min(closing_vel, cfg.close_speed_bonus_max_vel)
 
-    action_penalty = cfg.action_penalty_weight * sum(v * v for v in joint_vel)
+    # action_penalty_approach_scale (see its own docstring): full strength
+    # once holding, reduced while still approaching/attempting a grasp.
+    action_penalty_scale = 1.0 if holding else cfg.action_penalty_approach_scale
+    action_penalty = cfg.action_penalty_weight * action_penalty_scale * sum(v * v for v in joint_vel)
 
     reward = (
         shaping + close_shaping + deepest_close_bonus + align_shaping + milestone_bonus
@@ -2378,6 +2442,57 @@ def _self_test():
         "even though the joint is still moving toward closed"
     )
 
+    # 20a-20d. action_penalty_approach_scale (added 2026-09-12, see its own
+    # config docstring for the run22 regression this responds to). Uses a
+    # simple nonzero joint_vel (all six joints moving at 1.0 rad/s) so the
+    # expected penalty is easy to compute by hand: weight * scale * 6.0.
+    moving_joint_vel = (1.0,) * 6
+
+    # 20a. Not holding (still approaching/attempting a grasp): the
+    # REDUCED scale must apply.
+    _, info_penalty_approach = compute_reward(
+        (0.0, 0.0, 0.3), Q, cube_at_start, zero_vel, gripper_open_joint, moving_joint_vel,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
+    )
+    assert not info_penalty_approach["holding"], "test setup: must not be holding"
+    expected_approach_penalty = cfg.action_penalty_weight * cfg.action_penalty_approach_scale * 6.0
+    assert abs(info_penalty_approach["action_penalty"] - expected_approach_penalty) < 1e-9, (
+        f"expected action_penalty={expected_approach_penalty:.6f} while not holding "
+        f"(weight * action_penalty_approach_scale * sum(v^2)), got {info_penalty_approach['action_penalty']:.6f}"
+    )
+
+    # 20b. Holding (already carrying the cube): FULL strength, unscaled --
+    # transport/carry smoothness is still a fully-valid concern once the
+    # cube is actually secured. Reuses the `lifted`/`cube_between`
+    # fixtures from test 16e above, the established pattern for
+    # constructing a genuinely-holding state.
+    _, info_penalty_holding = compute_reward(
+        lifted, Q, cube_between, zero_vel, gripper_closed_joint, moving_joint_vel,
+        True, True, None, gripper_closed_joint, was_ever_held=True, cfg=cfg,
+    )
+    assert info_penalty_holding["holding"], "test setup: must already be holding"
+    expected_holding_penalty = cfg.action_penalty_weight * 6.0
+    assert abs(info_penalty_holding["action_penalty"] - expected_holding_penalty) < 1e-9, (
+        f"expected action_penalty={expected_holding_penalty:.6f} while holding (full, unscaled weight), "
+        f"got {info_penalty_holding['action_penalty']:.6f}"
+    )
+
+    # 20c. The same motion must cost strictly less while still
+    # approaching than once holding -- the whole point of this change --
+    # not just two independently-correct numbers in isolation.
+    assert info_penalty_approach["action_penalty"] < info_penalty_holding["action_penalty"], (
+        "the same joint motion must be penalized less while approaching than while holding"
+    )
+
+    # 20d. Sanity check that the PRODUCTION default is a genuine partial
+    # reduction (0 < scale < 1) -- not accidentally 0.0 (which would zero
+    # out the pre-hold penalty entirely, removing the "real hardware
+    # eventually" cost this deliberately keeps) or >= 1.0 (which would
+    # defeat the whole point of this change).
+    assert 0.0 < cfg.action_penalty_approach_scale < 1.0, (
+        "action_penalty_approach_scale's production default must be a genuine partial reduction"
+    )
+
     print("[OK] pickplace_reward self-test passed")
     print(f"  closer_shaping={info_closer['dense']:+.4f} farther_shaping={info_farther['dense']:+.4f}")
     print(f"  grasp_bonus_once={info['holding']} reward_at_target_still={reward_at_target_still:.3f}")
@@ -2388,6 +2503,9 @@ def _self_test():
     print(f"  deepest_close_bonus(new record)={info_deep1['deepest_close_bonus']:+.4f} "
           f"deepest_close_bonus(repeat)={info_deep2['deepest_close_bonus']:+.4f} "
           f"oscillation_total={total_bonus:+.4f} (== weight*deepest_ever={expected_total:+.4f})")
+    print(f"  action_penalty(approach)={info_penalty_approach['action_penalty']:.4f} "
+          f"action_penalty(holding)={info_penalty_holding['action_penalty']:.4f} "
+          f"(scale={cfg.action_penalty_approach_scale})")
 
 
 if __name__ == "__main__":

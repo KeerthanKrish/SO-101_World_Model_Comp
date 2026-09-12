@@ -1602,3 +1602,13 @@ pre-hold approach/grasp phase, not touching `deepest_close_weight`
 itself) are in docs/decisions.md. Not yet implemented -- checking with
 the user on direction before another reward change and another
 multi-hour run.
+
+Implemented the fix: `action_penalty_approach_scale` (0.2 default) cuts
+`action_penalty_weight`'s effect by 80% while not holding, full strength
+once holding. Verified with 4 new self-test cases (local + Ubuntu) and a
+full training-pipeline smoke test (no crash, real call site) -- full
+details and the one loose end (a separate, older validation script hung
+in Isaac Sim's own scene loading, unrelated to this change, not yet
+investigated) in docs/decisions.md. Ready for a real training run to see
+whether it actually recovers the oscillation/exploration behavior and
+`between_jaws`/`held` rates.
