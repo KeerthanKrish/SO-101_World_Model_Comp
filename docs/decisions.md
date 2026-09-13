@@ -1903,3 +1903,78 @@ split.
 No crashes in either test. Ready for a real training run, warm-started
 from run25's verified step45409 checkpoint (not the ancestor again --
 that's now the best-verified starting point this project has).
+
+## Starting sim-to-real: the follower arm is connected (2026-09-13)
+
+While run26 trained, started looking at deploying to the physical arm.
+Researched the actual current state first rather than assuming: no code
+anywhere in this repo has ever sent a command to a physical robot --
+`leader_reader.py`/`teleop_bridge.py` only ever READ the leader (a
+teleop input device) and drove the SIMULATED robot with it. The
+follower arm (what would actually execute a policy) had never been
+connected. Full inventory of what exists vs. what's missing for
+sim-to-real is now in this entry; see also the pre-existing
+docs/sim_to_real_checklist.md for the mismatch list this builds on.
+
+User has now connected the follower arm to the Ubuntu box
+(`/dev/ttyACM0`). Confirmed via `~/.cache/huggingface/lerobot/calibration/`
+that no follower calibration file exists yet (only
+`teleoperators/so_leader/leader1.json` from the earlier leader-only
+work) -- this arm has never been calibrated as a follower.
+
+Read `lerobot/src/lerobot/robots/so_follower/so_follower.py` directly
+(installed in editable mode at `~/SO-101-WM/lerobot/`, `lerobot` conda
+env) before writing anything, given a real arm is now involved. Key
+findings:
+- `SOFollower.connect(calibrate=True)` (the default) auto-detects the
+  missing calibration and walks through LeRobot's own interactive
+  calibration flow: disables torque first (arm goes limp, freely
+  movable by hand -- this is what makes the whole procedure safe, no
+  commanded motion happens during it), prompts to move to the middle of
+  the range (homing offsets), then prompts to sweep all joints except
+  `wrist_roll` through their full range while it records min/max
+  (`wrist_roll` is fixed at the full 4096-step turn instead, since it's
+  continuous with no natural end-of-travel).
+- `get_observation()` is a pure `sync_read` -- read-only, zero motion
+  risk, safe to call in a loop.
+- `send_action()` is the only path that writes to the motors
+  (`sync_write("Goal_Position", ...)`), and already has a real safety
+  mechanism built in: `max_relative_target` (config field, `None` by
+  default) clamps how far a single command can move a joint from its
+  CURRENT read position via `ensure_safe_goal_position()` -- worth
+  setting deliberately, not leaving at `None`, once this project
+  actually reaches the point of sending commands.
+- `SOFollowerRobotConfig`'s own defaults for the real STS3215 servos'
+  internal position-mode PID: `position_p_coefficient=16`,
+  `position_i_coefficient=0`, `position_d_coefficient=32` -- a real,
+  concrete data point for `docs/sim_to_real_checklist.md`'s open PD-gain
+  item, though NOT directly interchangeable with Isaac Lab's actuator
+  stiffness/damping (a joint-space spring-damper model) without further
+  thought -- these are a physically different servo's internal PID
+  loop, not the same control abstraction. Noted here rather than
+  claimed equivalent to anything already in `so101.py`.
+- The gripper motor specifically gets `Max_Torque_Limit=500` (50%) and
+  `Protection_Current=250` (50%) written at `configure()` time,
+  unconditionally, regardless of any of this project's own settings --
+  an existing LeRobot safety default worth knowing about, not something
+  this project added.
+
+**Built `sim/scripts/follower_reader.py`** (mirrors `leader_reader.py`'s
+structure): connects to the follower with `calibrate=True`, then only
+ever calls `get_observation()` in a loop and prints joint positions --
+deliberately never calls `send_action()` anywhere in this file, so
+there is no code path in it that can command the arm to move. Verified
+the import/construction path works on the actual Ubuntu box
+(`SOFollower(SOFollowerRobotConfig(port=..., id=...))` constructs
+cleanly, `is_connected=False` before any connect call, as expected) --
+did not call `.connect()` itself, since the calibration step needs the
+user standing next to the arm, not a one-shot SSH command.
+
+**How to apply**: user needs to run this interactively (own terminal on
+the Ubuntu box, not via a scripted SSH call) since the calibration
+prompts are timed against physically moving the arm by hand:
+`python sim/scripts/follower_reader.py --port /dev/ttyACM0 --id
+follower1` in the `lerobot` conda env. This is the very first real
+step -- calibrate the follower, then confirm its reported joint
+positions/signs make sense -- before anything in this project ever
+writes a command to it.

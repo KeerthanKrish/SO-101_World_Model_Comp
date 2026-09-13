@@ -1750,3 +1750,20 @@ actual practice values (both at 0.20) compute identically as expected.
 No crashes. Ready for a real run, warm-started from run25's verified
 step45409 checkpoint -- the best-verified starting point now, not the
 original ancestor.
+
+While run26 trained, started the sim-to-real side: the user connected
+the physical FOLLOWER arm for the first time (never before -- only the
+leader had ever been connected, purely to read teleop input into sim).
+Researched what actually exists before writing anything: no code in
+this repo has ever sent a command to a physical robot. Read LeRobot's
+SOFollower class directly to understand its real API (interactive,
+torque-disabled calibration flow; a read-only get_observation(); a
+send_action() with a built-in max_relative_target safety clamp; real
+STS3215 PID defaults, a genuine new data point for the sim_to_real
+checklist's open PD-gain item). Built follower_reader.py -- connects,
+calibrates if needed, then only ever reads and prints joint positions,
+never calls send_action() anywhere. User needs to run it themselves,
+interactively, since calibration means physically moving the arm by
+hand in sync with prompts. This is the deliberately cautious first step
+before anything in this project ever writes a motor command to real
+hardware. Full details in docs/decisions.md.
