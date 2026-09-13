@@ -1814,3 +1814,50 @@ now hold-concentrated, episodes.
 
 All three passed cleanly on the first real attempt. Ready for a real
 training run using this mechanism.
+
+## run25: hold segments tested for real (2026-09-13)
+
+72,000 steps, warm-started from the ancestor checkpoint (`run21_more_demo_weight/
+agent_step_070359.pt`, the most stable available -- 100% `between_jaws`
+across 12 prior draws), `--seed-demos-hold-segments` newly active,
+otherwise identical to run22/23/24. Finished in 16021.6s (~4h27m).
+
+Single-draw training-time evals aren't conclusions on their own, but
+step 45409 stood out: +5.077 reward, the highest single-draw reward this
+entire investigation has recorded. Verified it and the final checkpoint
+properly with `--eval-only-repeats 6`:
+
+| Checkpoint | touched | between_jaws | held | mean reward |
+|---|---|---|---|---|
+| run25 step45409 | **1.00** | **1.00** | 0.00 | +3.13 |
+| run25 final (072001) | 0.00 | 0.00 | 0.00 | -0.68 |
+
+**Step 45409 is the first descendant checkpoint since the ancestor
+itself to fully match its 100% `between_jaws` rate** -- run22 collapsed
+to 0%, run23 and run24's best both plateaued at 0.67. This is a real,
+substantial recovery, not a single lucky draw (6/6). Whether
+`--seed-demos-hold-segments` is specifically what did it (versus this
+particular warm-start hop just landing better than the last three) isn't
+provable from one run -- but it's the strongest positioning result any
+descendant of the ancestor has produced, and worth taking as a genuine
+positive signal for the approach rather than noise, given 6/6 is not an
+ambiguous number.
+
+`held` is still 0/6 on even this best checkpoint -- the core goal this
+change targeted isn't solved yet. The final checkpoint (072001) is
+ANOTHER instance of the by-now-familiar "last checkpoint saved is not
+the best" pattern -- the THIRD confirmed case (after run21 and run24) of
+a run's own final checkpoint being meaningfully worse than an earlier
+one from the same run. This is no longer worth re-litigating per run;
+it should just be treated as a standing fact about this codebase: never
+deploy or warm-start from a "final" checkpoint without checking earlier
+ones first.
+
+**How to apply**: step45409 is now the best-verified checkpoint this
+project has produced since the original ancestor. If continuing to
+iterate on `--seed-demos-hold-segments` (e.g. giving hold segments their
+own independent re-injection weight rather than sharing
+`--seed-demos-min-fraction` with whole episodes, per this feature's own
+"next lever" note), warm-start from HERE, not from the ancestor again --
+this is real, verified progress worth building on rather than
+discarding.

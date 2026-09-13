@@ -1712,3 +1712,26 @@ matched hand-computed expectations exactly; the never-held edge case
 regression check confirmed --seed-demos without the new flag is
 byte-for-byte unchanged. All three passed on the first attempt. Full
 design reasoning in docs/decisions.md. Ready for a real training run.
+
+Ran run25 (72k steps, warm-started from the ancestor checkpoint,
+--seed-demos-hold-segments active). Verified its best-looking checkpoint
+(step 45409, +5.08 reward -- the highest single-draw reward this project
+has ever recorded) properly with 6 draws: 100% touched, 100%
+between_jaws, 0% held, mean reward +3.13. This is the first descendant
+checkpoint since the ancestor itself to fully recover its 100%
+between_jaws rate -- run22 collapsed to 0%, run23 and run24 both
+plateaued at 67%. Not provable that hold-segments specifically caused
+this from one run, but 6/6 is real signal, not noise, and it's the best
+verified checkpoint this project has produced since the original
+ancestor. held is still 0/6 though -- the core goal isn't solved yet.
+
+The final checkpoint (072001) was, again, a regression (0% on
+everything) -- the third confirmed instance of this codebase's final
+checkpoint being worse than an earlier one from the same run (after
+run21 and run24). Treating this as a standing fact going forward rather
+than re-diagnosing it each time: never warm-start from a run's own final
+checkpoint without checking earlier ones first.
+
+Videos pulled to sim/output/tdmpc2_eval_videos/run25_hold_segments/ on
+the Mac (matching the Ubuntu-side path, not a temp directory) for the
+user to review -- eval_step_045409.mp4 is the one to watch.
