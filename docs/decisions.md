@@ -1978,3 +1978,76 @@ follower1` in the `lerobot` conda env. This is the very first real
 step -- calibrate the follower, then confirm its reported joint
 positions/signs make sense -- before anything in this project ever
 writes a command to it.
+
+## Follower calibrated, all 6 joint signs cross-checked (2026-09-13)
+
+Follower connected (`/dev/ttyACM0`), calibrated via `follower_reader.py`
+(saved to `~/.cache/huggingface/lerobot/calibration/robots/so_follower/
+follower1.json` -- sensible ranges, ~2300-2500 ticks per joint except
+`wrist_roll`'s full 0-4095 continuous-turn span). Also found and fixed a
+real safety gap while writing this script: `SOFollower.connect()` ->
+`configure()` re-enables torque as a side effect of writing the
+operating-mode/PID registers (confirmed by reading `configure()`'s own
+source, not assumed) -- without explicitly disabling it again,
+verifying a joint's sign by hand means fighting the servo's own active
+position hold at full STS3215 torque. Fixed by calling
+`bus.disable_torque()` again right after `connect()`.
+
+User then moved each of the 6 joints by hand (torque disabled) and
+reported the sign of each. Cross-checked against SIM's own convention,
+established independently and empirically for each joint rather than
+assumed from the URDF alone (this project has been burned before by
+trusting derived-not-measured geometry -- see `jaw_approach_axis_world()`'s
+own history):
+
+- `shoulder_pan`/`shoulder_lift`/`elbow_flex`/`wrist_flex`/`gripper`:
+  confirmed via `sim/scripts/calibrate_joint_signs.py`, a new script
+  extending `calibrate_grasp.py`'s own "render both limits, look at the
+  image" method (previously only ever applied to the gripper) to all 6
+  joints, holding each at 0 except the one being tested.
+- `shoulder_pan` specifically was cross-checked a second, more rigorous
+  way beyond the rendered image (a top-down rotation is hard to judge
+  from an oblique external camera): confirmed the robot's own root has
+  zero rotation offset from world frame (`pickplace_scene.py`), meaning
+  +X = forward from the base and (standard right-handed, Z-up
+  convention) +Y = the robot's own left. `episode_002`'s recorded cube
+  sits at y=+0.24 (its own left side), and every recorded `shoulder_pan`
+  value needed to reach it throughout that real, previously-validated
+  episode is strongly negative -- confirming sim's negative=left
+  independently of the rendered image.
+- `wrist_roll` needed a third attempt to get right, documented in
+  detail in `calibrate_wrist_roll_sign.py`'s own docstring: a rendered
+  external-camera image was too ambiguous to read (the rotation happens
+  too close to the viewing axis); tracking a reference point's raw
+  position around an assumed rotation center came back internally
+  inconsistent (radius from the assumed center varied 0.014m-0.042m
+  across poses, when a point genuinely circling a fixed axis must have
+  constant radius -- the tell that the assumed center wasn't precisely
+  on the true rotation axis line); what actually worked was reading
+  `gripper_link`'s real world orientation at two different `wrist_roll`
+  values and extracting the true rotation axis and angle directly from
+  the relative quaternion between them (no assumed center, no URDF frame
+  composition, nothing left to get subtly wrong) -- verified via a
+  sanity check that the recovered rotation angle matches the commanded
+  joint delta to within numerical precision (162.8 deg both ways) before
+  trusting the sign result at all.
+
+**Full comparison** (sim convention vs. the real follower's measured
+convention, same physical motion):
+
+| Joint | Sim | Follower | Result |
+|---|---|---|---|
+| `shoulder_pan` | negative = left | left = negative | Match |
+| `shoulder_lift` | positive = extending (reaching down/forward) | extending = positive | Match |
+| `elbow_flex` | positive = extending (straightening toward the cube) | extending = negative | **Mismatch** |
+| `wrist_flex` | positive = curling down toward the table | down-toward-table = positive (derived from the user's own "up/away = negative") | Match |
+| `wrist_roll` | positive = clockwise (viewed from behind the wrist toward the fingertips) | clockwise = negative | **Mismatch** |
+| `gripper` | positive = open (`pickplace_reward.py`'s own documented convention) | open = positive | Match |
+
+**How to apply**: `elbow_flex` and `wrist_roll` need their sign flipped
+when converting a sim-trained policy's action output into a real
+follower command; the other four transfer directly. Not yet applied
+anywhere -- no code exists yet that sends a command to the follower at
+all (the next real step in the sim-to-real work, not started this
+session). Recorded here now specifically so this doesn't need
+re-deriving from scratch once that code is written.

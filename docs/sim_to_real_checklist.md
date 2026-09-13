@@ -59,6 +59,24 @@ arbitrary/placeholder values, because randomization doesn't fix them:
   LeRobot's own calibration convention for the real servos. Should be
   consistent once real calibration is run, but not yet cross-checked
   against an actual calibrated real arm.
+- [x] **Joint SIGN convention** (2026-09-13) -- Cross-checked all 6
+  joints, following the follower arm's own calibration (physically
+  connected via `/dev/ttyACM0`, calibrated via `sim/scripts/
+  follower_reader.py`). Real hardware directions confirmed by hand, sim
+  directions confirmed empirically (rendered images for shoulder_lift/
+  elbow_flex/wrist_flex/gripper; the robot's zero-rotation base frame
+  plus a real recorded episode's cube position for shoulder_pan;
+  relative-quaternion axis/angle extraction, NOT a rendered image or
+  hand-derived URDF frame math, for wrist_roll -- see
+  `sim/scripts/calibrate_wrist_roll_sign.py`'s own docstring for why
+  two earlier attempts at this one were wrong before this). Result:
+  **`elbow_flex` and `wrist_roll` need a sign flip** between a policy's
+  sim-trained action output and the real follower's command convention;
+  `shoulder_pan`, `shoulder_lift`, `wrist_flex`, and `gripper` transfer
+  directly, no flip needed. Full derivation and evidence in
+  docs/decisions.md. Not yet applied anywhere (no deployment code exists
+  yet to apply it to) -- recorded here so it's not re-derived from
+  scratch once that code exists.
 - [ ] **Torque/velocity limits** -- Currently estimates from the STS3215
   public datasheet (see docs/so101_asset_notes.md), not measurements from
   the actual servos. Don't need to be exact, but should be validated to be
@@ -67,7 +85,13 @@ arbitrary/placeholder values, because randomization doesn't fix them:
   executable on hardware).
 - [ ] **Joint stiffness/damping (PD gains)** -- Currently generic
   placeholders (50/2) copied from Isaac Lab's Franka template config, not
-  tuned to how the real STS3215 servos actually respond.
+  tuned to how the real STS3215 servos actually respond. Partial real data
+  point now available: `SOFollowerConfig`'s own defaults (LeRobot's
+  actual position-mode PID gains, written to the real servos at every
+  connect) are `P=16, D=32, I=0` -- a real number from the actual
+  ecosystem this arm ships with, though not the same P/D parameterization
+  Isaac Lab's implicit actuator model uses, so not a direct drop-in
+  replacement for the sim value without checking the units/model match.
 
 ## When to revisit
 

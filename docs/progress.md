@@ -1767,3 +1767,21 @@ interactively, since calibration means physically moving the arm by
 hand in sync with prompts. This is the deliberately cautious first step
 before anything in this project ever writes a motor command to real
 hardware. Full details in docs/decisions.md.
+
+User connected the follower, calibrated it, and reported each joint's
+sign by hand. Cross-checked all 6 against sim's own convention --
+mostly via rendered images (extending calibrate_grasp.py's method to
+every joint, not just the gripper), `shoulder_pan` additionally
+cross-checked against a real recorded episode's cube position (since a
+top-down rotation is hard to judge from an oblique camera), and
+`wrist_roll` needed a third attempt (a rendered image was too ambiguous,
+then a position-tracking approach came back internally inconsistent)
+before landing on directly extracting the true rotation axis/angle from
+gripper_link's own measured orientation change -- verified via a sanity
+check before trusting it. Result: `elbow_flex` and `wrist_roll` need a
+sign flip between a policy's action output and a real follower command;
+`shoulder_pan`, `shoulder_lift`, `wrist_flex`, and `gripper` transfer
+directly. Full comparison table and reasoning in docs/decisions.md;
+recorded in docs/sim_to_real_checklist.md too, as a new checked-off
+"joint sign convention" item. Not yet applied anywhere -- no code exists
+yet that actually sends a command to the follower.
