@@ -198,6 +198,26 @@ parser.add_argument(
     "fraction, keeping their presence roughly constant rather than one-time-and-fading. See "
     "docs/decisions.md.",
 )
+parser.add_argument(
+    "--seed-demos-hold-segments", action="store_true",
+    help="Only used with --seed-demos. Added 2026-09-12 after a multi-draw variance study "
+    "(--eval-only-repeats) found held=True in 0 of 36 honestly-measured draws across every "
+    "checkpoint this project has tested, including its most stable one -- see docs/decisions.md. "
+    "--seed-demos-min-fraction (above) only guarantees a floor on WHOLE seed episodes' share of "
+    "total episode count; it says nothing about how many of the actual TRANSITIONS sampled are "
+    "genuinely post-grasp, and since SliceSampler picks episodes uniformly BY COUNT (not weighted "
+    "by length), the ~80%+ of the buffer that's self-generated RL experience contributes close to "
+    "zero hold-phase transitions of its own (the policy essentially never succeeds), leaving "
+    "genuine hold-phase signal thin and non-growing regardless of how long training runs. This "
+    "flag extracts, from each seed episode, the segment starting HOLD_SEGMENT_LOOKBACK_STEPS "
+    "before its own first is_holding()=True step through its end (see that constant's own "
+    "comment), and injects it as an ADDITIONAL pseudo-episode alongside (not instead of) the "
+    "whole episode -- on the same --seed-demos-min-fraction re-injection cadence, so the "
+    "existing periodic-re-injection machinery needs no changes, it just re-injects more, "
+    "hold-concentrated episodes now. Since episodes are sampled uniformly by COUNT, a short "
+    "hold-focused pseudo-episode gets the exact same per-draw selection probability as a full-"
+    "length one -- it costs nothing in selection weight to be short. Requires --seed-demos.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -446,6 +466,46 @@ def to_td(obs, action=None, reward=None, terminated=None, action_dim=6):
 
 _JOINT_ORDER = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 
+# Added 2026-09-12 for --seed-demos-hold-segments (see its own help text
+# for the full derivation: held=True was 0/36 across every checkpoint
+# this project has honestly, repeatedly measured -- see docs/decisions.md
+# -- and the buffer only ever guarantees a floor on whole SEED EPISODES'
+# share of total episode count, not on how many of the TRANSITIONS within
+# them are genuinely post-grasp). How many steps of "final approach" to
+# include BEFORE a demo episode's first is_holding()=True step when
+# extracting its hold-and-carry segment, so the segment captures the
+# critical transition-into-a-hold moment itself, not just its aftermath.
+# 50 steps = 1 second at this env's 50Hz control rate. Checked against
+# all 5 of this project's current seed episodes (episode_000/002/003/
+# 005/006) via extract_grasp_segment.py before picking this: their own
+# first-hold boundaries land at steps 194-200 with remarkable
+# consistency, so 50 is a generous "final approach" window comfortably
+# inside every one of them -- not deeply tuned, just checked against the
+# real data rather than guessed.
+HOLD_SEGMENT_LOOKBACK_STEPS = 50
+
+
+def hold_segment_start(first_holding_step, lookback_steps=HOLD_SEGMENT_LOOKBACK_STEPS):
+    """Pure index arithmetic for --seed-demos-hold-segments (see
+    HOLD_SEGMENT_LOOKBACK_STEPS' own comment) -- deliberately kept as a
+    tiny, dependency-free function separate from the actual tds slicing
+    at its call site (which needs torch/tensordict), so the one thing
+    actually worth getting wrong here -- the boundary arithmetic itself --
+    stays trivially checkable independent of Isaac Sim.
+
+    Returns None (no segment to extract) if this episode never held at
+    all (first_holding_step is None) -- a caller must not extract a
+    "hold segment" from an episode that never established one. Otherwise
+    clamps to 0 rather than going negative, for the (currently
+    unobserved, but not impossible for some future seed episode) case
+    where a hold is established within the first `lookback_steps` of the
+    episode -- extracting from the true start of the episode in that
+    case rather than an invalid negative index.
+    """
+    if first_holding_step is None:
+        return None
+    return max(0, first_holding_step - lookback_steps)
+
 
 def replay_episode_to_tds(base_env, env, episode_path):
     """Replays one recorded teleop episode (sim/output/teleop_episodes_v2/
@@ -485,7 +545,14 @@ def replay_episode_to_tds(base_env, env, episode_path):
 
     Returns (tds, stats): tds is a list of to_td()-format TensorDicts
     (torch.cat(tds) is directly buffer.add()-able); stats is a dict of
-    the episode's own outcome for the caller to log/audit.
+    the episode's own outcome for the caller to log/audit, including
+    (added 2026-09-12) `first_holding_step`, the index into `tds` of the
+    first step this episode's own is_holding() became True (None if it
+    never did) -- see --seed-demos-hold-segments/hold_segment_start()'s
+    own docstrings for why. Computed for every replay regardless of
+    whether that flag is passed, since it costs nothing extra (the
+    replay loop already checks info["holding"] every step for
+    ever_holding) -- only ACTED on when the flag is set.
     """
     with open(episode_path) as f:
         episode = json.load(f)
@@ -520,6 +587,7 @@ def replay_episode_to_tds(base_env, env, episode_path):
     tds = [to_td(obs, action_dim=6)]
     max_cube_height = downsampled[0]["cube_pos"][2]
     ever_touched = ever_between_jaws = ever_holding = False
+    first_holding_step = None  # index into `tds` -- see hold_segment_start()'s own docstring
     reward_sum = 0.0
     clamp_events = 0
     limit_clip_events = 0
@@ -567,6 +635,14 @@ def replay_episode_to_tds(base_env, env, episode_path):
         ever_touched = ever_touched or info["touched"]
         ever_between_jaws = ever_between_jaws or info["between_jaws"]
         ever_holding = ever_holding or info["holding"]
+        # First is_holding()=True step this episode -- tds.append() just
+        # above already happened, so len(tds)-1 is the index of the entry
+        # this step's `info` actually belongs to. Only the FIRST such step
+        # is recorded (later steps where holding flickers back to True
+        # after a brief loss don't move this) -- --seed-demos-hold-segments
+        # wants the genuine first transition into holding, not a later one.
+        if first_holding_step is None and info["holding"]:
+            first_holding_step = len(tds) - 1
         reward_sum += reward.item()
         if done:
             break
@@ -576,6 +652,7 @@ def replay_episode_to_tds(base_env, env, episode_path):
         reward_sum=reward_sum, max_cube_height=max_cube_height,
         recorded_max_cube_height=max(s["cube_pos"][2] for s in episode),
         ever_touched=ever_touched, ever_between_jaws=ever_between_jaws, ever_holding=ever_holding,
+        first_holding_step=first_holding_step,
         clamp_events=clamp_events, limit_clip_events=limit_clip_events,
     )
     return tds, stats
@@ -806,6 +883,9 @@ def main():
         # Calling it a second time here would be redundant at best.
         return
 
+    if args_cli.seed_demos_hold_segments and args_cli.seed_demos is None:
+        raise ValueError("--seed-demos-hold-segments requires --seed-demos (nothing to extract a segment from).")
+
     # --seed-demos: replay real recorded teleop episodes through this
     # exact env/wrapper instance BEFORE the buffer is even constructed --
     # see replay_episode_to_tds()'s own docstring and docs/decisions.md
@@ -814,6 +894,12 @@ def main():
     # is known before Buffer(cfg) runs, needed for the capacity
     # adjustment below.
     seed_episodes = []
+    # --seed-demos-hold-segments (see its own help text): (path, segment_tds)
+    # for each seed episode's extracted hold-and-carry segment, kept
+    # separate from seed_episodes above (rather than merged into it) so
+    # the per-episode logging/stats below stays about the WHOLE episode's
+    # own replay outcome, uncluttered by the derived segment's numbers.
+    hold_segments = []
     total_demo_transitions = 0
     if args_cli.seed_demos is not None:
         episode_paths = sorted(glob.glob(os.path.join(args_cli.seed_demos, "episode_*.json")))
@@ -830,8 +916,22 @@ def main():
                   f"ever_touched={stats['ever_touched']} ever_between_jaws={stats['ever_between_jaws']} "
                   f"ever_holding={stats['ever_holding']} clamp_events={stats['clamp_events']} "
                   f"limit_clip_events={stats['limit_clip_events']} truncated_by_timeout={truncated}")
+            if args_cli.seed_demos_hold_segments:
+                start_idx = hold_segment_start(stats["first_holding_step"])
+                if start_idx is None:
+                    print(f"[WARN] --seed-demos-hold-segments: {os.path.basename(path)} never reached "
+                          f"is_holding()=True -- no hold segment extracted from it")
+                else:
+                    segment_tds = tds[start_idx:]
+                    hold_segments.append((path, segment_tds))
+                    total_demo_transitions += len(segment_tds)
+                    print(f"[INFO] --seed-demos-hold-segments: extracted a {len(segment_tds)}-step hold "
+                          f"segment from {os.path.basename(path)} (steps {start_idx}-{start_idx + len(segment_tds) - 1}, "
+                          f"starting {HOLD_SEGMENT_LOOKBACK_STEPS} steps before first is_holding()=True "
+                          f"at step {stats['first_holding_step']})")
         print(f"[INFO] --seed-demos: {total_demo_transitions} total transitions from "
-              f"{len(episode_paths)} episode(s)")
+              f"{len(episode_paths)} episode(s)"
+              + (f" plus {len(hold_segments)} hold segment(s)" if hold_segments else ""))
 
     # Buffer's own capacity is min(cfg.buffer_size, cfg.steps) -- see
     # common/buffer.py. buffer_size already defaults to 1,000,000 (never
@@ -862,6 +962,11 @@ def main():
         print(f"[INFO] seed-demo episode {seed_ep_idx} added to buffer from {os.path.basename(path)} "
               f"(len={len(tds)}, reward_sum={stats['reward_sum']:+.3f})")
 
+    for path, segment_tds in hold_segments:
+        seed_ep_idx = buffer.add(torch.cat(segment_tds))
+        print(f"[INFO] hold-segment episode {seed_ep_idx} added to buffer from {os.path.basename(path)} "
+              f"(len={len(segment_tds)})")
+
     # Cache the already-replayed transitions (torch.cat once, reused many
     # times below) -- re-injection needs no new Isaac Sim stepping at all,
     # just another buffer.add() of data already computed above, so it's
@@ -871,8 +976,27 @@ def main():
     # across many add() calls is exactly how it's designed to be called
     # repeatedly (confirmed by reading common/buffer.py directly) -- no
     # aliasing/staleness risk.
-    num_seed_episodes = len(seed_episodes)
-    seed_tds_concat = [torch.cat(tds) for _, tds, _ in seed_episodes]
+    #
+    # hold_segments' tds are folded into this SAME list (not tracked
+    # separately) -- see --seed-demos-hold-segments' own help text: they
+    # share the exact same re-injection cadence and the exact same
+    # --seed-demos-min-fraction floor as the whole episodes, deliberately.
+    # There's no principled way yet to say hold segments need a DIFFERENT
+    # floor than whole episodes do, so this is the simplest change that
+    # actually shifts the buffer's composition -- doubling the "seed
+    # group" (5 whole + 5 hold-segment, at the current 5 real seed
+    # episodes) under the SAME target fraction means each individual
+    # episode gets roughly half the injection frequency it would alone,
+    # but half of the group's own content is now hold-concentrated
+    # instead of a natural approach/hold mix. If this isn't enough on its
+    # own, giving hold segments their own, independently-tunable fraction
+    # is the natural next lever -- not done here without evidence it's
+    # needed.
+    num_seed_episodes = len(seed_episodes) + len(hold_segments)
+    seed_tds_concat = (
+        [torch.cat(tds) for _, tds, _ in seed_episodes]
+        + [torch.cat(segment_tds) for _, segment_tds in hold_segments]
+    )
     reinject_every = None
     if num_seed_episodes > 0:
         frac = args_cli.seed_demos_min_fraction
@@ -883,7 +1007,8 @@ def main():
         # for reinject_every given the target fraction.
         reinject_every = max(1, round(num_seed_episodes * (1 - frac) / frac))
         print(f"[INFO] --seed-demos-min-fraction={frac}: re-injecting all {num_seed_episodes} "
-              f"seed episode(s) every {reinject_every} real episode(s) added")
+              f"seed episode(s) (including {len(hold_segments)} hold segment(s)) "
+              f"every {reinject_every} real episode(s) added")
     real_episodes_since_reinject = 0
 
     step, ep_idx, done = 0, 0, True

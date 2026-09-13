@@ -1677,3 +1677,38 @@ table (persist the replay buffer across warm starts instead of
 weights-only; re-weight demo sampling toward the hold-and-carry portion
 specifically) -- full reasoning in docs/decisions.md, deciding with the
 user which to try next rather than picking unilaterally.
+
+Decided on demo re-weighting: the ancestor checkpoint (100% between_jaws
+across 12 draws, never destabilized by a warm start) still never held,
+which points at a persistent data/signal gap rather than transient
+instability -- the thing buffer persistence would target.
+
+Caught and corrected my own first-pass reasoning before implementing
+anything: initially thought the hold phase was under-represented because
+it's a small FRACTION of each demo episode -- checked this against real
+data (extract_grasp_segment.py's boundary data across all 5 seed
+episodes) and it doesn't hold up, the hold phase is actually LARGER than
+the approach phase by step count. The real mechanism: only 5 demo
+episodes exist and --seed-demos-min-fraction only floors their EPISODE
+count, not how many sampled transitions are genuinely post-grasp -- the
+other ~80% of the buffer is self-generated experience that (since the
+policy rarely succeeds) contributes close to zero hold-phase transitions
+of its own, so hold signal stays thin and non-growing no matter how long
+training runs. Confirmed this actually fits how the buffer's sampler
+works by reading torchrl's SliceSampler source directly: episodes are
+selected uniformly by count, so a short, hold-concentrated pseudo-episode
+gets exactly the same selection odds as a full-length one.
+
+Implemented `--seed-demos-hold-segments`: extracts each seed episode's
+segment from 50 steps (checked against all 5 episodes' real boundaries,
+194-200, before picking this) before its first is_holding()=True through
+its end, and injects it as an additional pseudo-episode on the same
+re-injection cadence as the whole episodes -- no new replay cost
+(reuses replay_episode_to_tds()'s existing single pass), no changes
+needed to the existing re-injection machinery. Verified three ways
+before calling it done: real extraction against all 5 actual episodes
+matched hand-computed expectations exactly; the never-held edge case
+(via --smoke-test's short timeout) correctly produces no segment; a
+regression check confirmed --seed-demos without the new flag is
+byte-for-byte unchanged. All three passed on the first attempt. Full
+design reasoning in docs/decisions.md. Ready for a real training run.

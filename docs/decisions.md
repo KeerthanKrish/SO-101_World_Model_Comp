@@ -1717,3 +1717,100 @@ variation on "warm-start + train some more":
   picking one unilaterally given how much this investigation has already
   shown that assumptions here need checking before committing more
   training hours.
+
+## `--seed-demos-hold-segments`, designed and implemented (2026-09-12)
+
+Chose demo re-weighting over buffer persistence. The deciding evidence:
+the ancestor checkpoint (100% `between_jaws` across 12 draws, no warm-
+start instability in play at all) still never held. Buffer persistence
+targets warm-start destabilization specifically -- a real but separate
+problem, since `between_jaws`/`touched` do partially self-correct with
+more training (67% recovered in both run23 and run24) even without it.
+`held` never recovers, in a checkpoint that was never destabilized in
+the first place -- pointing at a persistent data/signal gap, not
+transient instability, which is what this option targets.
+
+**Corrected mechanism** (my first-pass framing, given to the user
+verbally, was wrong and worth recording as a caught error rather than
+memory-holed): initially reasoned the hold phase is under-represented
+because it's a small FRACTION of each demo episode's own length. Checked
+this against the real data before implementing anything and it doesn't
+hold up -- `extract_grasp_segment.py` against all 5 seed episodes shows
+the hold phase is actually LARGER than the approach phase by step count
+(boundary at steps 194-200 of ~500-step episodes). The actual mechanism
+is different: only 5 demo episodes exist, and `--seed-demos-min-fraction`
+guarantees them at least a floor of the buffer's total EPISODE count --
+not of how many TRANSITIONS are genuinely post-grasp. The other ~80%+ of
+the buffer is self-generated RL experience, and since the policy rarely
+succeeds (0/36 in the variance study), that 80% contributes close to
+zero hold-phase transitions of its own. So hold-phase signal in the
+whole buffer comes almost entirely from the 5 demos' own segments, a
+small, fixed, non-growing source, regardless of how much self-generated
+(non-holding) experience piles up around it. Confirmed the mechanism
+this depends on by reading torchrl's `SliceSampler._sample_slices()`
+directly: `get_traj_idx()` samples episode index uniformly via
+`torch.randint(maxval, ...)` where `maxval` is the number of distinct
+episodes -- confirms episode selection really is uniform by COUNT, not
+weighted by length, so a SHORT, hold-concentrated pseudo-episode gets
+exactly the same per-draw selection odds as a full-length one. That's
+what makes this approach well-suited to this specific sampler.
+
+**Design**: `--seed-demos-hold-segments` (new flag, requires
+`--seed-demos`). For each seed episode, extracts the segment starting
+`HOLD_SEGMENT_LOOKBACK_STEPS` (50 steps = 1 second at 50Hz) before its
+own first `is_holding()=True` step through its end, and injects it as
+an ADDITIONAL pseudo-episode alongside (not instead of) the whole
+episode. The 50-step lookback isn't arbitrary -- checked against all 5
+episodes' real boundaries (194-200, remarkably consistent) before
+picking it, specifically so the injected segment captures the critical
+transition-INTO-holding moment itself, not just its aftermath (a clean
+cut exactly at the boundary would only teach "how to continue a hold
+already established," missing the harder, rarer event of establishing
+one). Hold segments share the exact same `--seed-demos-min-fraction`
+floor and re-injection cadence as whole episodes -- deliberately not
+given their own separate fraction, since there's no evidence yet for
+what that should be; doubling the "seed group" (10 pseudo-episodes
+instead of 5, at the current 5 real episodes) under the same target
+floor already meaningfully shifts the mix toward hold-concentrated
+content without adding an untuned new knob. If this isn't enough,
+giving hold segments independent weight is the natural next lever --
+not done pre-emptively.
+
+**Implementation**: `replay_episode_to_tds()` now tracks
+`first_holding_step` (the tds-index of the first `is_holding()=True`
+step) as part of its existing single replay pass -- no second replay,
+no extra Isaac Sim cost, just one more field recorded from data already
+being read every step for `ever_holding`. A small, pure, dependency-free
+`hold_segment_start(first_holding_step, lookback_steps)` does the
+boundary arithmetic in isolation (clamped at 0, returns None if the
+episode never held) -- kept separate from the actual tds slicing at the
+call site specifically so the one thing worth getting wrong here stays
+checkable without booting Isaac Sim, even though this file as a whole
+can't be (`AppLauncher` boots at import time, so there's no formal
+`_self_test()` here the way `pickplace_reward.py` has -- verified
+against real data instead, see below). Hold segments feed into the SAME
+`seed_tds_concat` list already used for periodic re-injection, so that
+existing machinery needed no changes at all -- it just re-injects more,
+now hold-concentrated, episodes.
+
+**Verified, in order, before considering this done**:
+1. Real-data extraction against all 5 actual seed episodes (`--steps 600`,
+   full 500-step episode length so no artificial truncation before the
+   boundary): every segment's start/end/length matches hand-computed
+   expectations exactly (e.g. episode_000: boundary step 198, segment
+   148-499, length 352 = lookback of 50 + 254 = 499-148+1, confirmed
+   arithmetically for all 5). Buffer log confirms 10 total seed episodes
+   (5 whole + 5 hold-segment), re-injection message correctly reflects
+   the new count.
+2. The `None`/never-held edge case, via `--smoke-test`'s 100-step env
+   timeout (well before any real boundary at 194-200): all 5 episodes
+   correctly fall back to the `[WARN] ... never reached is_holding()=True`
+   path, "0 hold segment(s)" correctly reflected in the summary line, no
+   crash.
+3. Regression check: `--seed-demos` WITHOUT the new flag reproduces the
+   exact same per-episode stats as before this change, byte-for-byte
+   (same reward sums, same transition counts) -- confirms this is a
+   pure addition, nothing about the existing mechanism changed.
+
+All three passed cleanly on the first real attempt. Ready for a real
+training run using this mechanism.
