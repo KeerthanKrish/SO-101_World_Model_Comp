@@ -32,6 +32,19 @@ command) -- the ENTER-key prompts above are timed against actually moving
 the physical arm by hand, which only the person standing next to it can
 do. Run it directly in a terminal on the Ubuntu box.
 
+Explicitly disables torque again right after connect() (added
+2026-09-13): SOFollower.connect() -> configure() re-enables torque as a
+side effect of writing the operating-mode/PID registers (its own
+`torque_disabled()` context manager restores the PRIOR state on exit,
+which is torque-enabled for any already-calibrated arm) -- confirmed by
+reading configure()'s source directly, not assumed. Without this,
+holding a joint by hand to check its sign means fighting the servo's own
+active position hold, at full, un-derated STS3215 torque for every
+joint except the gripper (only the gripper gets a reduced Max_Torque_Limit/
+Protection_Current written by configure()) -- unnecessary force against
+a live PID loop for a diagnostic script that has no goal position of its
+own to hold anyway. Matches how calibration itself was already made safe.
+
 Usage:
     python follower_reader.py --port /dev/ttyACM0 --id follower1
 """
@@ -55,8 +68,10 @@ def main():
     cfg = SOFollowerRobotConfig(port=args.port, id=args.id)
     follower = SOFollower(cfg)
     follower.connect(calibrate=True)  # see module docstring -- walks through interactive calibration if no file exists yet
-    print(f"[INFO]: Follower arm connected (calibrated={follower.is_calibrated}). "
-          f"Reading live joint positions -- Ctrl+C to stop. No motion is ever commanded by this script.")
+    follower.bus.disable_torque()  # see module docstring -- undo connect()'s own re-enable, arm stays freely movable by hand
+    print(f"[INFO]: Follower arm connected (calibrated={follower.is_calibrated}), torque disabled -- "
+          f"safe to move any joint by hand. Reading live joint positions -- Ctrl+C to stop. "
+          f"No motion is ever commanded by this script.")
 
     try:
         while True:
