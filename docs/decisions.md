@@ -1644,3 +1644,76 @@ reward term):
    seed-demo weight specifically on the hold-and-carry portion of the
    5 available demo episodes) -- not before, since neither has been ruled
    in or out yet by real evidence.
+
+## run24: the "just train longer" experiment, tested properly (2026-09-12)
+
+Ran the recommended experiment: `run24_extended_training`, 96,000 steps
+(double run22/23's budget), resumed from `run23_action_penalty_fix/
+agent_step_045409.pt` -- the checkpoint actually VERIFIED at 67%
+`between_jaws` in the variance study, not just the last one saved (the
+same run21 lesson applied deliberately this time). No new reward term,
+no other setting changed -- the only variable was more uninterrupted
+time. Finished in 21469s (~5h58m, matching the ~6h estimate). 19
+single-draw training-time evals, 4 scattered `between_jaws=True` hits,
+no `held=True` -- deliberately NOT interpreted from single draws this
+time (per the new standard).
+
+Ran `--eval-only-repeats 6` on the two checkpoints that mattered: the
+best-looking single-draw checkpoint (step 65369, +2.87 reward,
+between_jaws=True) and the final checkpoint (096001, what would
+otherwise get used by default). Results:
+
+| Checkpoint | touched | between_jaws | held | mean reward |
+|---|---|---|---|---|
+| run24 step65369 (best-looking, 48k steps into the extension) | 1.00 | **0.67** | 0.00 | +1.37 |
+| run24 final (096001, end of the full 96k-step run) | **0.00** | **0.00** | 0.00 | -0.66 |
+
+**Two real conclusions, not single-draw noise:**
+
+1. **"Just train longer" plateaued rather than improved.** 0.67 at step
+   65369 is statistically indistinguishable from run23's own already-
+   verified 0.67 -- 48,000 additional steps of uninterrupted training,
+   with nothing else changed, produced no further recovery toward the
+   ancestor checkpoint's 1.00. The hypothesis this run was built to test
+   did not pan out: more time alone, on this same lineage, isn't closing
+   the remaining gap.
+
+2. **The final checkpoint regressed hard -- confirmed a second time,
+   not a fluke of run21.** 0/6 touched, let alone between_jaws -- a
+   complete failure, worse than even run22's collapsed final checkpoint
+   (which still touched 6/6). This is now the SECOND independent
+   instance (after run21) of a run's own final saved checkpoint being
+   meaningfully worse than an earlier one from the same run -- strong,
+   now-replicated confirmation that this isn't a one-off: whatever a
+   training run's last checkpoint happens to look like should never be
+   assumed to be its best, on this codebase, full stop.
+
+**Running total across every checkpoint this investigation has now
+verified with multi-draw testing: `held=True` in 0 of 36 independent
+draws**, spanning 4 distinct checkpoints across 3 different training
+runs (run21's ancestor at two `min_std` settings, run22, run23, run24 --
+twice). This is no longer a small-sample curiosity -- it's a solid null
+result. Continuing to add more training time to this exact lineage,
+unmodified, is not the way past it.
+
+**How to apply**: per the plan this was set up to test, this is the
+point to try something structurally different rather than a 5th
+variation on "warm-start + train some more":
+- Persist and reload the replay buffer across warm starts (currently
+  `TDMPC2.save()`/`--resume-from` never does -- weights only, a design
+  decision from run9, unchanged since) -- directly addresses the
+  offline-to-online destabilization mechanism already documented above,
+  rather than hoping more steps outruns it.
+- Re-weight the 5 seed demo episodes' OWN sampling specifically toward
+  their hold-and-carry portions (right now `--seed-demos-min-fraction`
+  controls how often whole episodes get re-injected, not which PART of
+  an episode gets sampled more) -- if the buffer is systematically
+  under-representing the rare "finish the hold" transitions relative to
+  the much more common "approach/reach" ones, that would directly
+  explain a persistent 0/36 on `held` regardless of how long training
+  runs.
+- Not yet tried, and not recommended yet either -- worth deciding
+  together which of these (or something else) to test next, rather than
+  picking one unilaterally given how much this investigation has already
+  shown that assumptions here need checking before committing more
+  training hours.

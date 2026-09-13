@@ -1656,3 +1656,24 @@ the standard going forward, and stop adding reactive reward terms --
 the next real experiment is more UNINTERRUPTED training time on the
 current best checkpoint, properly measured, before considering anything
 structural (buffer persistence, demo re-weighting).
+
+Ran that experiment: run24, 96k steps (double the usual budget), resumed
+from run23's actually-verified checkpoint, nothing else changed. Tested
+properly with `--eval-only-repeats 6` on its two most relevant
+checkpoints rather than trusting single-draw training logs. Result: the
+best checkpoint plateaued at 0.67 between_jaws -- statistically the same
+as run23 already had, no further recovery from 48k more steps of pure
+training time. The final checkpoint was a genuine, severe regression
+(0/6 touched at all) -- the second independent confirmation (after
+run21) that this codebase's last-saved checkpoint should never be
+assumed to be its best.
+
+Running total: `held=True` in 0 of 36 independent, honestly-drawn
+episodes across 4 checkpoints spanning 3 training runs. That's a solid
+null result now, not a small sample. "Just train longer" was the
+hypothesis this run tested, and it didn't hold up -- more of the same
+isn't the path past this. Two concrete structural options are on the
+table (persist the replay buffer across warm starts instead of
+weights-only; re-weight demo sampling toward the hold-and-carry portion
+specifically) -- full reasoning in docs/decisions.md, deciding with the
+user which to try next rather than picking unilaterally.
