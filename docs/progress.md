@@ -1735,3 +1735,18 @@ checkpoint without checking earlier ones first.
 Videos pulled to sim/output/tdmpc2_eval_videos/run25_hold_segments/ on
 the Mac (matching the Ubuntu-side path, not a temp directory) for the
 user to review -- eval_step_045409.mp4 is the one to watch.
+
+Implemented the flagged "next lever": --seed-demos-hold-segments-fraction
+gives hold segments their own independent target buffer-episode
+fraction (default 0.20) and their own re-injection schedule, fully
+decoupled from --seed-demos-min-fraction -- whole episodes no longer
+get quietly diluted to make room for hold segments the way run25's
+first version did. Verified with a deliberately extreme test (fraction
+0.9) that made the two groups' schedules clearly different: hold
+segments re-injected every single real episode while whole episodes
+correctly stayed silent on their own, much longer schedule -- confirmed
+independent, not just theoretically decoupled. Also confirmed the
+actual practice values (both at 0.20) compute identically as expected.
+No crashes. Ready for a real run, warm-started from run25's verified
+step45409 checkpoint -- the best-verified starting point now, not the
+original ancestor.

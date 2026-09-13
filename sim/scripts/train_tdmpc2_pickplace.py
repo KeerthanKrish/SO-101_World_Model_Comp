@@ -212,11 +212,32 @@ parser.add_argument(
     "flag extracts, from each seed episode, the segment starting HOLD_SEGMENT_LOOKBACK_STEPS "
     "before its own first is_holding()=True step through its end (see that constant's own "
     "comment), and injects it as an ADDITIONAL pseudo-episode alongside (not instead of) the "
-    "whole episode -- on the same --seed-demos-min-fraction re-injection cadence, so the "
-    "existing periodic-re-injection machinery needs no changes, it just re-injects more, "
-    "hold-concentrated episodes now. Since episodes are sampled uniformly by COUNT, a short "
-    "hold-focused pseudo-episode gets the exact same per-draw selection probability as a full-"
-    "length one -- it costs nothing in selection weight to be short. Requires --seed-demos.",
+    "whole episode. Re-injected on its OWN independent cadence -- see "
+    "--seed-demos-hold-segments-fraction below -- not the whole episodes' "
+    "--seed-demos-min-fraction (run25's first version of this shared one combined floor between "
+    "the two groups, which meant adding hold segments quietly diluted the whole episodes' own "
+    "proven representation to make room; verified via --eval-only-repeats that run25 still worked "
+    "well despite that, but there's no reason to keep paying that cost once it's this cheap to "
+    "avoid). Since episodes are sampled uniformly by COUNT, a short hold-focused pseudo-episode "
+    "gets the exact same per-draw selection probability as a full-length one -- it costs nothing "
+    "in selection weight to be short. Requires --seed-demos.",
+)
+parser.add_argument(
+    "--seed-demos-hold-segments-fraction", type=float, default=0.20,
+    help="Only used with --seed-demos-hold-segments. Added 2026-09-13, alongside decoupling hold "
+    "segments' re-injection cadence from --seed-demos-min-fraction (see --seed-demos-hold-segments' "
+    "own help text) -- the independent target share of total buffer EPISODE COUNT hold-segment "
+    "pseudo-episodes maintain, computed and re-injected completely separately from the whole "
+    "episodes' own --seed-demos-min-fraction floor (which stays at its own value, unchanged, no "
+    "longer diluted by sharing with hold segments). Same math as --seed-demos-min-fraction "
+    "(steady-state share of total episode insertions converges to n / (reinject_every + n), solved "
+    "for reinject_every given this target). Defaulted to 0.20 -- the same value "
+    "--seed-demos-min-fraction has actually been run at in practice (run22-25), chosen here so "
+    "hold segments get a genuinely independent, equally-substantial floor rather than reusing the "
+    "OTHER flag's own separate 0.15 default, which was tuned (loosely) for a different purpose "
+    "(whole episodes, well before hold segments existed) -- not a claim that 0.20 is specifically "
+    "correct for hold segments, just a reasonable, comparable starting point given no evidence yet "
+    "points to a better one.",
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -976,40 +997,40 @@ def main():
     # across many add() calls is exactly how it's designed to be called
     # repeatedly (confirmed by reading common/buffer.py directly) -- no
     # aliasing/staleness risk.
-    #
-    # hold_segments' tds are folded into this SAME list (not tracked
-    # separately) -- see --seed-demos-hold-segments' own help text: they
-    # share the exact same re-injection cadence and the exact same
-    # --seed-demos-min-fraction floor as the whole episodes, deliberately.
-    # There's no principled way yet to say hold segments need a DIFFERENT
-    # floor than whole episodes do, so this is the simplest change that
-    # actually shifts the buffer's composition -- doubling the "seed
-    # group" (5 whole + 5 hold-segment, at the current 5 real seed
-    # episodes) under the SAME target fraction means each individual
-    # episode gets roughly half the injection frequency it would alone,
-    # but half of the group's own content is now hold-concentrated
-    # instead of a natural approach/hold mix. If this isn't enough on its
-    # own, giving hold segments their own, independently-tunable fraction
-    # is the natural next lever -- not done here without evidence it's
-    # needed.
-    num_seed_episodes = len(seed_episodes) + len(hold_segments)
-    seed_tds_concat = (
-        [torch.cat(tds) for _, tds, _ in seed_episodes]
-        + [torch.cat(segment_tds) for _, segment_tds in hold_segments]
-    )
-    reinject_every = None
-    if num_seed_episodes > 0:
-        frac = args_cli.seed_demos_min_fraction
-        # Steady-state share of total episode INSERTIONS (not necessarily
-        # of whatever happens to still be resident after eviction, a
-        # subtly different and harder-to-track quantity) converges to
-        # num_seed_episodes / (reinject_every + num_seed_episodes) -- solve
-        # for reinject_every given the target fraction.
-        reinject_every = max(1, round(num_seed_episodes * (1 - frac) / frac))
-        print(f"[INFO] --seed-demos-min-fraction={frac}: re-injecting all {num_seed_episodes} "
-              f"seed episode(s) (including {len(hold_segments)} hold segment(s)) "
-              f"every {reinject_every} real episode(s) added")
-    real_episodes_since_reinject = 0
+    whole_tds_concat = [torch.cat(tds) for _, tds, _ in seed_episodes]
+    hold_tds_concat = [torch.cat(segment_tds) for _, segment_tds in hold_segments]
+
+    def _reinject_every(n, frac):
+        """Steady-state share of total episode INSERTIONS (not
+        necessarily of whatever happens to still be resident after
+        eviction, a subtly different and harder-to-track quantity)
+        converges to n / (reinject_every + n) -- solve for reinject_every
+        given the target fraction. None if there's nothing to re-inject
+        (n == 0 -- e.g. --seed-demos-hold-segments not passed, or no
+        seed episode ever held at all)."""
+        if n == 0:
+            return None
+        return max(1, round(n * (1 - frac) / frac))
+
+    # Added 2026-09-13: whole episodes and hold segments now maintain
+    # their OWN independent target fraction / re-injection cadence, each
+    # computed and tracked completely separately -- see
+    # --seed-demos-hold-segments-fraction's own help text for why this
+    # replaced run25's first version (one shared floor across both
+    # groups, which meant adding hold segments quietly diluted the whole
+    # episodes' own already-proven representation to make room for them).
+    whole_reinject_every = _reinject_every(len(seed_episodes), args_cli.seed_demos_min_fraction)
+    if whole_reinject_every is not None:
+        print(f"[INFO] --seed-demos-min-fraction={args_cli.seed_demos_min_fraction}: re-injecting all "
+              f"{len(seed_episodes)} whole seed episode(s) every {whole_reinject_every} "
+              f"real episode(s) added")
+    hold_reinject_every = _reinject_every(len(hold_segments), args_cli.seed_demos_hold_segments_fraction)
+    if hold_reinject_every is not None:
+        print(f"[INFO] --seed-demos-hold-segments-fraction={args_cli.seed_demos_hold_segments_fraction}: "
+              f"re-injecting all {len(hold_segments)} hold-segment episode(s) every "
+              f"{hold_reinject_every} real episode(s) added")
+    real_episodes_since_reinject_whole = 0
+    real_episodes_since_reinject_hold = 0
 
     step, ep_idx, done = 0, 0, True
     tds = None
@@ -1024,14 +1045,27 @@ def main():
                 print(f"[INFO] step {step}: episode {ep_idx} added to buffer "
                       f"(len={len(tds)}, reward_sum={sum(td['reward'].item() for td in tds[1:]):.3f})")
 
-                if reinject_every is not None:
-                    real_episodes_since_reinject += 1
-                    if real_episodes_since_reinject >= reinject_every:
-                        for demo_td in seed_tds_concat:
+                # Whole episodes and hold segments re-inject on their own
+                # independent schedules (see whole_reinject_every/
+                # hold_reinject_every's own comment) -- both checked here,
+                # completely independently of each other.
+                if whole_reinject_every is not None:
+                    real_episodes_since_reinject_whole += 1
+                    if real_episodes_since_reinject_whole >= whole_reinject_every:
+                        for demo_td in whole_tds_concat:
                             ep_idx = buffer.add(demo_td)
-                        print(f"[INFO] step {step}: re-injected {num_seed_episodes} seed-demo "
+                        print(f"[INFO] step {step}: re-injected {len(seed_episodes)} whole "
+                              f"seed-demo episode(s) to maintain sampling share (buffer.num_eps={ep_idx})")
+                        real_episodes_since_reinject_whole = 0
+
+                if hold_reinject_every is not None:
+                    real_episodes_since_reinject_hold += 1
+                    if real_episodes_since_reinject_hold >= hold_reinject_every:
+                        for demo_td in hold_tds_concat:
+                            ep_idx = buffer.add(demo_td)
+                        print(f"[INFO] step {step}: re-injected {len(hold_segments)} hold-segment "
                               f"episode(s) to maintain sampling share (buffer.num_eps={ep_idx})")
-                        real_episodes_since_reinject = 0
+                        real_episodes_since_reinject_hold = 0
 
             if not args_cli.smoke_test and step >= next_eval_at:
                 video_path = os.path.join(run_video_dir, f"eval_step_{step:06d}.mp4")

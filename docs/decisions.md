@@ -1861,3 +1861,45 @@ own independent re-injection weight rather than sharing
 "next lever" note), warm-start from HERE, not from the ancestor again --
 this is real, verified progress worth building on rather than
 discarding.
+
+## Independent hold-segment weighting (2026-09-13)
+
+Implemented the "next lever" flagged above: `--seed-demos-hold-segments-fraction`
+(new flag, default 0.20), giving hold segments their own target buffer-
+episode-count fraction, re-injected on their own schedule, fully
+decoupled from `--seed-demos-min-fraction` (which now stays at whatever
+it's set to, e.g. 0.20 in practice, without being diluted by sharing
+with hold segments the way run25's first version did).
+
+**Implementation**: replaced the single `num_seed_episodes`/
+`seed_tds_concat`/`reinject_every` triple with two fully independent
+ones -- `whole_tds_concat`/`whole_reinject_every`/
+`real_episodes_since_reinject_whole` and the hold-segment equivalents --
+each computed via the same `n / (reinject_every + n)` steady-state math
+as before (now a small named helper, `_reinject_every(n, frac)`, instead
+of inlined once), and each checked completely independently in the main
+loop's re-injection block. No other part of the pipeline needed to
+change -- buffer capacity sizing already summed both groups' transition
+counts before this, unaffected by how their re-injection cadence is
+split.
+
+**Verified, in order**:
+1. A deliberately extreme test (`--seed-demos-hold-segments-fraction 0.9`,
+   `--seed-demos-min-fraction` left at its own 0.15 default) to make the
+   two groups' cadences clearly different and directly observable within
+   a short run: hold segments (reinject_every=1) re-injected after
+   EVERY real episode (confirmed at steps 499, 998, 1497, 1996, buffer
+   episode count climbing by exactly +6 each cycle -- 5 hold-segment
+   re-injections + 1 new real episode), while whole episodes
+   (reinject_every=28) correctly never fired in this ~4-episode-long
+   test. Exactly the independent behavior this was designed to produce.
+2. Confirmed the actual-practice values compute correctly:
+   `--seed-demos-min-fraction 0.20` (explicit) and
+   `--seed-demos-hold-segments-fraction` left at its own new 0.20
+   default both produce `reinject_every=20`, matching the hand-computed
+   expectation (`round(5*(1-0.2)/0.2) = 20`) for both groups
+   independently.
+
+No crashes in either test. Ready for a real training run, warm-started
+from run25's verified step45409 checkpoint (not the ancestor again --
+that's now the best-verified starting point this project has).
