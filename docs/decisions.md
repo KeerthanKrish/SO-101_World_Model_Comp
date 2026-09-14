@@ -2092,3 +2092,22 @@ variance across this entire investigation, the next decision (try
 independent hold-segment weight again for a second, independent
 data point; revert it; or try something else entirely) is worth making
 deliberately rather than automatically chaining another hop.
+
+## First real command sent to physical hardware (2026-09-13)
+
+`follower_writer_test.py` -- read the follower's current position, then
+commanded that exact position back (a no-op), with a 5-degree
+`max_relative_target` clamp engaged defensively. User ran it
+interactively on the real follower: all 6 joints reported `moved +0.000`
+before vs. after, confirming `SOFollower.send_action()` works correctly
+end to end with zero unexpected motion. This is the first time any code
+in this project has ever written a command to a physical motor.
+
+**How to apply**: next, staged step is replaying a short, already-
+recorded, already-validated teleop episode's REACH-ONLY segment (not the
+grasp/hold portion -- no real cube is positioned to match yet, so
+attempting a real grasp blind isn't meaningful) on the real follower,
+applying the `elbow_flex`/`wrist_roll` sign flips found above, at a
+reduced rate with `max_relative_target` engaged, smoothly interpolating
+from the arm's actual current position into the trajectory's first
+waypoint rather than jumping there.
