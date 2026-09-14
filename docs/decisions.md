@@ -2155,3 +2155,40 @@ choices: (a) replay closer to the original 50Hz for a smoother motion,
 needs correcting before any contact-sensitive task, or (c) move on to
 placing a real cube and camera setup so an actual policy could eventually
 be evaluated end to end.
+
+## run27: replicating run25's exact original schedule (2026-09-13)
+
+Set out to warm-start from run25's step45409 (100% between_jaws, still
+0% held) with run25's ORIGINAL settings unchanged, no other variable,
+to test whether more time alone (not more demo weight) closes the
+remaining gap. Caught a real mistake before it cost 6 hours: the
+`b8d26ee` commit (made for run26) fully replaced run25's shared-floor
+reinjection mechanism with two independent ones, and
+`--seed-demos-hold-segments-fraction` defaults to 0.20 whenever hold
+segments are used at all -- there is no longer a code path that
+reproduces run25's original combined behavior just by omitting the new
+flag. A first launch attempt (both groups defaulting/set to 0.20
+independently) was actually injecting demo/hold-segment material at
+**2x** run25's original rate (0.5 vs 0.25 pseudo-episode insertions per
+real episode -- verified by computing both reinject_every values
+directly, not assumed) -- silently closer to a bigger, untested version
+of run26's change than to run25's setup at all. Caught from the log's
+own printed reinject_every values looking implausible for a "should
+match run25" run, not assumed correct because it launched cleanly.
+
+Fixed by finding the fraction that makes each independent group's own
+formula reproduce run25's original combined reinject_every=40: solving
+`n*(1-f)/f = 40` for `n=5` gives `f=5/45=0.11111`. Verified both
+`--seed-demos-min-fraction` and `--seed-demos-hold-segments-fraction` at
+0.111111 each independently compute `reinject_every=40` (confirmed in
+the relaunched run's own log), and since both groups start their
+counters at 0 and share the same period, they stay in sync -- exactly
+reproducing run25's original "10 pseudo-episodes together every 40 real
+episodes" cadence, not a coincidentally-similar-looking independent
+approximation of it.
+
+**How to apply**: this is the correct way to reproduce a pre-b8d26ee
+run's exact demo-injection behavior going forward, given that code path
+no longer exists to select directly -- solve for the shared fraction
+via `f = n_per_group / (n_per_group + old_reinject_every)`, not by
+guessing a value or trusting the new flags' defaults to be equivalent.
