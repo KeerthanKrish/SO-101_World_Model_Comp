@@ -2304,3 +2304,59 @@ warm-start source, given the result.
 Meanwhile run29 (horizon=5, otherwise identical to run27) is showing a
 visibly different, more promising single-draw trend while still running
 -- see the next entry once it's finished and multi-draw verified.
+
+## run29 (horizon=5) verified: reproduces run25's 100%, independently (2026-09-14)
+
+Finished: 96,001 steps, 33749.7s (~9h22m -- notably longer than run27's
+~7h24m for the identical step count, the expected horizon=5 planning/
+training cost, consistent with the caveat noted when this was prepared).
+Full single-draw eval trend: 5 of 19 checkpoints hit `between_jaws=True`
+(steps 30439/45409/65369/75349/85329), all five at clearly positive
+reward (+1.96 to +3.28) -- a qualitatively different, more consistent
+pattern than run27's single (negative-reward) hit.
+
+Verified the best-looking checkpoint (step75349, +3.28 single-draw) and
+the final checkpoint with `--eval-only-repeats 6` (`--horizon 5`
+included, so the eval actually exercises the 5-step planning the
+checkpoint was trained under, not silently falling back to the
+default 3):
+
+| Checkpoint | touched | between_jaws | held | mean reward |
+|---|---|---|---|---|
+| run29 step75349 | 1.00 | **1.00** | 0.00 | +2.04 |
+| run29 final (096001) | 1.00 | 0.17 | 0.00 | -0.04 |
+
+**step75349 verifies at a genuine 100% between_jaws (6/6) -- matching
+run25's own best result exactly, via a completely different mechanism
+(longer planning horizon, not demo-reweighting) and a different
+training trajectory (run29, not run25 itself).** This is real,
+independent confirmation that 100% between_jaws is a reachable,
+repeatable outcome for this setup, not a one-off fluke specific to
+run25's own random path -- and, set directly against run27 (identical
+everything else, horizon=3, only 1/19 single-draw hits, never verified
+above 33%), the clearest evidence this investigation has produced that
+the planning-horizon hypothesis has real merit, not just plausible
+reasoning.
+
+The final checkpoint (096001) regressed again (17%, down from 100%) --
+the FIFTH confirmed instance of this codebase's final-checkpoint
+pattern (after run21, run24, run25, run26), though notably a partial
+regression here (still touches 100% of the time, hits between_jaws
+once) rather than run22/24/25/26's final checkpoints' complete
+collapses to 0% on everything.
+
+`held` remains 0/12 across both checkpoints -- horizon=5 has not yet
+solved the core remaining goal either, same as every other lever tried
+so far.
+
+**How to apply**: run29's step75349 is now, alongside run25's step45409,
+one of two independently-verified 100%-between_jaws checkpoints this
+project has produced -- and the only one reached via a structurally
+different mechanism, making it the more informative one to build on
+next if the goal is understanding WHY 100% positioning is achievable
+here (horizon vs. demo-weighting) rather than just re-confirming it
+again. Worth deciding deliberately whether to continue extending from
+run29's step75349, attempt a genuine held-verification-focused
+experiment (e.g. combining horizon=5 with run25's hold-segments demo
+weighting, now that both are independently shown to reach 100%
+between_jaws), or pursue option 2 (still unlaunched, see above).

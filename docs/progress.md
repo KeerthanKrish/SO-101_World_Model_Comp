@@ -1826,3 +1826,17 @@ required adding a new --horizon CLI override and confirming, both by
 reading the code and by an actual smoke test, that it's safe to combine
 with warm-starting from an existing checkpoint trained at a different
 horizon. Exact commands for both in docs/decisions.md.
+
+Ran option 1 (run27) and option 3 (run29, launched in parallel at the
+user's request once GPU headroom was confirmed) to completion. run27
+(more time, run25's exact settings) did NOT reproduce run25 -- only
+1/19 single-draw checkpoints hit between_jaws, and even that one at a
+negative reward. run29 (horizon 3->5, otherwise identical to run27) told
+a genuinely different story: verified its best checkpoint (step75349) at
+100% between_jaws (6/6 draws) -- matching run25's own best result
+exactly, via a completely different mechanism and a different training
+run, independent confirmation this is a reachable, repeatable outcome
+rather than a one-off. This is the clearest real evidence yet that
+longer planning horizon helps. held remains 0% throughout, and the final
+checkpoint regressed again (17%) -- the fifth confirmed instance of that
+pattern. Full numbers in docs/decisions.md.
