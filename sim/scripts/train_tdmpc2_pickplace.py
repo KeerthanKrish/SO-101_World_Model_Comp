@@ -111,6 +111,28 @@ parser.add_argument(
     "See build_cfg()'s docstring for why this was raised. Omit to keep tdmpc2's own default.",
 )
 parser.add_argument(
+    "--horizon", type=int, default=None,
+    help="CEM/MPPI planning AND training rollout length (tdmpc2/config.yaml's default: 3). Added "
+    "2026-09-14 to test whether the planner's short 3-step lookahead is why a policy that reliably "
+    "gets between the jaws (100% verified, run25) has still never once genuinely held the cube "
+    "(0% across 40+ multi-draw-verified episodes spanning many checkpoints) -- a real hold needs "
+    "committing through many more steps than CEM can directly see, so it has to trust the value "
+    "function's own (still-uncertain) longer-horizon bootstrap instead of evaluating the commitment "
+    "directly. Confirmed compatible with warm-starting from an existing checkpoint trained at a "
+    "DIFFERENT horizon: horizon is used purely as a loop trip-count during both planning (tdmpc2.py's "
+    "_plan()) and the training rollout/loss computation (update()), never as a fixed tensor shape "
+    "baked into any network layer -- the only horizon-shaped state (_prev_mean, a CEM warm-start "
+    "buffer) belongs to the TDMPC2 wrapper object itself, not self.model, and TDMPC2.save()/load() "
+    "only ever touch self.model.state_dict() -- confirmed by reading tdmpc2.py directly, then "
+    "verified empirically by actually loading run25's checkpoint at a different horizon with no "
+    "shape-mismatch error. Increases both per-step planning cost (CEM unrolls more steps every env "
+    "step, i.e. every action) and per-update training cost (the consistency/reward/value losses "
+    "unroll further, and Buffer.sample()'s effective batch grows since it draws horizon+1 length "
+    "windows) roughly in proportion to the new/old horizon ratio -- a training run at a larger "
+    "horizon will complete fewer real env steps in the same wall-clock budget than one at the "
+    "default. Omit to keep tdmpc2's own default (3).",
+)
+parser.add_argument(
     "--video-dir", type=str, default="/home/keerthan/SO-101-WM/sim/output/tdmpc2_eval_videos",
     help="Base eval video directory -- each run writes into its own --run-name subfolder under this, "
     "never directly into it. See --run-name.",
@@ -441,6 +463,8 @@ def build_cfg():
     # from the real one.
     if args_cli.min_std is not None:
         overrides["min_std"] = args_cli.min_std
+    if args_cli.horizon is not None:
+        overrides["horizon"] = args_cli.horizon
     cfg = OmegaConf.merge(base, overrides)
     cfg.obs_shape = {"state": (12,), "rgb": (6, 64, 64)}
     cfg.action_dim = 6
@@ -813,7 +837,7 @@ def main():
     cfg = build_cfg()
     print(f"[INFO] task={cfg.task} model_size={cfg.model_size} latent_dim={cfg.latent_dim} "
           f"episode_length={cfg.episode_length} steps={cfg.steps} seed_steps={cfg.seed_steps} "
-          f"min_std={cfg.min_std} cube_pos={args_cli.cube_pos}")
+          f"min_std={cfg.min_std} horizon={cfg.horizon} cube_pos={args_cli.cube_pos}")
 
     # --cube-pos fixes cube_x_range/cube_y_range to a single (degenerate,
     # zero-width) range -- sample_uniform(x, x, ...) returns exactly x

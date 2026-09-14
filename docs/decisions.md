@@ -2192,3 +2192,78 @@ run's exact demo-injection behavior going forward, given that code path
 no longer exists to select directly -- solve for the shared fraction
 via `f = n_per_group / (n_per_group + old_reinject_every)`, not by
 guessing a value or trusting the new flags' defaults to be equivalent.
+
+## Options 2 and 3 prepared, ready to launch if run27 doesn't pan out (2026-09-14)
+
+Both isolate exactly ONE variable against run25's own exact settings,
+warm-started from the SAME ancestor checkpoint run25 itself started
+from (`run21_more_demo_weight/agent_step_070359.pt`) -- not from run25's
+own resulting checkpoint -- so each is a clean, direct A/B comparison
+against run25's actual result, not a chained/confounded one.
+
+**Option 2 -- half run25's demo/hold-segment insertion rate**, testing
+run26's "more demo weight hurt" finding directly rather than just
+reproducing run25 again. Run25's original combined rate was 0.25
+pseudo-episode insertions per real episode (n=10 combined at frac=0.20,
+reinject_every=40); half of that is 0.125. Solved the same way as the
+run27 fix above, for a per-group rate of 0.0625: `reinject_every=80`,
+`frac=5/85=0.058824`. Verified by direct computation (`reinject_every(5,
+0.058824) == 80`, total rate `5/80 + 5/80 == 0.125`), not by hand.
+
+```
+--headless --enable_cameras --steps 96000 --eval-every 5000 \
+  --cube-pos 0.113 0.240 --min-std 0.5 --seed-episodes 2 \
+  --seed-demos sim/output/teleop_episodes_seed \
+  --seed-demos-min-fraction 0.058824 --seed-demos-hold-segments \
+  --seed-demos-hold-segments-fraction 0.058824 \
+  --resume-from sim/output/tdmpc2_checkpoints/run21_more_demo_weight/agent_step_070359.pt \
+  --run-name run28_half_demo_weight
+```
+
+**Option 3 -- longer CEM planning/training horizon** (3 -> 5), testing
+whether the planner's short lookahead is why a policy that reliably
+gets between the jaws has still never once genuinely held the cube --
+holding needs committing through far more steps than CEM can directly
+evaluate, so it has to trust the value function's own uncertain
+long-horizon bootstrap instead. Added a new `--horizon` CLI override to
+`train_tdmpc2_pickplace.py` (mirrors `--min-std`'s existing pattern).
+
+Confirmed this is safe to combine with warm-starting from an EXISTING
+(horizon=3-trained) checkpoint, not assumed: `horizon` is used purely as
+a loop trip-count during both planning (`tdmpc2.py`'s `_plan()`) and the
+training rollout/loss computation (`update()`), never as a fixed tensor
+shape baked into any network layer. The only horizon-shaped state
+(`_prev_mean`, a CEM warm-start buffer) belongs to the `TDMPC2` wrapper
+object itself, not `self.model`, and `TDMPC2.save()`/`load()` only ever
+touch `self.model.state_dict()` -- confirmed by reading `tdmpc2.py`
+directly, then verified empirically with a real `--smoke-test
+--horizon 5 --resume-from run25_hold_segments/agent_step_045409.pt`:
+loaded with no shape-mismatch error, ran 301 steps / 202 updates
+end-to-end, no crash.
+
+Cost caveat, honestly not fully measured yet: increases both per-step
+planning cost (CEM unrolls more steps every single env step) and
+per-update training cost (losses unroll further, and `Buffer.sample()`'s
+effective batch grows since it draws `horizon+1`-length windows) roughly
+in proportion to the horizon ratio -- the smoke test's per-step wall
+time looked comparable to a horizon=3 run's, but at a much smaller
+batch_size (8 vs. 256) than a real run uses, so that comparison doesn't
+reliably extrapolate to production scale. A real run at horizon=5 may
+take noticeably longer than 96,000 steps' worth of run25-paced wall
+time -- worth checking progress against elapsed time rather than
+assuming the same ~6h budget applies.
+
+```
+--headless --enable_cameras --steps 96000 --eval-every 5000 \
+  --cube-pos 0.113 0.240 --min-std 0.5 --horizon 5 --seed-episodes 2 \
+  --seed-demos sim/output/teleop_episodes_seed \
+  --seed-demos-min-fraction 0.111111 --seed-demos-hold-segments \
+  --seed-demos-hold-segments-fraction 0.111111 \
+  --resume-from sim/output/tdmpc2_checkpoints/run21_more_demo_weight/agent_step_070359.pt \
+  --run-name run29_horizon5
+```
+
+**How to apply**: check on run27 first. If it doesn't improve on run25's
+100% between_jaws / 0% held, launch whichever of these two seems more
+promising given what run27 showed -- both commands above are verified
+and ready, no further preparation needed.

@@ -1811,3 +1811,18 @@ cube ~1 inch up at this exact cutoff (the segment ends where
 of the gap but not all of it -- a real, if modest, sim-to-real height
 offset makes up the rest, not yet isolated further. Full details in
 docs/decisions.md.
+
+Back to the world-model side: launched run27 (option 1 -- more time
+from run25's own 100%-verified checkpoint, otherwise unchanged) after
+catching and fixing a real config bug first (a first launch attempt was
+accidentally injecting demo material at 2x run25's original rate, not
+matching it -- see docs/decisions.md for the exact fix). While that
+runs, prepared options 2 (half run25's demo weight, testing run26's
+"more weight hurt" finding directly) and 3 (longer CEM planning horizon,
+3->5, targeting the hypothesis that the planner can't directly see far
+enough ahead to value a genuine multi-step hold) -- both fully verified
+and ready to launch immediately if run27 doesn't pan out. Option 3
+required adding a new --horizon CLI override and confirming, both by
+reading the code and by an actual smoke test, that it's safe to combine
+with warm-starting from an existing checkpoint trained at a different
+horizon. Exact commands for both in docs/decisions.md.
