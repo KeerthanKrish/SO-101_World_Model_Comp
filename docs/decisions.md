@@ -2280,3 +2280,27 @@ directly. Both confirmed healthy after launch: GPU at ~10.2GB/16.3GB,
 64-71% utilization -- real headroom remains, no contention issues so
 far. run29's own log confirms `reinject_every=40` for both demo groups,
 matching run27 exactly.
+
+## run27 finished: option 1 did not reproduce run25 (2026-09-14)
+
+96,001 steps, 26641.4s (~7h24m). Full single-draw eval trend across all
+19 checkpoints: only 1 hit `between_jaws=True` (step 80339, and even
+that at a negative reward, -0.263) -- the other 18 all False. This is a
+clear regression from run25's own 100% (verified), even though run27
+used run25's EXACT settings (corrected fractions, same checkpoint, no
+other changes) and the only variable was more training time. "Just
+train longer from the exact same good setup" did not reproduce or
+sustain run25's result here -- consistent with the warm-start-hop
+degradation pattern seen repeatedly throughout this whole investigation
+(run20->21, run21->22, run23->24), except this time nothing about the
+reward/weighting changed at all, only elapsed training time did,
+suggesting the degradation isn't specifically tied to any single
+reward-shaping or demo-weighting choice tested so far -- something more
+general about continuing to train appears to erode this specific skill
+over time, at least along this training run's own trajectory. Not fully
+understood yet. Checkpoint retained but not recommended as a future
+warm-start source, given the result.
+
+Meanwhile run29 (horizon=5, otherwise identical to run27) is showing a
+visibly different, more promising single-draw trend while still running
+-- see the next entry once it's finished and multi-draw verified.
