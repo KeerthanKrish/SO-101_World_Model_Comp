@@ -1785,3 +1785,15 @@ directly. Full comparison table and reasoning in docs/decisions.md;
 recorded in docs/sim_to_real_checklist.md too, as a new checked-off
 "joint sign convention" item. Not yet applied anywhere -- no code exists
 yet that actually sends a command to the follower.
+
+Meanwhile, run26 (72k steps, warm-started from run25's 100%-verified
+checkpoint, independent hold-segment weighting active) finished and its
+best checkpoint verified at only 33% between_jaws -- a regression from
+run25, not an improvement. Can't tell from one run whether the new
+weighting caused this or it's another instance of the same warm-start
+variance seen throughout this investigation, but it didn't help. Final
+checkpoint was again a total collapse (0% everything) -- the fourth
+confirmed instance of that pattern, no longer worth re-diagnosing each
+time. run25's step45409 remains the best verified checkpoint this
+project has produced since the original ancestor; future work should
+build from there, not from run26. Full numbers in docs/decisions.md.

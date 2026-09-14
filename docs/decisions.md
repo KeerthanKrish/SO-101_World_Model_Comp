@@ -2051,3 +2051,44 @@ anywhere -- no code exists yet that sends a command to the follower at
 all (the next real step in the sim-to-real work, not started this
 session). Recorded here now specifically so this doesn't need
 re-deriving from scratch once that code is written.
+
+## run26: independent hold-segment weight, verified (2026-09-13)
+
+72,000 steps, warm-started from `run25_hold_segments/agent_step_045409.pt`
+(the 100%-between_jaws checkpoint), `--seed-demos-hold-segments-fraction
+0.20` newly active (hold segments no longer share `--seed-demos-min-fraction`
+with whole episodes). Finished in 16577.8s (~4h36m). Best single-draw
+checkpoint: step 25449, +4.21 reward, between_jaws=True -- the highest
+single-draw reward in this run.
+
+Verified with `--eval-only-repeats 6`:
+
+| Checkpoint | touched | between_jaws | held | mean reward |
+|---|---|---|---|---|
+| run26 step25449 | 1.00 | **0.33** | 0.00 | -0.46 |
+| run26 final (072001) | 0.00 | 0.00 | 0.00 | -0.76 |
+
+**This is a regression from run25's 100%, not an improvement.** The
+independent hold-segment weighting change didn't reproduce or build on
+run25's result -- if anything this warm-start hop landed worse than
+run23/24's own 67% plateau. Can't conclude from one run whether the
+change itself is responsible (given how much variance this whole
+investigation has already demonstrated between warm-start hops) or
+whether this is another instance of the same warm-start-hop degradation
+pattern seen repeatedly before (run20->21, run21->22, run23->24) --
+but it certainly didn't help here.
+
+The final checkpoint (072001) is, again, a total collapse (0% on
+everything) -- the FOURTH confirmed instance of this codebase's final
+checkpoint being worse than an earlier one from the same run (after
+run21, run24, run25). No longer treating this as newsworthy per run --
+it's a standing, well-established fact about this training setup.
+
+**How to apply**: run25's step45409 (100% between_jaws, verified) remains
+the best checkpoint this project has produced since the original
+ancestor. Future work should warm-start from THERE, not from run26 --
+run26 didn't improve on it. Given the demonstrated warm-start-hop
+variance across this entire investigation, the next decision (try
+independent hold-segment weight again for a second, independent
+data point; revert it; or try something else entirely) is worth making
+deliberately rather than automatically chaining another hop.
