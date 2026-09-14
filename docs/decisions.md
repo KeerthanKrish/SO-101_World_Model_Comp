@@ -2267,3 +2267,16 @@ assuming the same ~6h budget applies.
 100% between_jaws / 0% held, launch whichever of these two seems more
 promising given what run27 showed -- both commands above are verified
 and ready, no further preparation needed.
+
+**Update**: launched option 3 (`run29_horizon5`) in parallel with run27
+instead of waiting, at the user's request -- checked GPU headroom first
+(run27 alone: ~5.45GB/16.3GB, 44% utilization, plenty of both memory and
+spare compute). Changed its warm-start checkpoint from the ancestor to
+run27's own -- `run25_hold_segments/agent_step_045409.pt` -- so run27
+and run29 now differ in EXACTLY one variable (`horizon`, 3 vs. 5) against
+identical everything else (same checkpoint, same corrected 0.111111
+fractions), a cleaner isolation than comparing either against run25
+directly. Both confirmed healthy after launch: GPU at ~10.2GB/16.3GB,
+64-71% utilization -- real headroom remains, no contention issues so
+far. run29's own log confirms `reinject_every=40` for both demo groups,
+matching run27 exactly.
