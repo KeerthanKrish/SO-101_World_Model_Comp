@@ -497,6 +497,61 @@ class PickPlaceRewardConfig:
     # detection purposes, since direction now does most of the work that
     # radius alone used to.
     grasp_lateral_threshold: float = 0.02
+    # A SEPARATE, WIDER lateral tolerance (added 2026-09-14) used ONLY to
+    # gate grasp_close_weight/deepest_close_weight's shaping -- never
+    # touches is_between_jaws()/is_grasped()/is_holding()'s own
+    # establishment logic, grasp_lateral_threshold above, or the strict
+    # `between_jaws` value in the info dict (still exactly what it always
+    # was). This is the same "strict-for-success, looser-for-shaping"
+    # split between_jaws_grace_steps already established below for a
+    # different kind of gap (brief step-count flickers) -- this one
+    # targets a genuinely different, much bigger gap a grace period alone
+    # can't bridge.
+    #
+    # Motivation: run29 (horizon=5, docs/decisions.md) verified a
+    # checkpoint at a real 100% between_jaws (6/6 --eval-only-repeats
+    # draws) -- but 0% held, and the user's own video review confirmed
+    # the gripper simply wasn't attempting to close, not attempting and
+    # failing. A per-step CSV analysis of all 6 verified draws found why,
+    # consistently across every one: while genuinely touching the cube,
+    # `lateral` has a MEAN of 0.04-0.05 across all 6 episodes -- roughly
+    # DOUBLE grasp_lateral_threshold -- and is actually under 0.02 only
+    # 0.2-1.5% of touched steps. Since grasp_close_weight/
+    # deepest_close_weight ONLY pay out while between_jaws_for_closing is
+    # true, they were getting a real training signal on well under 2% of
+    # the steps where the policy was genuinely close and could have used
+    # it -- for ~98%+ of the time actually spent near the cube, there was
+    # NO reward gradient at all pushing toward closing further. The
+    # gripper_joint_pos data confirms the consequence: a stable, static
+    # ~55-58% mean across all 6 draws (barely varying between episodes),
+    # not a partial-close-then-reverse pattern -- a genuine stable local
+    # optimum (don't bother closing, it almost never pays), not a failed
+    # attempt.
+    #
+    # 0.04 chosen directly from that data -- the low end of the observed
+    # mean range, so the gate now covers the region the policy is
+    # ACTUALLY spending time in, not an arbitrarily larger one. Still a
+    # real, bounded tolerance, not "anything counts": 0.04m of lateral
+    # slack beyond the cube's own 0.015m half-width is 0.025m (2.5cm),
+    # less than the cube's own full 3cm width -- a meaningfully tighter
+    # bound than touch_threshold's much larger activation range (0.14m).
+    #
+    # Deliberately NOT loosening grasp_lateral_threshold itself: that
+    # value has real physical grounding (just over the cube's own half-
+    # size, see its own docstring) and is what is_grasped()/is_holding()
+    # use to decide whether a hold is REAL -- this project has been
+    # burned by exactly this kind of false positive before (run7, the
+    # reason is_between_jaws() exists at all). A generous SHAPING-only
+    # tolerance can only ever encourage more closing attempts; it cannot
+    # register a false hold, since establishment still requires the
+    # original, unchanged, strict threshold. The only genuine new risk is
+    # grasp_close_weight's own pre-existing gate-timing asymmetry (see
+    # docs/decisions.md's "run22's regression, root-caused" entry for why
+    # gating a potential-based term breaks its exact telescoping
+    # guarantee) becoming easier to trigger in practice with a wider
+    # gate -- quantified and bounded, not just reasoned about, in this
+    # module's self-test (see the farm-proofing test for this field).
+    grasp_close_lateral_threshold: float = 0.04
     # Grace period (added 2026-09-06), in consecutive steps, for
     # grasp_close_weight's own gate ONLY -- see _between_jaws_effective()
     # and this module's docstring's hysteresis section. Deliberately does
@@ -628,9 +683,9 @@ class PickPlaceRewardConfig:
     # weight * max(0, Phi_close(now) - Phi_close(best-so-far)), and only
     # updates the record when this step's potential genuinely exceeds it.
     # Gated identically to grasp_close_weight (not holding, and
-    # between_jaws_for_closing -- the SAME hysteresis-adjusted gate, so a
-    # brief forgiven miss doesn't also erase progress already banked
-    # here).
+    # between_jaws_for_closing -- the SAME wider-tolerance,
+    # hysteresis-adjusted gate, so a brief forgiven miss doesn't also
+    # erase progress already banked here).
     #
     # Why this can't be farmed by oscillating, unlike a plain per-step
     # velocity reward would be (see close_speed_bonus's own docstring for
@@ -970,16 +1025,29 @@ def is_between_jaws(gripper_pos, gripper_quat, cube_pos, cfg: PickPlaceRewardCon
 
 
 def _between_jaws_effective(raw_between_jaws: bool, prev_miss_streak, cfg: PickPlaceRewardConfig):
-    """Adds a short grace period on top of the strict, stateless
-    is_between_jaws() check -- see between_jaws_grace_steps's own
-    docstring for why. Used ONLY to gate grasp_close_weight's shaping in
-    compute_reward() -- never passed to is_grasped()/is_holding(), whose
-    own establishment logic calls is_between_jaws() directly and must
-    stay exactly as strict as before (see this module's docstring's
-    hysteresis section for why the two must not share this leniency).
+    """Adds a short grace period on top of a stateless "is this step
+    between the jaws" check. Used ONLY to gate grasp_close_weight/
+    deepest_close_weight's shaping in compute_reward() -- never passed to
+    is_grasped()/is_holding(), whose own establishment logic calls
+    is_between_jaws() directly and must stay exactly as strict as before
+    (see this module's docstring's hysteresis section for why the two
+    must not share this leniency).
+
+    `raw_between_jaws` here is deliberately NOT required to be
+    is_between_jaws()'s own strict result -- since 2026-09-14
+    (grasp_close_lateral_threshold, see its own docstring) the actual
+    call site passes a WIDER-tolerance check instead, computed with the
+    same axial bounds but a more forgiving lateral one. This function
+    itself is agnostic to which "between the jaws" definition it's given
+    -- the grace-period math is identical either way -- so both raw
+    strictness AND raw looseness are entirely the CALLER's choice, this
+    function only adds step-count hysteresis on top of whatever it's
+    handed.
 
     Args:
-        raw_between_jaws: this step's actual is_between_jaws() result.
+        raw_between_jaws: this step's "between the jaws" result, per
+            whatever definition the caller is using for this purpose
+            (see above).
         prev_miss_streak: how many consecutive steps (up to and not
             including this one) raw_between_jaws has been False since it
             was last True, or None on a fresh episode / first step after
@@ -1319,6 +1387,42 @@ def compute_reward(
     there's nothing new to farm here, the same reasoning already used for
     premature_close_weight.
 
+    ## Wider shaping-only lateral tolerance for closing (added 2026-09-14)
+
+    run29 (horizon=5, docs/decisions.md) verified a genuine 100%
+    between_jaws checkpoint (6/6 --eval-only-repeats draws) -- but still
+    0% held, and video review confirmed the gripper wasn't attempting to
+    close, not attempting and failing. A per-step CSV analysis of all 6
+    verified draws found a consistent cause: while genuinely touching the
+    cube, `lateral` has a mean of 0.04-0.05 across every episode --
+    roughly double grasp_lateral_threshold (0.02) -- and dips under it
+    only 0.2-1.5% of touched steps. Since grasp_close_weight/
+    deepest_close_weight only pay out while between_jaws_for_closing is
+    true, they had a real training signal on well under 2% of the steps
+    where the policy was genuinely close -- for the other 98%+, there was
+    no reward gradient at all pushing toward closing further.
+    `gripper_joint_pos` confirmed the consequence: a stable ~55-58% mean
+    across all 6 draws, not a partial-close-then-reverse pattern -- a
+    genuine stable local optimum, not a failed attempt.
+
+    `grasp_close_lateral_threshold` (see its own docstring for the full
+    derivation) is now used, instead of `grasp_lateral_threshold`, to
+    compute the "between the jaws" value fed into
+    `_between_jaws_effective()` for this gate specifically -- a wider,
+    data-derived tolerance covering where the policy is actually
+    spending its time, so the closing-shaping terms get real signal
+    density again. The strict `grasp_lateral_threshold`,
+    `is_between_jaws()`, and `is_grasped()`/`is_holding()`'s own
+    establishment logic are completely untouched -- a generous shaping
+    tolerance can only ever encourage more closing attempts, it cannot
+    register a false hold, since establishment still requires the
+    original strict threshold. See this module's own self-test for a
+    direct, quantified check that this doesn't meaningfully worsen
+    grasp_close_weight's pre-existing gate-timing exploit -- the
+    mechanism where gating a potential-based term breaks its exact
+    telescoping guarantee, documented in full in docs/decisions.md's
+    "run22's regression, root-caused" entry, not repeated here.
+
     Args:
         gripper_pos: (x, y, z) world position of the actual grasp point
             (use grasp_point_world() on gripper_frame_link's pose -- NOT
@@ -1416,7 +1520,7 @@ def compute_reward(
     holding = is_holding(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, was_holding, cfg)
     grasped = is_grasped(gripper_pos, gripper_quat, cube_pos, gripper_joint_pos, cfg)
     between_jaws = is_between_jaws(gripper_pos, gripper_quat, cube_pos, cfg)
-    _axial, lateral = _jaw_offsets(gripper_pos, gripper_quat, cube_pos)
+    axial, lateral = _jaw_offsets(gripper_pos, gripper_quat, cube_pos)
     touching_now = is_touching(gripper_pos, cube_pos, cfg)
     touched = touching_now or was_touched
     placed = is_placed(cube_pos, cube_lin_vel, cfg)
@@ -1446,15 +1550,20 @@ def compute_reward(
     # Gripper-closing shaping -- see this function's docstring. Gated on
     # `not holding` (only relevant pre-grasp; once holding, the gripper
     # should just stay closed, nothing more to reward here) AND an
-    # HYSTERESIS-ADJUSTED between_jaws (added 2026-09-06 -- see
-    # _between_jaws_effective()'s own docstring for why this is a
-    # SEPARATE value from the strict `between_jaws` used everywhere else
-    # in this function/info dict, never fed to is_grasped()/is_holding()).
-    # No phase_transition-style reset needed here: joint_pos is the same
-    # physical quantity whether or not holding was just established, so a
-    # delta across that boundary is still well-defined -- the `not
+    # HYSTERESIS-ADJUSTED, WIDER-TOLERANCE between_jaws (added 2026-09-06,
+    # widened 2026-09-14 -- see _between_jaws_effective()'s and
+    # grasp_close_lateral_threshold's own docstrings). This is now a
+    # SHAPING-ONLY notion of "between the jaws," built from the WIDER
+    # grasp_close_lateral_threshold rather than the strict
+    # grasp_lateral_threshold -- deliberately a different, more forgiving
+    # value from the strict `between_jaws` computed above, which is
+    # untouched and still what the info dict/is_grasped()/is_holding()
+    # use. No phase_transition-style reset needed here: joint_pos is the
+    # same physical quantity whether or not holding was just established,
+    # so a delta across that boundary is still well-defined -- the `not
     # holding` gate alone is enough to stop payouts once transport begins.
-    between_jaws_for_closing, jaws_miss_streak = _between_jaws_effective(between_jaws, prev_jaws_miss_streak, cfg)
+    between_jaws_wide = cfg.grasp_reach_min <= axial <= cfg.grasp_reach_max and lateral <= cfg.grasp_close_lateral_threshold
+    between_jaws_for_closing, jaws_miss_streak = _between_jaws_effective(between_jaws_wide, prev_jaws_miss_streak, cfg)
     if not holding and between_jaws_for_closing and prev_joint_pos is not None:
         close_shaping = cfg.grasp_close_weight * (
             _gripper_close_potential(gripper_joint_pos, cfg) - _gripper_close_potential(prev_joint_pos, cfg)
@@ -1515,16 +1624,20 @@ def compute_reward(
     # "farm" by holding a state -- a policy minimizes this by simply not
     # closing early, not by exploiting it. Gated on `not holding` (once
     # actually holding, the gripper should obviously stay closed) AND
-    # `not between_jaws_for_closing` (the SAME hysteresis-adjusted value
-    # grasp_close_weight uses, not the strict `between_jaws` -- added
-    # 2026-09-06 alongside the hysteresis fix itself: using the strict
-    # value here would let this penalty fire on a grace-period step at
-    # the exact same time grasp_close_weight is rewarding it, directly
-    # undermining the point of the grace period the moment this weight is
-    # ever nonzero again. Mutually exclusive with grasp_close_weight by
-    # construction, never both nonzero the same step, regardless of which
-    # between_jaws value -- strict or hysteresis-adjusted -- is in play
-    # that step).
+    # `not between_jaws_for_closing` (the SAME wider-tolerance,
+    # hysteresis-adjusted value grasp_close_weight uses, not the strict
+    # `between_jaws` -- added 2026-09-06 alongside the hysteresis fix
+    # itself: using the strict value here would let this penalty fire on
+    # a grace-period step at the exact same time grasp_close_weight is
+    # rewarding it, directly undermining the point of the grace period
+    # the moment this weight is ever nonzero again. Widened further
+    # 2026-09-14 alongside grasp_close_lateral_threshold -- if this
+    # weight is ever reactivated, note the penalty region has shrunk
+    # correspondingly, since it's the complement of a now-larger positive
+    # zone. Mutually exclusive with grasp_close_weight by construction,
+    # never both nonzero the same step, regardless of which between_jaws
+    # value -- strict or wider-tolerance-and-hysteresis-adjusted -- is in
+    # play that step).
     if not holding and not between_jaws_for_closing:
         premature_close_penalty = cfg.premature_close_weight * _gripper_close_potential(gripper_joint_pos, cfg)
     else:
@@ -2493,6 +2606,87 @@ def _self_test():
         "action_penalty_approach_scale's production default must be a genuine partial reduction"
     )
 
+    # 21a-21d. grasp_close_lateral_threshold (added 2026-09-14) -- a
+    # position strictly BETWEEN the two thresholds (lateral=0.03, with
+    # grasp_lateral_threshold=0.02 and grasp_close_lateral_threshold=0.04)
+    # is the entire point of this change: outside the strict zone, inside
+    # the wider one. Reuses `lifted`/`axis`/`perp_unit` from test 14's own
+    # setup.
+    cube_lateral_wide_only = tuple(lifted[i] + 0.02 * axis[i] + 0.03 * perp_unit[i] for i in range(3))
+    assert cfg.grasp_lateral_threshold < 0.03 < cfg.grasp_close_lateral_threshold, (
+        "test setup: 0.03 must sit strictly between the two thresholds for this test to mean anything"
+    )
+
+    # 21a. Regression: the STRICT check, and everything built on it, must
+    # be completely unaffected by the new wider tolerance -- this
+    # position must still fail is_between_jaws() and must still never
+    # register as grasped/holding, exactly as it would have before this
+    # change existed.
+    assert not is_between_jaws(lifted, Q, cube_lateral_wide_only, cfg), (
+        "is_between_jaws() (strict) must still fail here -- only the SHAPING gate should have widened"
+    )
+    _, info_wide_closed = compute_reward(
+        lifted, Q, cube_lateral_wide_only, zero_vel, gripper_closed_joint, zero_joint_vel,
+        F, F, None, None, was_ever_held=F, cfg=cfg,
+    )
+    assert not info_wide_closed["between_jaws"], "the info dict's own between_jaws key must stay strict too"
+    assert not info_wide_closed["grasped"], "must still never register as grasped in the wide-only zone"
+    assert not info_wide_closed["holding"], "must still never register as holding in the wide-only zone"
+
+    # 21b. The actual fix: grasp_close_weight must NOW pay out while
+    # actively closing in this same wide-only position -- before this
+    # change, this would have earned exactly 0.0, identical to test 16a's
+    # cube_far_axis case, since between_jaws_for_closing was built from
+    # the strict check alone.
+    _, info_wide_closing = compute_reward(
+        lifted, Q, cube_lateral_wide_only, zero_vel, gripper_closed_joint, zero_joint_vel,
+        F, F, None, gripper_open_joint, was_ever_held=F, cfg=cfg,
+    )
+    assert info_wide_closing["grasp_close"] > 0.0, (
+        "closing while in the wide-only zone must now earn grasp_close shaping -- this is the "
+        "entire point of grasp_close_lateral_threshold"
+    )
+
+    # 21c. Still bounded, not "anything goes": beyond the wider
+    # threshold too (lateral=0.05), grasp_close must still earn nothing.
+    cube_lateral_too_far_even_wide = tuple(lifted[i] + 0.02 * axis[i] + 0.05 * perp_unit[i] for i in range(3))
+    _, info_still_too_far = compute_reward(
+        lifted, Q, cube_lateral_too_far_even_wide, zero_vel, gripper_closed_joint, zero_joint_vel,
+        F, F, None, gripper_open_joint, was_ever_held=F, cfg=cfg,
+    )
+    assert info_still_too_far["grasp_close"] == 0.0, (
+        "beyond grasp_close_lateral_threshold too, grasp_close must still earn nothing"
+    )
+
+    # 21d. deepest_close_weight's exact farm-proofing guarantee (test 5m's
+    # own property) must hold EXACTLY in this newly-opened wide-only
+    # zone too, not just in the trivially-centered position test 5m
+    # itself used. Same oscillation pattern as test 5m, same assertion,
+    # only the cube position differs.
+    total_wide_bonus = 0.0
+    prev_deep_wide = None
+    prev_j_wide = gripper_open_joint
+    for depth in cycle_depths:
+        _, info_wide_cycle = compute_reward(
+            lifted, Q, cube_lateral_wide_only, zero_vel, depth, zero_joint_vel,
+            F, F, None, prev_j_wide, was_ever_held=F, prev_deepest_close=prev_deep_wide, cfg=cfg,
+        )
+        total_wide_bonus += info_wide_cycle["deepest_close_bonus"]
+        prev_deep_wide = info_wide_cycle["deepest_close"]
+        prev_j_wide = depth
+    expected_wide_total = cfg.deepest_close_weight * _gripper_close_potential(min(cycle_depths), cfg)
+    assert abs(total_wide_bonus - expected_wide_total) < 1e-9, (
+        "deepest_close_weight's farm-proofing guarantee must hold exactly in the newly-opened "
+        "wide-only zone too, not just the trivially-centered position test 5m already covers -- "
+        "this is what actually neutralizes grasp_close_weight's own gate-timing exploit becoming "
+        "easier to trigger with a wider gate: even though grasp_close_weight alone can still be "
+        "nudged by well-timed oscillation (a structural property independent of gate width -- its "
+        "own per-cycle payout is bounded by weight * 1.0 regardless, since "
+        "_gripper_close_potential() is bounded to [0, 1] either way), deepest_close_weight (same "
+        "weight, 4.0) provably cannot be farmed this way at all, so oscillating for its own sake "
+        "still can't out-earn a genuine deeper commitment overall"
+    )
+
     print("[OK] pickplace_reward self-test passed")
     print(f"  closer_shaping={info_closer['dense']:+.4f} farther_shaping={info_farther['dense']:+.4f}")
     print(f"  grasp_bonus_once={info['holding']} reward_at_target_still={reward_at_target_still:.3f}")
@@ -2506,6 +2700,10 @@ def _self_test():
     print(f"  action_penalty(approach)={info_penalty_approach['action_penalty']:.4f} "
           f"action_penalty(holding)={info_penalty_holding['action_penalty']:.4f} "
           f"(scale={cfg.action_penalty_approach_scale})")
+    print(f"  grasp_close_lateral_threshold={cfg.grasp_close_lateral_threshold} "
+          f"(strict={cfg.grasp_lateral_threshold}): wide_only_closing_grasp_close="
+          f"{info_wide_closing['grasp_close']:+.4f} wide_only_deepest_close_total="
+          f"{total_wide_bonus:+.4f} (== weight*deepest_ever={expected_wide_total:+.4f})")
 
 
 if __name__ == "__main__":
