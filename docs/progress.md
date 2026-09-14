@@ -1797,3 +1797,17 @@ confirmed instance of that pattern, no longer worth re-diagnosing each
 time. run25's step45409 remains the best verified checkpoint this
 project has produced since the original ancestor; future work should
 build from there, not from run26. Full numbers in docs/decisions.md.
+
+First real command sent to physical hardware: a no-op position readback
+(follower_writer_test.py) confirmed the write path works with zero
+unexpected motion, then episode_002's reach segment was replayed for
+real (follower_replay_reach.py, sign flips applied). Success -- correct
+direction, gripper closed appropriately, settled cleanly. Motion was
+visibly "stop and go" (expected -- replayed at 10Hz against a recording
+made at 50Hz) and stopped ~2-3 inches above the table instead of at
+contact -- checked against sim's own data and found sim itself has the
+cube ~1 inch up at this exact cutoff (the segment ends where
+`is_holding()` first turns true, already mid-lift), accounting for part
+of the gap but not all of it -- a real, if modest, sim-to-real height
+offset makes up the rest, not yet isolated further. Full details in
+docs/decisions.md.

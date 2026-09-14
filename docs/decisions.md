@@ -2111,3 +2111,47 @@ applying the `elbow_flex`/`wrist_roll` sign flips found above, at a
 reduced rate with `max_relative_target` engaged, smoothly interpolating
 from the arm's actual current position into the trajectory's first
 waypoint rather than jumping there.
+
+## First real multi-joint movement, and a real height discrepancy found (2026-09-13)
+
+`follower_replay_reach.py` run for real (episode_002's reach segment,
+10Hz, sign flips applied). Result: the arm moved in the correct
+direction, extended and reached toward the table, gripper closed
+appropriately, and settled cleanly with no runaway or unexpected
+motion -- the sign-flip conversion and the whole pipeline work.
+
+Two observations, checked against the actual sim data rather than
+assumed:
+
+1. **Motion was visibly "stop and go," not smooth** -- expected, a
+   direct consequence of replaying at 10Hz when the recording was made
+   at 50Hz: the real servo gets 100ms to reach each commanded waypoint
+   instead of the 20ms the recording implies, so it settles briefly at
+   each one before the next nudges it forward. A smoother replay would
+   need to run closer to the original 50Hz -- deliberately slowed down
+   for this first test to leave more reaction time.
+
+2. **The gripper stopped ~2-3 inches above the table, not at contact**
+   -- checked episode_002's own recorded cube height at the exact
+   cutoff step (194): the cube is already lifted to ~0.041m (vs. ~0.015m
+   resting), i.e. sim itself has the cube ~1 inch up by this point, not
+   at table contact -- the reach segment is deliberately cut off right
+   where `is_holding()` first turns true, which in this recording
+   happens after the cube's already partway lifted. That accounts for
+   PART of the observed gap, but not all of it -- the real gap (2-3
+   inches) is larger than sim's own ~1 inch at the same point, pointing
+   to a genuine, if modest, sim-to-real offset (real table height, arm
+   mounting position, or accumulated tracking error) making up the
+   difference. Not yet isolated further -- worth a dedicated measurement
+   (e.g. commanding the arm to a few known joint configurations and
+   directly measuring real end-effector height vs. sim's predicted
+   height) if this needs to be tightened up before anything relies on
+   precise real-world contact.
+
+**How to apply**: the core pipeline (sim recording -> unit/sign
+conversion -> real follower command) is validated and working. Next
+choices: (a) replay closer to the original 50Hz for a smoother motion,
+(b) measure the real-vs-sim height offset directly and decide whether it
+needs correcting before any contact-sensitive task, or (c) move on to
+placing a real cube and camera setup so an actual policy could eventually
+be evaluated end to end.
