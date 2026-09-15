@@ -2360,3 +2360,70 @@ run29's step75349, attempt a genuine held-verification-focused
 experiment (e.g. combining horizon=5 with run25's hold-segments demo
 weighting, now that both are independently shown to reach 100%
 between_jaws), or pursue option 2 (still unlaunched, see above).
+
+---
+
+## `grasp_close_lateral_threshold` tested: run30/run31 verified (2026-09-14)
+
+Per-step CSV analysis of run29's step75349 (6 verified draws, all 100%
+between_jaws / 0% held) found the mechanism behind the stall: `lateral`
+sat at a mean of 0.04-0.05 while touching the cube -- roughly double
+`grasp_lateral_threshold` (0.02), the strict gate feeding
+`grasp_close_weight`/`deepest_close_weight`. `gripper_joint_pos` was
+stable at ~55-58% mean across all 6 draws: a genuine stable local
+optimum ("hover near the cube, don't bother closing"), not a
+failed-attempt pattern, because the closing-shaping terms essentially
+never fired.
+
+**Fix** (`691315c`): added `grasp_close_lateral_threshold` (0.04), a new
+wider lateral tolerance used ONLY to gate the closing-shaping terms via
+a new `between_jaws_wide` boolean, feeding the existing
+`_between_jaws_effective()` grace-period mechanism in place of the
+strict `between_jaws`. Deliberately does not touch
+`grasp_lateral_threshold` (0.02, physically grounded), `is_between_jaws()`,
+`is_grasped()`, or `is_holding()` -- success criteria stay exactly as
+strict as before, avoiding a repeat of the run7 false-positive failure
+mode. 4 new self-test cases verified passing (Mac + Ubuntu), plus a full
+training-pipeline smoke test.
+
+Two runs launched from run29's step75349 (horizon=5 maintained
+throughout), both to 42,000 steps: run30 (standard demo weight, same
+`--seed-demos-min-fraction`/`--seed-demos-hold-segments-fraction` as
+run29) and run31 (half that weight, queued to auto-launch after run30
+via a log-marker-polling script -- not a process-exit wait, which would
+hang forever given this codebase's universal Kit shutdown-hang).
+
+Verified via `--eval-only-repeats 6` on the checkpoints with the
+strongest single-draw signal from each run:
+
+| Run / checkpoint | touched | between_jaws | held | mean reward |
+|---|---|---|---|---|
+| run30 step020459 (20k/42k) | 1.00 | **1.00** | 0.00 | +5.04 |
+| run30 step040419 (40k/42k) | 1.00 | 0.00 | 0.00 | +1.48 |
+| run31 step040419 (40k/42k) | pending | pending | pending | pending |
+
+**run30 step020459 verifies at a genuine 100% between_jaws (6/6)** --
+matching run25's and run29's own best results, now via a third
+mechanism (wider closing-shaping gate, on top of horizon=5) and
+confirming the fix does what it was designed to do: get the policy back
+into a fully consistent between-jaws position. `held` is still 0/6,
+though -- the fix alone has not solved the actual closing problem, only
+the positioning-consistency half of it.
+
+**run30 step040419 (double the training under the same fix) collapsed
+to 0/6 between_jaws** -- the SIXTH confirmed instance of this
+codebase's checkpoint-regresses-with-more-training pattern (after
+run21, run22, run24, run25, run26, run29), and further evidence that
+whatever is being optimized here degrades a genuine positioning skill
+with continued training rather than refining it toward closing. This is
+consistent with the reward-sparsification mechanism from run22's own
+regression (`deepest_close_weight`'s rising high-water-mark bar)
+possibly still applying, now to the wider gate as well.
+
+**How to apply**: continues to reinforce "never trust the final (or even
+just the most-trained) checkpoint -- always verify multiple checkpoints
+across the run, not just the last one." step020459 is the best
+verified-so-far result for the `grasp_close_lateral_threshold` fix, but
+the fix's actual goal (getting `held` off zero) remains unmet. Awaiting
+run31's step040419 verification before drawing conclusions about demo
+weight's effect. See docs/progress.md for the narrative summary.

@@ -1840,3 +1840,28 @@ rather than a one-off. This is the clearest real evidence yet that
 longer planning horizon helps. held remains 0% throughout, and the final
 checkpoint regressed again (17%) -- the fifth confirmed instance of that
 pattern. Full numbers in docs/decisions.md.
+
+Diagnosed why run29's 100%-between_jaws checkpoint still never achieves
+`held`: per-step CSV analysis across all 6 verified draws showed
+`lateral` sitting at roughly double the strict `grasp_lateral_threshold`
+while touching the cube, so the closing-shaping reward terms almost
+never fired -- a genuine stable "hover, don't close" local optimum, not
+a failed attempt. Added `grasp_close_lateral_threshold`, a wider
+tolerance used only to gate the closing-shaping terms, leaving the
+strict success criteria (`is_between_jaws`/`is_grasped`/`is_holding`)
+completely untouched to avoid reopening the run7 false-positive failure
+mode. Launched two runs from run29's verified checkpoint to test it:
+run30 (standard demo weight) and run31 (half demo weight, auto-queued to
+launch after run30 via a log-marker-polling script rather than waiting
+on process exit, since every run in this project hangs at shutdown and
+never exits on its own).
+
+run30 verified: step020459 (20k of 42k steps) hit a genuine 100%
+between_jaws (6/6 draws) -- the fix works exactly as designed for
+positioning consistency, matching run25's and run29's own best results
+via a third distinct mechanism. `held` is still 0/6, though -- the fix
+alone hasn't solved the actual closing problem. step040419 (double the
+training) collapsed back to 0/6 between_jaws -- the sixth confirmed
+instance of this project's more-training-regresses-the-checkpoint
+pattern. run31's equivalent checkpoint is being verified now. Full
+numbers and the CSV-based diagnosis in docs/decisions.md.
