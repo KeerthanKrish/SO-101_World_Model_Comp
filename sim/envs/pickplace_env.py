@@ -139,7 +139,49 @@ class PickPlaceEnvCfg(DirectRLEnvCfg):
     # was only ever a documented placeholder for whichever env eventually
     # got built (this one).
     episode_length_s = 10.0
-    sim: sim_utils.SimulationCfg = sim_utils.SimulationCfg(dt=0.01, render_interval=2)
+    # PhysX contact tuning added 2026-09-15 -- see docs/decisions.md ("The
+    # closing dynamics diagnosed: a genuine timing race") for the evidence
+    # motivating this. All four defaults were sized around PhysX's own
+    # generic-object assumptions, not this project's 3cm/50g cube:
+    #   - friction_correlation_distance: default 0.025m merges any two
+    #     contact points within 2.5cm into one shared friction anchor --
+    #     larger than this cube's own 3cm edge, so the two jaws' contact
+    #     points could plausibly be merged into a single, asymmetric anchor
+    #     instead of resolved independently. Isaac Lab's own shipped
+    #     Franka cube-lift reference task (Isaac-Lift-Cube-Franka-v0)
+    #     independently arrived at the same conclusion and sets this to
+    #     0.00625m (4x smaller) specifically for small-object/gripper
+    #     contact -- reused verbatim here rather than guessing a new value.
+    #   - friction_offset_threshold: default 0.04m is LARGER than this
+    #     cube's entire 3cm size -- NVIDIA's own Factory-task tuning
+    #     guidance explicitly calls out decreasing this for small objects.
+    #     Set well under the cube's own size (not matched to any specific
+    #     reference task's value, unlike the other three parameters here).
+    #   - bounce_threshold_velocity: default 0.5 m/s; Isaac-Lift-Cube-Franka-v0
+    #     uses 0.01 m/s, reused verbatim.
+    #   - solve_articulation_contact_last: default False. Its own docstring
+    #     (isaaclab/sim/simulation_cfg.py) states plainly that the default
+    #     solver ordering "may not be ideal for gripping scenarios" and
+    #     recommends enabling this "with dynamic contact resolution being
+    #     such an important part of gripping" -- a direct, first-party match
+    #     to this project's exact symptom, found by reading the installed
+    #     Isaac Lab source directly (new in Isaac Sim 5.1, not yet widely
+    #     documented elsewhere).
+    # None of these change observation/action spaces or reward computation
+    # -- purely a contact-solver retune, tested via re-verifying an
+    # already-trained checkpoint (--eval-only-repeats), not a new training
+    # run, specifically so any change in `held` can be attributed to this
+    # change alone.
+    sim: sim_utils.SimulationCfg = sim_utils.SimulationCfg(
+        dt=0.01,
+        render_interval=2,
+        physx=sim_utils.PhysxCfg(
+            friction_correlation_distance=0.00625,
+            friction_offset_threshold=0.01,
+            bounce_threshold_velocity=0.01,
+            solve_articulation_contact_last=True,
+        ),
+    )
 
     # -- scene (built in __post_init__, depends on use_cameras/num_envs) --
     # IMPORTANT: pass these to the PickPlaceEnvCfg(...) constructor, e.g.

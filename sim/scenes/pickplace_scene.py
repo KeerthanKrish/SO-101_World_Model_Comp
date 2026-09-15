@@ -82,7 +82,13 @@ class PickPlaceSceneBaseCfg(InteractiveSceneCfg):
         spawn=sim_utils.CuboidCfg(
             size=(_CUBE_SIZE, _CUBE_SIZE, _CUBE_SIZE),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                solver_position_iteration_count=12,
+                # 12->16 (2026-09-15): matches Isaac Lab's own shipped
+                # Franka cube-lift reference task's cube exactly (its cube
+                # uses 16 vs. PhysX's own default of 4) -- see
+                # docs/decisions.md's PhysX contact-tuning entry for the
+                # full motivation (same pass that added the physx= block
+                # in pickplace_env.py's SimulationCfg).
+                solver_position_iteration_count=16,
                 solver_velocity_iteration_count=2,
                 # Matches the robot's cap -- see so101.py's comment. Without
                 # this the cube could still get ejected at a high default
