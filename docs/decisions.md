@@ -2452,3 +2452,77 @@ velocity/torque during a close attempt, not just position) rather than
 another reward-shaping iteration on the same gating mechanism, since
 that lever has now been shown not to be the bottleneck. See
 docs/progress.md for the narrative summary.
+
+---
+
+## The closing dynamics diagnosed: a genuine timing race, not a stalled policy (2026-09-15)
+
+Pulled all 6 per-step CSVs from step020459's verification (already saved
+by `--eval-only-repeats`'s own `step_log_path` mechanism, no new run
+needed) and traced `action_gripper` (commanded) and `gripper_joint_pos`
+(actual) specifically within each contiguous `between_jaws=True` window,
+across all 6 draws (10 windows total, 1-20 steps each).
+
+**In every single window, the policy correctly commands closing**
+(`action_gripper` strongly negative, mean -0.28 to -1.00) **and the
+joint genuinely responds** (`gripper_joint_pos` steadily decreasing
+toward fully closed, e.g. one window's fraction-open goes 0.39->0.16
+over 20 steps). This directly rules out "the policy doesn't try" -- the
+earlier `grasp_close_lateral_threshold` fix is doing exactly what it was
+designed to do.
+
+**What actually ends every window: `lateral` jumps past the strict 0.02
+threshold in a single physics step, every time** -- checked the exact
+step where each of the 10 windows ends: `lateral` is always ≤0.02 on the
+last in-window step and >0.02 (typically 0.021-0.036, one jump as large
+as 0.013 in one 0.02s timestep) on the very next step, while `axial`
+barely moves in the same window (≤0.005 change). This is a lateral-only
+perturbation, not general positional drift. In several windows this
+happens with the gripper already very close to fully closed (e.g.
+`gripper_joint_pos=-0.041`, `-0.039`, `-0.049` -- all near the
+fully-closed value of -0.1745) -- the close was nearly finished when
+position broke.
+
+**Confirmed via `grasp_point_world()`/`jaw_approach_axis_world()`'s own
+code (`sim/robots/grasp_geometry.py`) that this isn't a measurement
+artifact**: both use a FIXED local offset (`JAW_OFFSET_LOCAL`) from
+`gripper_frame_link`'s own body pose, not the moving jaw's joint angle --
+so the lateral value genuinely reflects the cube's position relative to
+the gripper body frame, not an artifact of the jaws closing around a
+fixed measurement point.
+
+**`holding=True` never registers on a single step across all 6 draws
+(0 of 2,994 total logged steps)** -- confirming this isn't a near-miss
+being missed by strict-vs-wide gating (that gate only affects the
+closing-shaping reward, not the strict success check), but a genuine
+race between two things that need to happen simultaneously: closing
+motion, and positional stability.
+
+**This matches a failure mode already seen once before in this
+project's history**, at run17 (2026-09-08, see the demo-seeded-training
+section above): "the gripper was genuinely, steadily closing, just too
+slowly relative to the arm's own lateral drift in and out of
+position -- a timing race, not a policy that never tries." The
+mechanism has now recurred after horizon=5, the wider closing gate, and
+several other changes since then -- suggesting this specific failure
+mode is more fundamental to the current reward/control setup than any
+single lever tried against it so far.
+
+**How to apply**: the open question is now specifically what's causing
+the lateral perturbation during a close attempt -- most likely either
+(a) genuine contact-force interaction as the closing jaws first touch
+the cube asymmetrically, nudging it sideways, or (b) the arm not holding
+its own end-effector position steady while the gripper actuates (CEM
+planning the gripper-close action without a corresponding
+hold-position constraint on the rest of the arm). These have different
+fixes: (a) would need either softer/more centered contact or added
+robustness in the shaping to tolerate a small in-progress lateral
+excursion; (b) would need either an explicit stability term in the
+reward or examining whether arm-joint actions have any residual
+movement during the exact steps `action_gripper` is very negative. Worth
+watching one or two of the actual `.mp4` clips at these specific step
+ranges (already saved in
+`sim/output/tdmpc2_eval_videos/verify_run30_agent_step_020459/`, e.g.
+draw0 steps 78-90 or draw4 steps 106-116) before committing to either
+explanation, since this is the kind of thing that's obvious on video but
+easy to mis-theorize from numbers alone.

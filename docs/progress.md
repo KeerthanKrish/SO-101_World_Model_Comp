@@ -1874,3 +1874,26 @@ once adequately incentivized, still doesn't complete. Next step is a
 per-step diagnostic pass on step020459's own draws looking at the
 gripper's actual closing dynamics, not another reward-gating iteration.
 Full numbers and the CSV-based diagnosis in docs/decisions.md.
+
+Ran that diagnostic pass, reusing the CSVs already saved by
+`--eval-only-repeats` rather than a new run. Traced `action_gripper` vs
+`gripper_joint_pos` within every `between_jaws=True` window across all 6
+draws (10 windows total): the policy reliably commands closing and the
+joint genuinely closes in every one -- this is not a stalled policy.
+What ends every window, without exception, is `lateral` jumping past the
+strict 0.02 threshold in a single physics step while `axial` barely
+moves -- a lateral-only perturbation happening during the close attempt
+itself, in several cases with the gripper already nearly fully closed.
+Confirmed via the actual geometry code that this isn't a measurement
+artifact (the lateral/axial reference point is fixed to the gripper
+body, not the moving jaw). `holding` never registers on a single one of
+2,994 logged steps across all 6 draws. This is the same "timing race"
+failure mode first seen at run17 (steady closing undone by lateral
+drift), recurring here after horizon=5 and the wider closing gate --
+evidence this specific race is more fundamental to the current setup
+than any single lever tried against it so far. Two candidate physical
+explanations (contact-force nudge from asymmetric jaw closure, vs. the
+arm not holding position while the gripper actuates) aren't yet
+distinguished -- next step is watching the actual video clips at the
+flagged step ranges before deciding which one it is. Full trace and the
+exact step-by-step evidence in docs/decisions.md.
