@@ -1863,5 +1863,14 @@ via a third distinct mechanism. `held` is still 0/6, though -- the fix
 alone hasn't solved the actual closing problem. step040419 (double the
 training) collapsed back to 0/6 between_jaws -- the sixth confirmed
 instance of this project's more-training-regresses-the-checkpoint
-pattern. run31's equivalent checkpoint is being verified now. Full
-numbers and the CSV-based diagnosis in docs/decisions.md.
+pattern. run31's equivalent checkpoint (half demo weight, same step
+count) verified better but not fully recovered: 50% between_jaws (3/6)
+-- a real comparative signal that lower demo weight degrades more
+slowly under continued training, though not strong enough to call it a
+fix on its own. Across all three verified checkpoints (18 draws total),
+`held` never fired once -- the fix reliably restores positioning
+consistency but doesn't touch the deeper problem of why a close attempt,
+once adequately incentivized, still doesn't complete. Next step is a
+per-step diagnostic pass on step020459's own draws looking at the
+gripper's actual closing dynamics, not another reward-gating iteration.
+Full numbers and the CSV-based diagnosis in docs/decisions.md.

@@ -2398,9 +2398,9 @@ strongest single-draw signal from each run:
 
 | Run / checkpoint | touched | between_jaws | held | mean reward |
 |---|---|---|---|---|
-| run30 step020459 (20k/42k) | 1.00 | **1.00** | 0.00 | +5.04 |
-| run30 step040419 (40k/42k) | 1.00 | 0.00 | 0.00 | +1.48 |
-| run31 step040419 (40k/42k) | pending | pending | pending | pending |
+| run30 step020459 (20k/42k, standard demo weight) | 1.00 | **1.00** | 0.00 | +5.04 |
+| run30 step040419 (40k/42k, standard demo weight) | 1.00 | 0.00 | 0.00 | +1.48 |
+| run31 step040419 (40k/42k, half demo weight) | 1.00 | 0.50 | 0.00 | +2.45 |
 
 **run30 step020459 verifies at a genuine 100% between_jaws (6/6)** --
 matching run25's and run29's own best results, now via a third
@@ -2420,10 +2420,35 @@ consistent with the reward-sparsification mechanism from run22's own
 regression (`deepest_close_weight`'s rising high-water-mark bar)
 possibly still applying, now to the wider gate as well.
 
+**run31 step040419 (half demo weight, same step count as run30's
+step040419) verified at 50% between_jaws (3/6)** -- meaningfully better
+than run30's own step040419 (0/6) at the identical step count, though
+still well short of step020459's 100%. This is a real, if modest,
+comparative signal that lower demo weight degrades more slowly under
+continued training than standard demo weight does, consistent with
+run22's own sparsification mechanism (a rising reward bar interacting
+with a constant-cost term) applying in proportion to how much demo
+material is being reinforced. Not strong enough on its own to call half
+demo weight a fix, though -- both runs' most-trained checkpoints
+underperform their own earlier ones.
+
+**held is 0/18 across all three verified checkpoints (run30 step020459,
+run30 step040419, run31 step040419)** -- the `grasp_close_lateral_threshold`
+fix, across every configuration tested so far, has reliably restored
+the positioning-consistency result already seen in run25/run29, but has
+not moved `held` off zero anywhere. This narrows the remaining problem:
+it is not that the closing-shaping reward never fires (the fix ensures
+it does, and 100% between_jaws is achievable), but that firing it more
+often still isn't enough to make the policy actually complete a close
+and sustain it.
+
 **How to apply**: continues to reinforce "never trust the final (or even
 just the most-trained) checkpoint -- always verify multiple checkpoints
-across the run, not just the last one." step020459 is the best
-verified-so-far result for the `grasp_close_lateral_threshold` fix, but
-the fix's actual goal (getting `held` off zero) remains unmet. Awaiting
-run31's step040419 verification before drawing conclusions about demo
-weight's effect. See docs/progress.md for the narrative summary.
+across the run, not just the last one." step020459 remains the best
+verified result to build on. The next real question is why the closing
+attempt itself still fails even when adequately incentivized -- worth a
+fresh per-step diagnostic pass on step020459's own draws (gripper
+velocity/torque during a close attempt, not just position) rather than
+another reward-shaping iteration on the same gating mechanism, since
+that lever has now been shown not to be the bottleneck. See
+docs/progress.md for the narrative summary.
